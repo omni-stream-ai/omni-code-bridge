@@ -165,7 +165,7 @@ fn find_client_repo_root() -> Option<PathBuf> {
 async fn health() -> impl IntoResponse {
     Json(serde_json::json!({
         "ok": true,
-        "service": "desktop-bridge",
+        "service": "omni-code-bridge",
     }))
 }
 

@@ -784,7 +784,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "omni-code-desktop-bridge"
+name = "omni-code-bridge"
 version = "0.1.0"
 dependencies = [
  "anyhow",

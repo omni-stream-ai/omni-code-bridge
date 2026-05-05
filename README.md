@@ -1,6 +1,6 @@
-# Omni Code Desktop Bridge
+# Omni Code Bridge
 
-Rust desktop bridge for Omni Code. This repository exposes the HTTP and SSE API
+Rust bridge for Omni Code. This repository exposes the HTTP and SSE API
 used by the mobile client and connects it to local coding agents such as
 `codex` and `claudecode`.
 

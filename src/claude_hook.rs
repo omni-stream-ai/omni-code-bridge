@@ -40,7 +40,7 @@ pub struct ClaudeHookStatusEvent {
 
 pub fn claude_state_dir() -> PathBuf {
     env::temp_dir()
-        .join("omni-code-desktop-bridge")
+        .join("omni-code-bridge")
         .join("claude-permissions")
 }
 

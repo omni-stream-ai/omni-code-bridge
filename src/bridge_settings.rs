@@ -85,7 +85,7 @@ impl BridgeSettingsStore {
 pub fn settings_path() -> PathBuf {
     std::env::var("ECHO_MATE_SETTINGS_PATH")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir().join("omni-code-desktop-bridge/settings.json"))
+        .unwrap_or_else(|_| std::env::temp_dir().join("omni-code-bridge/settings.json"))
 }
 
 fn env_bool(name: &str) -> bool {

@@ -47,7 +47,7 @@ async fn run() -> Result<()> {
     let addr = SocketAddr::from(([0, 0, 0, 0], 8787));
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
-    println!("Omni Code desktop bridge listening on http://{addr}");
+    println!("Omni Code bridge listening on http://{addr}");
 
     axum::serve(listener, app).await?;
     Ok(())

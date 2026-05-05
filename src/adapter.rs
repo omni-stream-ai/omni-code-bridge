@@ -536,8 +536,8 @@ async fn run_codex(
         "initialize",
         serde_json::json!({
             "clientInfo": {
-                "name": "omni-code-desktop-bridge",
-                "title": "omni-code-desktop-bridge",
+                "name": "omni-code-bridge",
+                "title": "omni-code-bridge",
                 "version": env!("CARGO_PKG_VERSION"),
             },
             "capabilities": {
@@ -1026,8 +1026,8 @@ async fn summarize_with_codex(
         "initialize",
         serde_json::json!({
             "clientInfo": {
-                "name": "omni-code-desktop-bridge",
-                "title": "omni-code-desktop-bridge",
+                "name": "omni-code-bridge",
+                "title": "omni-code-bridge",
                 "version": env!("CARGO_PKG_VERSION"),
             },
             "capabilities": {
