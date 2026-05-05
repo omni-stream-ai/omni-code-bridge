@@ -4,12 +4,14 @@ Rust desktop bridge for Omni Code. This repository exposes the HTTP and SSE API
 used by the mobile client and connects it to local coding agents such as
 `codex` and `claudecode`.
 
-The Flutter client lives in the sibling repository directory `../omni-code`.
+The Flutter client lives in:
+`https://github.com/omni-stream-ai/omni-code`
 
 ## Requirements
 
 - `Rust` / `cargo`
-- Optional: a sibling checkout of `../omni-code` if you want the built-in APK
+- Optional: a local checkout of
+  `https://github.com/omni-stream-ai/omni-code` if you want the built-in APK
   update manifest endpoints to serve a local Android build
 
 ## Run
@@ -28,14 +30,15 @@ At minimum, configure:
 
 ## Client APK Update Endpoints
 
-The bridge can serve the newest Android APK it finds from the sibling client
-repository:
+The bridge can serve the newest Android APK it finds from a local checkout of
+the client repository:
 
 - `GET /app-update/manifest`
 - `GET /app-update/apk`
 
-By default it looks for APK build outputs under `../omni-code/build/...` and
-reads the version from `../omni-code/pubspec.yaml`.
+By default it looks for APK build outputs from a local checkout of
+`https://github.com/omni-stream-ai/omni-code` and reads the version from that
+repository's `pubspec.yaml`.
 
 These endpoints are primarily useful for local development or self-hosted
 distribution. The client now checks the official GitHub release manifest by
