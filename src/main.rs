@@ -7,18 +7,66 @@ mod asr;
 mod bridge_settings;
 mod claude_hook;
 mod claude_store;
+mod client_auth_store;
 mod device_store;
 mod models;
 mod push;
 mod session_store;
 mod tts;
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use app_state::AppState;
 use axum::Router;
+use clap::{Parser, Subcommand};
 use tower_http::cors::{Any, CorsLayer};
+
+#[derive(Parser)]
+#[command(name = "omni-code-bridge", about = "Omni Code bridge CLI and server")]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Start the HTTP bridge server (default)
+    Serve {
+        #[arg(long, default_value = "8787")]
+        port: u16,
+    },
+    /// Claude Code permission hook (invoked by Claude Code, not by users)
+    ClaudePermissionHook {
+        #[arg(long)]
+        state_dir: PathBuf,
+        #[arg(long)]
+        session_id: String,
+        #[arg(long)]
+        run_id: String,
+        #[arg(long)]
+        project_root: PathBuf,
+    },
+    /// Manage client authorization
+    #[command(subcommand)]
+    ClientAuth(ClientAuthCommand),
+}
+
+#[derive(Subcommand)]
+enum ClientAuthCommand {
+    /// List all client auth requests
+    List {
+        /// Show only pending requests
+        #[arg(long)]
+        pending: bool,
+    },
+    /// Approve pending client auth requests and generate tokens
+    Approve {
+        /// The request ID to approve (omit to approve all pending)
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+}
 
 #[tokio::main]
 async fn main() {
@@ -31,26 +79,106 @@ async fn main() {
 async fn run() -> Result<()> {
     load_bridge_env();
 
-    if let Some(args) = ClaudePermissionHookArgs::parse(std::env::args().skip(1))? {
-        return claude_hook::run_permission_hook(
-            args.state_dir,
-            args.session_id,
-            args.run_id,
-            args.project_root,
-        )
-        .await;
-    }
+    let cli = Cli::parse();
 
+    match cli.command {
+        Some(Command::ClaudePermissionHook {
+            state_dir,
+            session_id,
+            run_id,
+            project_root,
+        }) => {
+            claude_hook::run_permission_hook(state_dir, session_id, run_id, project_root).await
+        }
+        Some(Command::ClientAuth(sub)) => handle_client_auth(sub).await,
+        Some(Command::Serve { port }) => serve(port).await,
+        None => serve(8787).await,
+    }
+}
+
+async fn serve(port: u16) -> Result<()> {
     let state = Arc::new(AppState::new().await);
     let app = router(state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], 8787));
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
     println!("Omni Code bridge listening on http://{addr}");
 
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+async fn handle_client_auth(cmd: ClientAuthCommand) -> Result<()> {
+    match cmd {
+        ClientAuthCommand::List { pending } => {
+            let store = client_auth_store::ClientAuthStore::load().await;
+            let records = store.list().await;
+
+            if records.is_empty() {
+                println!("No client auth requests found.");
+                return Ok(());
+            }
+
+            for record in &records {
+                if pending && record.status != models::ClientAuthStatus::Pending {
+                    continue;
+                }
+                let status = match record.status {
+                    models::ClientAuthStatus::Pending => "pending",
+                    models::ClientAuthStatus::Approved => "approved",
+                };
+                let token_display = record
+                    .token
+                    .as_deref()
+                    .unwrap_or("(none)");
+                let device = record
+                    .device_name
+                    .as_deref()
+                    .unwrap_or("(unknown)");
+                println!(
+                    "  request_id: {}\n  client_id:  {}\n  device:     {}\n  status:     {}\n  token:      {}\n  created_at: {}\n  updated_at: {}\n",
+                    record.request_id,
+                    record.client_id,
+                    device,
+                    status,
+                    token_display,
+                    record.created_at.to_rfc3339(),
+                    record.updated_at.to_rfc3339(),
+                );
+            }
+            Ok(())
+        }
+        ClientAuthCommand::Approve { request_id } => {
+            let store = client_auth_store::ClientAuthStore::load().await;
+            match request_id {
+                Some(id) => {
+                    let record = store.approve(&id).await?;
+                    println!("Approved.");
+                    println!("  request_id: {}", record.request_id);
+                    println!("  client_id:  {}", record.client_id);
+                    println!("  token:      {}", record.token.as_deref().unwrap_or("(none)"));
+                }
+                None => {
+                    let records = store.approve_all_pending().await?;
+                    if records.is_empty() {
+                        println!("No pending requests to approve.");
+                    } else {
+                        println!("Approved {} request(s):", records.len());
+                        for record in &records {
+                            println!(
+                                "  request_id: {}  client_id: {}  token: {}",
+                                record.request_id,
+                                record.client_id,
+                                record.token.as_deref().unwrap_or("(none)"),
+                            );
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 fn load_bridge_env() {
@@ -70,44 +198,4 @@ fn router(state: Arc<AppState>) -> Router {
             .allow_methods(Any)
             .allow_headers(Any),
     )
-}
-
-struct ClaudePermissionHookArgs {
-    state_dir: std::path::PathBuf,
-    session_id: String,
-    run_id: String,
-    project_root: std::path::PathBuf,
-}
-
-impl ClaudePermissionHookArgs {
-    fn parse(mut args: impl Iterator<Item = String>) -> Result<Option<Self>> {
-        let Some(command) = args.next() else {
-            return Ok(None);
-        };
-        if command != "claude-permission-hook" {
-            return Ok(None);
-        }
-
-        let mut state_dir = None;
-        let mut session_id = None;
-        let mut run_id = None;
-        let mut project_root = None;
-
-        while let Some(flag) = args.next() {
-            match flag.as_str() {
-                "--state-dir" => state_dir = args.next().map(Into::into),
-                "--session-id" => session_id = args.next(),
-                "--run-id" => run_id = args.next(),
-                "--project-root" => project_root = args.next().map(Into::into),
-                other => anyhow::bail!("unknown claude hook arg: {other}"),
-            }
-        }
-
-        Ok(Some(Self {
-            state_dir: state_dir.context("missing --state-dir")?,
-            session_id: session_id.context("missing --session-id")?,
-            run_id: run_id.context("missing --run-id")?,
-            project_root: project_root.context("missing --project-root")?,
-        }))
-    }
 }

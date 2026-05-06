@@ -14,13 +14,15 @@ use uuid::Uuid;
 use crate::{
     adapter::ProviderRegistry,
     bridge_settings::{BridgeSettings, BridgeSettingsStore},
+    client_auth_store::ClientAuthStore,
     device_store::{load_device_registrations, save_device_registrations},
     models::{
         AgentErrorEvent, AgentKind, ApprovalChoice, ApprovalRequest, ApprovalRequestEvent,
-        ApprovalResolvedEvent, ChatMessage, CreateProjectInput, CreateSessionInput, InputMode,
-        MessageDeltaEvent, MessageRole, ProjectSummary, PushDeviceRegistration,
-        RegisterPushDeviceInput, SendMessageInput, SessionEvent, SessionStatus, SessionStatusEvent,
-        SessionSummary, TriggerClientMessageInput, TriggerClientMessageResult,
+        ApprovalResolvedEvent, ChatMessage, ClientAuthRecord, ClientAuthRequestInput,
+        ClientAuthStatus, CreateProjectInput, CreateSessionInput, InputMode, MessageDeltaEvent,
+        MessageRole, ProjectSummary, PushDeviceRegistration, RegisterPushDeviceInput,
+        SendMessageInput, SessionEvent, SessionStatus, SessionStatusEvent, SessionSummary,
+        TriggerClientMessageInput, TriggerClientMessageResult,
     },
     push::PushService,
     session_store::project_id_for_path,
@@ -56,6 +58,7 @@ pub struct AppState {
     event_tx: broadcast::Sender<SessionEvent>,
     providers: ProviderRegistry,
     settings: BridgeSettingsStore,
+    client_auth: ClientAuthStore,
     push: PushService,
     bridge_token: Option<String>,
     allowed_client_ids: HashSet<String>,
@@ -92,6 +95,7 @@ impl AppState {
             event_tx,
             providers: ProviderRegistry::new(),
             settings: BridgeSettingsStore::load().await,
+            client_auth: ClientAuthStore::load().await,
             push: PushService::new(),
             bridge_token,
             allowed_client_ids,
@@ -104,6 +108,50 @@ impl AppState {
 
     pub fn is_client_id_allowed(&self, client_id: &str) -> bool {
         self.allowed_client_ids.is_empty() || self.allowed_client_ids.contains(client_id)
+    }
+
+    pub async fn is_runtime_client_id_allowed(&self, client_id: &str) -> bool {
+        self.client_auth.has_approved_client_id(client_id).await
+    }
+
+    pub async fn client_token_matches(&self, client_id: &str, token: &str) -> bool {
+        self.client_auth.token_matches(client_id, token).await
+    }
+
+    pub async fn request_client_auth(
+        &self,
+        input: ClientAuthRequestInput,
+    ) -> Result<ClientAuthRecord, String> {
+        let client_id = input.client_id.trim();
+        if client_id.is_empty() {
+            return Err("client_id is required".to_string());
+        }
+
+        if let Some(record) = self.client_auth.find_approved_by_client_id(client_id).await {
+            return Ok(record);
+        }
+
+        let now = Utc::now();
+        let record = ClientAuthRecord {
+            request_id: Uuid::new_v4().to_string(),
+            client_id: client_id.to_string(),
+            device_name: input
+                .device_name
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            status: ClientAuthStatus::Pending,
+            token: None,
+            created_at: now,
+            updated_at: now,
+        };
+        self.client_auth
+            .upsert(record)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn get_client_auth_request(&self, request_id: &str) -> Option<ClientAuthRecord> {
+        self.client_auth.get(request_id).await
     }
 
     pub async fn bridge_settings(&self) -> BridgeSettings {

@@ -213,6 +213,31 @@ pub struct ReplySummary {
     pub text: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientAuthStatus {
+    Pending,
+    Approved,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientAuthRequestInput {
+    pub client_id: String,
+    pub device_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientAuthRecord {
+    pub request_id: String,
+    pub client_id: String,
+    pub device_name: Option<String>,
+    pub status: ClientAuthStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioSpeechInput {
     pub input: String,

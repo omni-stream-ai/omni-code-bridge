@@ -21,8 +21,8 @@ use crate::{
     bridge_settings::BridgeSettings,
     models::{
         ApiResponse, AppUpdateManifest, ApprovalDecisionInput, AudioSpeechInput,
-        AudioTranscription, CreateProjectInput, CreateSessionInput, RegisterPushDeviceInput,
-        ReplySummary, SendMessageInput, SessionEvent, SummarizeReplyInput,
+        AudioTranscription, ClientAuthRequestInput, CreateProjectInput, CreateSessionInput,
+        RegisterPushDeviceInput, ReplySummary, SendMessageInput, SessionEvent, SummarizeReplyInput,
         TriggerClientMessageInput,
     },
     tts,
@@ -33,6 +33,11 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/health", get(health))
         .route("/app-update/manifest", get(app_update_manifest))
         .route("/app-update/apk", get(download_app_update_apk))
+        .route("/client-auth/requests", post(request_client_auth))
+        .route(
+            "/client-auth/requests/{request_id}",
+            get(get_client_auth_request),
+        )
         .route("/settings", get(get_settings).put(update_settings))
         .route("/projects", get(list_projects).post(create_project))
         .route("/devices/register", post(register_push_device))
@@ -170,7 +175,7 @@ async fn health() -> impl IntoResponse {
 }
 
 async fn get_settings(headers: HeaderMap, State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    if let Err(error) = authorize_request(&headers, &state) {
+    if let Err(error) = authorize_request(&headers, &state).await {
         return error.into_response();
     }
     Json(ApiResponse {
@@ -184,7 +189,7 @@ async fn update_settings(
     State(state): State<Arc<AppState>>,
     Json(input): Json<BridgeSettings>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    authorize_request(&headers, &state)?;
+    authorize_request(&headers, &state).await?;
     let settings = state
         .save_bridge_settings(input)
         .await
@@ -196,7 +201,7 @@ async fn list_sessions(
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    if let Err(error) = authorize_request(&headers, &state) {
+    if let Err(error) = authorize_request(&headers, &state).await {
         return error.into_response();
     }
     Json(ApiResponse {
@@ -209,7 +214,7 @@ async fn list_projects(
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    if let Err(error) = authorize_request(&headers, &state) {
+    if let Err(error) = authorize_request(&headers, &state).await {
         return error.into_response();
     }
     Json(ApiResponse {
@@ -223,7 +228,7 @@ async fn create_session(
     State(state): State<Arc<AppState>>,
     Json(input): Json<CreateSessionInput>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    authorize_request(&headers, &state)?;
+    authorize_request(&headers, &state).await?;
     let session = state
         .create_session(input)
         .await
@@ -236,7 +241,7 @@ async fn create_project(
     State(state): State<Arc<AppState>>,
     Json(input): Json<CreateProjectInput>,
 ) -> impl IntoResponse {
-    if let Err(error) = authorize_request(&headers, &state) {
+    if let Err(error) = authorize_request(&headers, &state).await {
         return error.into_response();
     }
     let project = state.create_project(input).await;
@@ -248,7 +253,7 @@ async fn register_push_device(
     State(state): State<Arc<AppState>>,
     Json(input): Json<RegisterPushDeviceInput>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    authorize_request(&headers, &state)?;
+    authorize_request(&headers, &state).await?;
     let client_id = read_client_id(&headers)?;
     let device = state.register_push_device(client_id, input).await;
     Ok((StatusCode::CREATED, Json(ApiResponse { data: device })))
@@ -259,7 +264,7 @@ async fn list_project_sessions(
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<ApiResponse<Vec<crate::models::SessionSummary>>>, StatusCode> {
-    authorize_request_status(&headers, &state)?;
+    authorize_request_status(&headers, &state).await?;
     let sessions = state
         .list_project_sessions(&id)
         .await
@@ -272,7 +277,7 @@ async fn transcribe_audio(
     State(state): State<Arc<AppState>>,
     mut multipart: Multipart,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    authorize_request(&headers, &state)?;
+    authorize_request(&headers, &state).await?;
     let mut file_bytes = None;
     let mut file_name = "speech.wav".to_string();
     let mut content_type = None;
@@ -328,7 +333,7 @@ async fn synthesize_speech(
     State(state): State<Arc<AppState>>,
     Json(input): Json<AudioSpeechInput>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    authorize_request(&headers, &state)?;
+    authorize_request(&headers, &state).await?;
     let (audio_bytes, content_type) = tts::synthesize_speech(
         input.input,
         input.voice,
@@ -351,7 +356,7 @@ async fn trigger_client_message(
     State(state): State<Arc<AppState>>,
     Json(input): Json<TriggerClientMessageInput>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    authorize_request(&headers, &state)?;
+    authorize_request(&headers, &state).await?;
     let result = state
         .trigger_client_message(input)
         .await
@@ -365,7 +370,7 @@ async fn list_messages(
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<ApiResponse<Vec<crate::models::ChatMessage>>>, StatusCode> {
-    authorize_request_status(&headers, &state)?;
+    authorize_request_status(&headers, &state).await?;
     let messages = state
         .list_messages(&id)
         .await
@@ -379,7 +384,7 @@ async fn send_message(
     State(state): State<Arc<AppState>>,
     Json(input): Json<SendMessageInput>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    authorize_request(&headers, &state)?;
+    authorize_request(&headers, &state).await?;
     let (user_message, pending_reply) = state
         .send_message(&id, input)
         .await
@@ -402,7 +407,7 @@ async fn summarize_reply(
     State(state): State<Arc<AppState>>,
     Json(input): Json<SummarizeReplyInput>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    authorize_request(&headers, &state)?;
+    authorize_request(&headers, &state).await?;
     let text = state
         .summarize_reply(&id, input.content)
         .await
@@ -421,7 +426,7 @@ async fn cancel_session_reply(
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    authorize_request(&headers, &state)?;
+    authorize_request(&headers, &state).await?;
     state
         .cancel_turn(&id)
         .await
@@ -435,7 +440,7 @@ async fn resolve_approval(
     State(state): State<Arc<AppState>>,
     Json(input): Json<ApprovalDecisionInput>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    authorize_request(&headers, &state)?;
+    authorize_request(&headers, &state).await?;
     state
         .submit_approval(&id, &request_id, input.choice)
         .await
@@ -449,7 +454,7 @@ async fn session_events(
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
-    authorize_request_status(&headers, &state)?;
+    authorize_request_status(&headers, &state).await?;
     if state.list_messages(&id).await.is_none() {
         return Err(StatusCode::NOT_FOUND);
     }
@@ -474,30 +479,73 @@ async fn session_events(
     ))
 }
 
-fn authorize_request(headers: &HeaderMap, state: &AppState) -> Result<(), (StatusCode, String)> {
+async fn request_client_auth(
+    State(state): State<Arc<AppState>>,
+    Json(input): Json<ClientAuthRequestInput>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let record = state
+        .request_client_auth(input)
+        .await
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    Ok((StatusCode::CREATED, Json(ApiResponse { data: record })))
+}
+
+async fn get_client_auth_request(
+    Path(request_id): Path<String>,
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let record = state
+        .get_client_auth_request(&request_id)
+        .await
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(ApiResponse { data: record }))
+}
+
+async fn authorize_request(
+    headers: &HeaderMap,
+    state: &AppState,
+) -> Result<(), (StatusCode, String)> {
     let client_id = read_client_id(headers)?;
 
-    if !state.is_client_id_allowed(client_id) {
+    let env_allowed = state.is_client_id_allowed(client_id);
+    let runtime_allowed = state.is_runtime_client_id_allowed(client_id).await;
+    if !env_allowed && !runtime_allowed {
         return Err((
             StatusCode::FORBIDDEN,
             "client id is not allowed".to_string(),
         ));
     }
 
-    if let Some(expected) = state.bridge_token() {
-        let actual = headers
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .map(str::trim)
-            .and_then(|value| value.strip_prefix("Bearer "))
-            .map(str::trim)
-            .ok_or((StatusCode::UNAUTHORIZED, "missing bearer token".to_string()))?;
-        if actual != expected {
-            return Err((StatusCode::FORBIDDEN, "invalid bearer token".to_string()));
+    let actual = bearer_token(headers);
+    if let Some(expected) = state.bridge_token()
+        && actual == Some(expected)
+    {
+        return Ok(());
+    }
+
+    if runtime_allowed {
+        let actual = actual.ok_or((StatusCode::UNAUTHORIZED, "missing bearer token".to_string()))?;
+        if state.client_token_matches(client_id, actual).await {
+            return Ok(());
         }
+        return Err((StatusCode::FORBIDDEN, "invalid bearer token".to_string()));
+    }
+
+    if state.bridge_token().is_some() {
+        return Err((StatusCode::FORBIDDEN, "invalid bearer token".to_string()));
     }
 
     Ok(())
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 fn read_client_id(headers: &HeaderMap) -> Result<&str, (StatusCode, String)> {
@@ -509,8 +557,10 @@ fn read_client_id(headers: &HeaderMap) -> Result<&str, (StatusCode, String)> {
         .ok_or((StatusCode::UNAUTHORIZED, "missing client id".to_string()))
 }
 
-fn authorize_request_status(headers: &HeaderMap, state: &AppState) -> Result<(), StatusCode> {
-    authorize_request(headers, state).map_err(|(status, _)| status)
+async fn authorize_request_status(headers: &HeaderMap, state: &AppState) -> Result<(), StatusCode> {
+    authorize_request(headers, state)
+        .await
+        .map_err(|(status, _)| status)
 }
 
 fn event_belongs_to_session(event: &SessionEvent, session_id: &str) -> bool {
