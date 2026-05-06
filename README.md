@@ -7,6 +7,39 @@ used by the mobile client and connects it to local coding agents such as
 The Flutter client lives in:
 `https://github.com/omni-stream-ai/omni-code`
 
+## Install
+
+**Homebrew (macOS / Linux):**
+
+```bash
+brew tap omni-stream-ai/omni-code-bridge
+brew install omni-code-bridge
+```
+
+**Arch Linux (AUR):**
+
+```bash
+yay -S omni-code-bridge
+```
+
+**curl (macOS / Linux):**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/omni-stream-ai/omni-code-bridge/main/scripts/install.sh | bash
+```
+
+**PowerShell (Windows):**
+
+```powershell
+powershell -ExecutionPolicy Bypass -Command "iwr https://raw.githubusercontent.com/omni-stream-ai/omni-code-bridge/main/scripts/install.ps1 -UseBasicParsing | iex"
+```
+
+**cargo install:**
+
+```bash
+cargo install omni-code-bridge
+```
+
 ## Requirements
 
 - `Rust` / `cargo`
@@ -27,6 +60,35 @@ At minimum, configure:
 
 - `ECHO_MATE_BRIDGE_TOKEN`
 - `ECHO_MATE_ALLOWED_CLIENT_IDS`
+
+## Client Authorization
+
+The bridge supports two authorization modes that can be used together:
+
+**Static mode** — set in `.env`:
+- `ECHO_MATE_BRIDGE_TOKEN`: a shared Bearer token for all clients
+- `ECHO_MATE_ALLOWED_CLIENT_IDS`: comma-separated list of allowed client IDs
+
+**Dynamic mode** — clients register and get approved via CLI:
+
+1. Client sends `POST /client-auth/requests` with `{ client_id, device_name }`
+2. Admin reviews pending requests and approves them:
+
+```bash
+# list pending requests
+omni-code-bridge client-auth list --pending
+
+# approve a specific request
+omni-code-bridge client-auth approve --request-id <request-id>
+
+# approve all pending requests at once
+omni-code-bridge client-auth approve
+```
+
+3. Client polls `GET /client-auth/requests/{request_id}` until `status` becomes `approved` and a `token` is returned
+4. Client uses the token as `Authorization: Bearer <token>` together with the `x-omni-code-client-id` header for all subsequent API calls
+
+Approved records are stored in `~/.omni-code/client-auth.json` (override with `ECHO_MATE_CLIENT_AUTH_PATH`).
 
 ## Client APK Update Endpoints
 

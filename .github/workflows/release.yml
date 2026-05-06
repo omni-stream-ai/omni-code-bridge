@@ -11,6 +11,12 @@ on:
 permissions:
   contents: write
 
+env:
+  BIN_NAME: omni-code-bridge
+  HOMEBREW_TAP_REPO: omni-stream-ai/homebrew-omni-code-bridge
+  AUR_REPO: omni-code-bridge
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   prepare-release:
     name: Prepare Release
@@ -98,9 +104,19 @@ jobs:
             asset_name: omni-code-bridge-linux-x64
             archive_ext: tar.gz
             binary_name: omni-code-bridge
+          - os: ubuntu-24.04
+            target: aarch64-unknown-linux-gnu
+            asset_name: omni-code-bridge-linux-arm64
+            archive_ext: tar.gz
+            binary_name: omni-code-bridge
           - os: macos-14
             target: aarch64-apple-darwin
             asset_name: omni-code-bridge-macos-arm64
+            archive_ext: tar.gz
+            binary_name: omni-code-bridge
+          - os: macos-14
+            target: x86_64-apple-darwin
+            asset_name: omni-code-bridge-macos-x64
             archive_ext: tar.gz
             binary_name: omni-code-bridge
           - os: windows-2022
@@ -117,7 +133,15 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Install cross-compilation tools (Linux aarch64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
       - name: Build release binary
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Package Unix artifact
@@ -202,3 +226,186 @@ jobs:
           body: ${{ steps.changelog.outputs.changelog }}
           prerelease: ${{ needs.prepare-release.outputs.prerelease }}
           files: dist/*
+
+      # ── Homebrew ──────────────────────────────────────────────────────
+      - name: Checkout Homebrew tap repository
+        if: needs.prepare-release.outputs.stable == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.HOMEBREW_TAP_REPO }}
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: Update Homebrew formula
+        if: needs.prepare-release.outputs.stable == 'true'
+        env:
+          VERSION: ${{ needs.prepare-release.outputs.cargo_version }}
+          TAG: ${{ needs.prepare-release.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          linux_x86_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/omni-code-bridge-linux-x64.tar.gz"
+          linux_arm_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/omni-code-bridge-linux-arm64.tar.gz"
+          macos_arm_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/omni-code-bridge-macos-arm64.tar.gz"
+          macos_x86_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/omni-code-bridge-macos-x64.tar.gz"
+
+          linux_x86_sha=$(sha256sum dist/omni-code-bridge-linux-x64.tar.gz | awk '{print $1}')
+          linux_arm_sha=$(sha256sum dist/omni-code-bridge-linux-arm64.tar.gz | awk '{print $1}')
+          macos_arm_sha=$(sha256sum dist/omni-code-bridge-macos-arm64.tar.gz | awk '{print $1}')
+          macos_x86_sha=$(sha256sum dist/omni-code-bridge-macos-x64.tar.gz | awk '{print $1}')
+
+          mkdir -p homebrew-tap/Formula
+          cat > homebrew-tap/Formula/omni-code-bridge.rb <<EOF
+          class OmniCodeBridge < Formula
+            desc "Rust bridge for Omni Code — connects mobile clients to local coding agents"
+            homepage "https://github.com/${GITHUB_REPOSITORY}"
+            version "${VERSION}"
+            license "MIT"
+
+            on_macos do
+              on_arm do
+                url "${macos_arm_url}"
+                sha256 "${macos_arm_sha}"
+              end
+
+              on_intel do
+                url "${macos_x86_url}"
+                sha256 "${macos_x86_sha}"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "${linux_arm_url}"
+                sha256 "${linux_arm_sha}"
+              end
+
+              on_intel do
+                url "${linux_x86_url}"
+                sha256 "${linux_x86_sha}"
+              end
+            end
+
+            def install
+              bin.install "omni-code-bridge"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/omni-code-bridge --version")
+            end
+          end
+          EOF
+
+      - name: Commit and push Homebrew formula update
+        if: needs.prepare-release.outputs.stable == 'true'
+        env:
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd homebrew-tap
+          git add Formula/omni-code-bridge.rb
+          if git diff --cached --quiet; then
+            echo "No Homebrew formula changes to commit."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "omni-code-bridge ${VERSION}"
+          git push origin HEAD
+
+      # ── AUR ──────────────────────────────────────────────────────────
+      - name: Publish to AUR
+        if: needs.prepare-release.outputs.stable == 'true'
+        env:
+          VERSION: ${{ needs.prepare-release.outputs.cargo_version }}
+          TAG: ${{ needs.prepare-release.outputs.tag }}
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${AUR_SSH_PRIVATE_KEY}" ]]; then
+            echo "AUR_SSH_PRIVATE_KEY not set, skipping AUR publish."
+            exit 0
+          fi
+
+          sudo apt-get update -q && sudo apt-get install -y openssh-client
+          mkdir -p ~/.ssh
+          echo "${AUR_SSH_PRIVATE_KEY}" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null
+
+          git clone ssh://aur@aur.archlinux.org/${AUR_REPO}.git aur-pkg
+          cd aur-pkg
+
+          source_url="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${TAG}.tar.gz"
+
+          cat > omni-code-bridge.service <<'SVCEOF'
+          [Unit]
+          Description=Omni Code Bridge
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          ExecStart=/usr/bin/omni-code-bridge serve
+          Restart=on-failure
+          RestartSec=3
+          Environment=RUST_LOG=info
+          EnvironmentFile=-/etc/omni-code-bridge/.env
+
+          [Install]
+          WantedBy=multi-user.target
+          SVCEOF
+
+          cat > PKGBUILD <<EOF
+          # Maintainer: Junjie <junjie@omni-stream.ai>
+          pkgname=omni-code-bridge
+          pkgver=${VERSION}
+          pkgrel=1
+          pkgdesc="Rust bridge for Omni Code — connects mobile clients to local coding agents"
+          arch=('x86_64' 'aarch64')
+          url="https://github.com/${GITHUB_REPOSITORY}"
+          license=('MIT')
+          depends=('gcc-libs')
+          makedepends=('cargo')
+          backup=('etc/omni-code-bridge/.env')
+          source=("\$pkgname-\$pkgver.tar.gz::${source_url}"
+                  "omni-code-bridge.service")
+          sha256sums=('SKIP'
+                      'SKIP')
+
+          build() {
+              cd "\$pkgname-\$pkgver"
+              cargo build --release --locked
+          }
+
+          check() {
+              cd "\$pkgname-\$pkgver"
+              cargo test --release --locked
+          }
+
+          package() {
+              cd "\$pkgname-\$pkgver"
+              install -Dm755 "target/release/\$pkgname" "\$pkgdir/usr/bin/\$pkgname"
+              install -Dm644 LICENSE "\$pkgdir/usr/share/licenses/\$pkgname/LICENSE"
+              install -Dm644 "\$srcdir/omni-code-bridge.service" "\$pkgdir/usr/lib/systemd/system/omni-code-bridge.service"
+              install -Dm644 /dev/null "\$pkgdir/etc/omni-code-bridge/.env"
+          }
+          EOF
+
+          makepkg --printsrcinfo > .SRCINFO
+
+          git add PKGBUILD .SRCINFO
+          if git diff --cached --quiet; then
+            echo "No AUR changes to commit."
+            exit 0
+          fi
+
+          git config user.email "junjie@omni-stream.ai"
+          git config user.name "Junjie"
+          git commit -m "Update to ${VERSION}"
+          GIT_SSH_COMMAND="ssh -i ~/.ssh/aur -o StrictHostKeyChecking=no" git push origin master
