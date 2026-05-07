@@ -10,6 +10,16 @@ pub enum AgentKind {
     Custom,
 }
 
+#[cfg(test)]
+impl AgentKind {
+    pub const ALL: [AgentKind; 4] = [
+        AgentKind::Codex,
+        AgentKind::ClaudeCode,
+        AgentKind::OpenCode,
+        AgentKind::Custom,
+    ];
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionStatus {
@@ -20,7 +30,7 @@ pub enum SessionStatus {
     Failed,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageRole {
     User,

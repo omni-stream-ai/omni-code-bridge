@@ -8,9 +8,10 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use serde_json::Value;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
     process::{Child, Command},
     sync::mpsc,
     time::sleep,
@@ -77,10 +78,7 @@ impl ProviderRegistry {
         let mut providers: HashMap<AgentKind, Arc<dyn AgentProvider>> = HashMap::new();
         providers.insert(AgentKind::Codex, Arc::new(CodexProvider::new()));
         providers.insert(AgentKind::ClaudeCode, Arc::new(ClaudeCodeProvider::new()));
-        providers.insert(
-            AgentKind::OpenCode,
-            Arc::new(StubProvider::new(AgentKind::OpenCode)),
-        );
+        providers.insert(AgentKind::OpenCode, Arc::new(OpenCodeProvider::new()));
         providers.insert(
             AgentKind::Custom,
             Arc::new(StubProvider::new(AgentKind::Custom)),
@@ -151,6 +149,211 @@ impl AgentProvider for StubProvider {
     ) -> Result<String> {
         let summary = content.chars().take(60).collect::<String>();
         Ok(summary)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{MessageRole, SessionStatus};
+
+    #[test]
+    fn provider_registry_has_provider_for_every_agent_kind() {
+        let registry = ProviderRegistry::new();
+
+        for kind in AgentKind::ALL {
+            assert!(
+                registry.get(kind).is_some(),
+                "missing provider for {kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_streaming_state_parses_content_status_and_completion() {
+        let mut state = CodexAppServerStreamingState::default();
+
+        match state.ingest_value(&serde_json::json!({
+            "method": "item/agentMessage/delta",
+            "params": {
+                "itemId": "msg-1",
+                "delta": "hello"
+            }
+        })) {
+            CodexAppServerEvent::Content(text) => assert_eq!(text, "hello"),
+            _ => panic!("expected content delta"),
+        }
+
+        match state.ingest_value(&serde_json::json!({
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "id": "msg-1",
+                    "type": "agentMessage",
+                    "text": "hello world"
+                }
+            }
+        })) {
+            CodexAppServerEvent::Content(text) => assert_eq!(text, "hello world"),
+            _ => panic!("expected completed content"),
+        }
+
+        match state.ingest_value(&serde_json::json!({
+            "method": "turn/completed",
+            "params": {
+                "turn": {
+                    "status": "completed"
+                }
+            }
+        })) {
+            CodexAppServerEvent::TurnCompleted => {}
+            _ => panic!("expected turn completion"),
+        }
+
+        assert_eq!(state.finish_text().as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn codex_streaming_state_maps_approval_requests() {
+        let mut state = CodexAppServerStreamingState::default();
+
+        match state.ingest_value(&serde_json::json!({
+            "id": 7,
+            "method": "item/commandExecution/requestApproval",
+            "params": {
+                "command": "cargo test",
+                "reason": "run tests",
+                "availableDecisions": ["accept", "acceptForSession", "cancel"]
+            }
+        })) {
+            CodexAppServerEvent::ApprovalRequested(pending) => {
+                assert_eq!(pending.request.request_id, "7");
+                assert_eq!(pending.request.command.as_deref(), Some("cargo test"));
+                assert_eq!(pending.request.reason.as_deref(), Some("run tests"));
+                assert!(pending.request.allow_accept_for_session);
+                assert!(pending.request.allow_cancel);
+                assert!(pending.request.resolvable);
+            }
+            _ => panic!("expected approval request"),
+        }
+    }
+
+    #[test]
+    fn claude_streaming_state_parses_assistant_result_and_errors() {
+        let mut state = ClaudeStreamingState::default();
+
+        let rendered = state
+            .ingest_line(
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"partial"}]}}"#,
+            )
+            .expect("valid assistant event");
+        assert_eq!(rendered.as_deref(), Some("partial"));
+        assert_eq!(state.finish_text().as_deref(), Some("partial"));
+
+        let rendered = state
+            .ingest_line(r#"{"type":"result","result":"final answer","is_error":false}"#)
+            .expect("valid result event");
+        assert_eq!(rendered.as_deref(), Some("final answer"));
+        assert_eq!(state.finish_text().as_deref(), Some("final answer"));
+
+        let error = state
+            .ingest_line(r#"{"type":"result","result":"failed","is_error":true}"#)
+            .expect_err("error result should fail");
+        assert!(error.to_string().contains("failed"));
+    }
+
+    #[tokio::test]
+    async fn stub_provider_completes_when_called_directly() {
+        let state = Arc::new(AppState::new().await);
+        let provider = StubProvider::new(AgentKind::Custom);
+        let session = SessionSummary {
+            id: "stub-session".to_string(),
+            project_id: "project".to_string(),
+            title: "Stub".to_string(),
+            agent: AgentKind::Custom,
+            brief_reply_mode: false,
+            status: SessionStatus::Running,
+            updated_at: chrono::Utc::now(),
+            unread_count: 0,
+            last_message_preview: None,
+            pending_approval: None,
+        };
+        let input = ChatMessage {
+            id: "input".to_string(),
+            session_id: session.id.clone(),
+            role: MessageRole::User,
+            content: "ping".to_string(),
+            created_at: chrono::Utc::now(),
+        };
+        let reply = ChatMessage {
+            id: "reply".to_string(),
+            session_id: session.id.clone(),
+            role: MessageRole::Assistant,
+            content: String::new(),
+            created_at: chrono::Utc::now(),
+        };
+
+        let result = provider
+            .run_session(Arc::clone(&state), session, input, reply)
+            .await
+            .expect_err("direct call without seeded reply should expose state contract");
+        assert!(result.to_string().contains("unknown message"));
+    }
+
+    #[test]
+    fn opencode_streaming_state_parses_session_text_tools_and_errors() {
+        let mut state = OpenCodeStreamingState::default();
+
+        match state
+            .ingest_line(
+                r#"{"type":"step_start","timestamp":1767036059338,"sessionID":"ses_123","part":{"type":"step-start"}}"#,
+            )
+            .expect("valid step start")
+        {
+            OpenCodeStreamEvent::Session(session_id) => assert_eq!(session_id, "ses_123"),
+            _ => panic!("expected session event"),
+        }
+
+        match state
+            .ingest_line(
+                r#"{"type":"text","timestamp":1767036064268,"sessionID":"ses_123","part":{"type":"text","text":"hello"}}"#,
+            )
+            .expect("valid text")
+        {
+            OpenCodeStreamEvent::Content(text) => assert_eq!(text, "hello"),
+            _ => panic!("expected text content"),
+        }
+
+        match state
+            .ingest_line(
+                r#"{"type":"tool_use","timestamp":1767036064269,"sessionID":"ses_123","part":{"tool":"bash","status":"completed","input":{"command":"cargo test"}}}"#,
+            )
+            .expect("valid tool use")
+        {
+            OpenCodeStreamEvent::Status(status) => assert!(status.contains("cargo test")),
+            _ => panic!("expected tool status"),
+        }
+
+        match state
+            .ingest_line(
+                r#"{"type":"step_finish","timestamp":1767036064273,"sessionID":"ses_123","part":{"type":"step-finish","reason":"stop"}}"#,
+            )
+            .expect("valid step finish")
+        {
+            OpenCodeStreamEvent::None => {}
+            _ => panic!("expected no content on final step"),
+        }
+        assert_eq!(state.finish_text().as_deref(), Some("hello"));
+
+        match state
+            .ingest_line(
+                r#"{"type":"error","timestamp":1767036065000,"sessionID":"ses_123","error":{"name":"APIError","data":{"message":"rate limited"}}}"#,
+            )
+            .expect("valid error")
+        {
+            OpenCodeStreamEvent::Error(message) => assert!(message.contains("rate limited")),
+            _ => panic!("expected error event"),
+        }
     }
 }
 
@@ -404,6 +607,69 @@ impl AgentProvider for ClaudeCodeProvider {
     }
 }
 
+struct OpenCodeProvider;
+
+impl OpenCodeProvider {
+    fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl AgentProvider for OpenCodeProvider {
+    async fn list_projects(&self) -> HashMap<String, ProjectSummary> {
+        match OpenCodeHttpClient::start().await {
+            Ok(mut client) => {
+                let result = client.list_projects().await.unwrap_or_default();
+                client.shutdown().await;
+                result
+            }
+            Err(_) => HashMap::new(),
+        }
+    }
+
+    async fn list_sessions(&self) -> HashMap<String, SessionSummary> {
+        match OpenCodeHttpClient::start().await {
+            Ok(mut client) => {
+                let result = client.list_sessions().await.unwrap_or_default();
+                client.shutdown().await;
+                result
+            }
+            Err(_) => HashMap::new(),
+        }
+    }
+
+    async fn list_messages(&self, session_id: &str) -> Option<Vec<ChatMessage>> {
+        let mut client = OpenCodeHttpClient::start().await.ok()?;
+        let result = client.list_messages(session_id).await.ok();
+        client.shutdown().await;
+        result
+    }
+
+    async fn default_runtime_ref(&self, _session_id: &str) -> Option<String> {
+        None
+    }
+
+    async fn run_session(
+        &self,
+        state: Arc<AppState>,
+        session: SessionSummary,
+        input: ChatMessage,
+        reply: ChatMessage,
+    ) -> Result<()> {
+        run_opencode(state, &session, &input, &reply).await
+    }
+
+    async fn summarize_reply(
+        &self,
+        state: Arc<AppState>,
+        session: SessionSummary,
+        content: String,
+    ) -> Result<String> {
+        summarize_with_opencode(state, &session, &content).await
+    }
+}
+
 fn spawn_codex_app_server(cwd: &Path) -> Result<Child> {
     let binary = codex_binary_path();
     Command::new(&binary)
@@ -458,6 +724,302 @@ fn codex_binary_path() -> PathBuf {
         .into_iter()
         .find(|path| path.is_file())
         .unwrap_or_else(|| PathBuf::from("codex"))
+}
+
+fn opencode_binary_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("ECHO_MATE_OPENCODE_BIN")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        return path;
+    }
+
+    find_executable_in_path("opencode").unwrap_or_else(|| PathBuf::from("opencode"))
+}
+
+struct OpenCodeHttpClient {
+    base_url: String,
+    http: reqwest::Client,
+    child: Child,
+    stderr_task: tokio::task::JoinHandle<std::result::Result<String, std::io::Error>>,
+}
+
+impl OpenCodeHttpClient {
+    async fn start() -> Result<Self> {
+        let mut child = Command::new(opencode_binary_path())
+            .arg("serve")
+            .arg("--hostname")
+            .arg("127.0.0.1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .context("failed to spawn `opencode serve`")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("opencode server did not expose stdout")?;
+        let stderr = child
+            .stderr
+            .take()
+            .context("opencode server did not expose stderr")?;
+        let stderr_task = tokio::spawn(async move {
+            let mut reader = BufReader::new(stderr).lines();
+            let mut output = String::new();
+            while let Some(line) = reader.next_line().await? {
+                if !output.is_empty() {
+                    output.push('\n');
+                }
+                output.push_str(&strip_ansi(&line));
+            }
+            Ok::<_, std::io::Error>(output)
+        });
+        let base_url = read_opencode_server_url(stdout).await?;
+        Ok(Self {
+            base_url,
+            http: reqwest::Client::new(),
+            child,
+            stderr_task,
+        })
+    }
+
+    async fn shutdown(&mut self) {
+        let _ = self.child.kill().await;
+        self.stderr_task.abort();
+    }
+
+    async fn list_projects(&self) -> Result<HashMap<String, ProjectSummary>> {
+        let sessions = self.get_json("/session").await?;
+        let mut projects = HashMap::new();
+        for session in sessions.as_array().into_iter().flatten() {
+            let Some(directory) = session.get("directory").and_then(Value::as_str) else {
+                continue;
+            };
+            let project_id = crate::session_store::project_id_for_path(directory);
+            let updated_at = opencode_time(session.pointer("/time/updated"));
+            let preview = session
+                .get("title")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            projects
+                .entry(project_id.clone())
+                .and_modify(|project: &mut ProjectSummary| {
+                    project.session_count += 1;
+                    if updated_at > project.updated_at {
+                        project.updated_at = updated_at;
+                        project.last_session_preview = preview.clone();
+                    }
+                })
+                .or_insert_with(|| ProjectSummary {
+                    id: project_id,
+                    name: project_name_from_path(directory),
+                    root_path: directory.to_string(),
+                    updated_at,
+                    session_count: 1,
+                    last_session_preview: preview,
+                });
+        }
+        Ok(projects)
+    }
+
+    async fn list_sessions(&self) -> Result<HashMap<String, SessionSummary>> {
+        let sessions = self.get_json("/session").await?;
+        Ok(sessions
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(opencode_session_summary)
+            .map(|session| (session.id.clone(), session))
+            .collect())
+    }
+
+    async fn list_messages(&self, session_id: &str) -> Result<Vec<ChatMessage>> {
+        let value = self
+            .get_json(&format!("/session/{}/message", url_path_escape(session_id)))
+            .await?;
+        Ok(opencode_messages_from_value(session_id, &value))
+    }
+
+    async fn latest_assistant_text(&self, session_id: &str, project_root: &Path) -> Result<String> {
+        let value = self
+            .get_json_with_query(
+                &format!("/session/{}/message", url_path_escape(session_id)),
+                &[("directory", project_root.display().to_string())],
+            )
+            .await?;
+        Ok(opencode_messages_from_value(session_id, &value)
+            .into_iter()
+            .rev()
+            .find(|message| matches!(message.role, crate::models::MessageRole::Assistant))
+            .map(|message| message.content)
+            .unwrap_or_default())
+    }
+
+    async fn create_session(&self, project_root: &Path, title: &str) -> Result<String> {
+        let value = self
+            .post_json_with_query(
+                "/session",
+                &[("directory", project_root.display().to_string())],
+                serde_json::json!({
+                    "title": title,
+                    "permission": [{
+                        "permission": "bash",
+                        "pattern": "*",
+                        "action": "ask",
+                    }],
+                }),
+            )
+            .await?;
+        value
+            .get("id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .context("opencode session create did not return id")
+    }
+
+    async fn prompt_async(
+        &self,
+        session_id: &str,
+        project_root: &Path,
+        prompt: &str,
+    ) -> Result<()> {
+        self.post_json_with_query(
+            &format!("/session/{}/prompt_async", url_path_escape(session_id)),
+            &[("directory", project_root.display().to_string())],
+            serde_json::json!({
+                "parts": [{
+                    "type": "text",
+                    "text": prompt,
+                }],
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn reply_permission(&self, request_id: &str, choice: &ApprovalChoice) -> Result<()> {
+        let reply = match choice {
+            ApprovalChoice::Accept => "once",
+            ApprovalChoice::AcceptForSession | ApprovalChoice::AlwaysAllow => "always",
+            ApprovalChoice::Decline | ApprovalChoice::Cancel => "reject",
+        };
+        self.post_json(
+            &format!("/permission/{}/reply", url_path_escape(request_id)),
+            serde_json::json!({ "reply": reply }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn event_stream(
+        &self,
+        project_root: &Path,
+    ) -> Result<mpsc::UnboundedReceiver<Result<String>>> {
+        let response = self
+            .http
+            .get(format!("{}/event", self.base_url))
+            .query(&[("directory", project_root.display().to_string())])
+            .send()
+            .await
+            .context("failed to connect opencode event stream")?
+            .error_for_status()
+            .context("opencode event stream failed")?;
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut stream = response.bytes_stream();
+            let mut buffer = Vec::<u8>::new();
+            while let Some(chunk) = stream.next().await {
+                match chunk {
+                    Ok(bytes) => {
+                        buffer.extend_from_slice(&bytes);
+                        while let Some(index) = buffer.iter().position(|byte| *byte == b'\n') {
+                            let line = buffer.drain(..=index).collect::<Vec<_>>();
+                            let line = String::from_utf8_lossy(&line).trim().to_string();
+                            let _ = tx.send(Ok(line));
+                        }
+                    }
+                    Err(error) => {
+                        let _ = tx.send(Err(error.into()));
+                        return;
+                    }
+                }
+            }
+        });
+        Ok(rx)
+    }
+
+    async fn get_json(&self, path: &str) -> Result<Value> {
+        self.get_json_with_query(path, &[]).await
+    }
+
+    async fn get_json_with_query(&self, path: &str, query: &[(&str, String)]) -> Result<Value> {
+        let response = self
+            .http
+            .get(format!("{}{}", self.base_url, path))
+            .query(query)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(response.json().await?)
+    }
+
+    async fn post_json(&self, path: &str, body: Value) -> Result<Value> {
+        self.post_json_with_query(path, &[], body).await
+    }
+
+    async fn post_json_with_query(
+        &self,
+        path: &str,
+        query: &[(&str, String)],
+        body: Value,
+    ) -> Result<Value> {
+        let url = format!("{}{}", self.base_url, path);
+        let response = self
+            .http
+            .post(&url)
+            .query(query)
+            .json(&body)
+            .send()
+            .await?;
+        let status = response.status();
+        if status.is_success() {
+            Ok(response.json().await.unwrap_or(Value::Null))
+        } else {
+            let body_text = response.text().await.unwrap_or_default();
+            eprintln!(
+                "[opencode] HTTP {status} {url} body={body_text}"
+            );
+            bail!("opencode HTTP {status}: {body_text}");
+        }
+    }
+}
+
+async fn read_opencode_server_url(stdout: impl AsyncRead + Unpin) -> Result<String> {
+    let mut lines = BufReader::new(stdout).lines();
+    let deadline = tokio::time::sleep(Duration::from_secs(10));
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            line = lines.next_line() => {
+                let Some(line) = line? else {
+                    bail!("opencode server exited before printing URL");
+                };
+                if let Some(url) = extract_first_http_url(&strip_ansi(&line)) {
+                    return Ok(url);
+                }
+            }
+            _ = &mut deadline => {
+                bail!("timed out waiting for opencode server URL");
+            }
+        }
+    }
+}
+
+fn extract_first_http_url(text: &str) -> Option<String> {
+    text.split_whitespace()
+        .find(|part| part.starts_with("http://") || part.starts_with("https://"))
+        .map(|part| part.trim_end_matches('/').to_string())
 }
 
 fn find_executable_in_path(name: &str) -> Option<PathBuf> {
@@ -961,6 +1523,151 @@ async fn run_claude_code(
     Ok(())
 }
 
+async fn run_opencode(
+    state: Arc<AppState>,
+    session: &SessionSummary,
+    input: &ChatMessage,
+    reply: &ChatMessage,
+) -> Result<()> {
+    let project_root = state
+        .project_root_path_for_session(&session.id)
+        .await
+        .map(PathBuf::from)
+        .map_err(anyhow::Error::msg)?;
+    let mut client = OpenCodeHttpClient::start().await?;
+    let opencode_session_id =
+        if let Some(session_id) = state.provider_session_ref(&session.id).await {
+            session_id
+        } else {
+            let session_id = client
+                .create_session(&project_root, &session.title)
+                .await
+                .context("failed to create opencode session")?;
+            state
+                .set_provider_session_ref(&session.id, Some(session_id.clone()))
+                .await;
+            session_id
+        };
+
+    let mut last_rendered = String::new();
+    let mut full_text = String::new();
+    let (approval_tx, mut approval_rx) = mpsc::unbounded_channel();
+    state.set_approval_sender(&session.id, approval_tx).await;
+    let prompt = if let Some(system_prompt) = brief_reply_developer_prompt(session) {
+        format!("{system_prompt}\n\n{}", input.content)
+    } else {
+        input.content.clone()
+    };
+    client
+        .prompt_async(&opencode_session_id, &project_root, &prompt)
+        .await
+        .context("failed to send opencode prompt")?;
+    let mut event_stream = client
+        .event_stream(&project_root)
+        .await
+        .context("failed to subscribe to opencode events")?;
+    let mut pending_approval: Option<PendingApproval> = None;
+
+    loop {
+        tokio::select! {
+            maybe_line = event_stream.recv() => {
+                let Some(line) = maybe_line else {
+                    break;
+                };
+                let line = line?;
+                let Some(event) = parse_sse_json_event(&line) else {
+                    continue;
+                };
+                let event_type = event.get("type").and_then(Value::as_str).unwrap_or_default();
+                let properties = event.get("properties").unwrap_or(&Value::Null);
+                let event_session_id = properties
+                    .get("sessionID")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if !event_session_id.is_empty() && event_session_id != opencode_session_id {
+                    continue;
+                }
+
+                match event_type {
+                    "message.part.delta" => {
+                        let delta = properties.get("delta").and_then(Value::as_str).unwrap_or_default();
+                        if properties.get("field").and_then(Value::as_str).unwrap_or("text") == "text"
+                            && !delta.is_empty()
+                        {
+                            full_text.push_str(delta);
+                            push_incremental_text(&state, &session.id, &reply.id, &mut last_rendered, &full_text).await;
+                        }
+                    }
+                    "message.part.updated" => {
+                        if let Some(status) = render_opencode_part_status(properties.get("part").unwrap_or(&Value::Null)) {
+                            state.emit_system_message(&session.id, status).await;
+                        }
+                    }
+                    "permission.asked" => {
+                        let request = opencode_permission_to_approval(properties);
+                        if let Some(choice) = auto_approve_opencode_request(&request, &project_root).await? {
+                            client.reply_permission(&request.request_id, &choice).await?;
+                            state.resolve_approval(&session.id, &request.request_id, choice).await;
+                        } else {
+                            pending_approval = Some(PendingApproval {
+                                request: request.clone(),
+                                last_choice: None,
+                            });
+                            state.raise_approval(&session.id, request).await;
+                        }
+                    }
+                    "permission.replied" => {
+                        let request_id = properties
+                            .get("requestID")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        if let Some(pending) = pending_approval.take() {
+                            let choice = pending.last_choice.unwrap_or(ApprovalChoice::Accept);
+                            state.resolve_approval(&session.id, request_id, choice).await;
+                        }
+                    }
+                    "session.error" => {
+                        bail!("{}", render_opencode_error(properties));
+                    }
+                    "session.idle" => break,
+                    "session.status" => {
+                        if let Some(status) = properties.pointer("/status/type").and_then(Value::as_str)
+                            && status != "idle"
+                        {
+                            state.emit_system_message(&session.id, format!("[opencode] {status}")).await;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Some(choice) = approval_rx.recv(), if pending_approval.is_some() => {
+                let request = pending_approval
+                    .as_mut()
+                    .context("approval state disappeared unexpectedly")?;
+                request.last_choice = Some(choice.clone());
+                client.reply_permission(&request.request.request_id, &choice).await?;
+            }
+        }
+    }
+
+    if full_text.trim().is_empty() {
+        full_text = client
+            .latest_assistant_text(&opencode_session_id, &project_root)
+            .await
+            .unwrap_or_default();
+    }
+    let text = (!full_text.trim().is_empty())
+        .then(|| full_text.trim().to_string())
+        .context("opencode response did not include assistant text")?;
+    push_incremental_text(&state, &session.id, &reply.id, &mut last_rendered, &text).await;
+    client.shutdown().await;
+    state
+        .finish_assistant_message(&session.id, &reply.id)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    Ok(())
+}
+
 async fn summarize_with_codex(
     state: Arc<AppState>,
     session: &SessionSummary,
@@ -1217,6 +1924,34 @@ async fn summarize_with_claude_code(
     let text = final_text
         .or_else(|| parsed.finish_text())
         .context("claude summary did not include assistant text")?;
+    Ok(normalize_summary_output(&text))
+}
+
+async fn summarize_with_opencode(
+    state: Arc<AppState>,
+    session: &SessionSummary,
+    content: &str,
+) -> Result<String> {
+    let project_root = state
+        .project_root_path_for_session(&session.id)
+        .await
+        .map(PathBuf::from)
+        .map_err(anyhow::Error::msg)?;
+    let mut client = OpenCodeHttpClient::start().await?;
+    let session_id = client
+        .create_session(&project_root, "omni-code summary")
+        .await
+        .context("failed to create opencode summary session")?;
+    client
+        .prompt_async(&session_id, &project_root, &summary_prompt(content))
+        .await
+        .context("failed to send opencode summary prompt")?;
+    wait_for_opencode_session_idle(&mut client, &session_id, &project_root).await?;
+    let text = client
+        .latest_assistant_text(&session_id, &project_root)
+        .await
+        .context("opencode summary did not include assistant text")?;
+    client.shutdown().await;
     Ok(normalize_summary_output(&text))
 }
 
@@ -2126,6 +2861,355 @@ impl ClaudeStreamingState {
         let text = blocks.join("\n\n").trim().to_string();
         if text.is_empty() { None } else { Some(text) }
     }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct OpenCodeStreamingState {
+    session_id: Option<String>,
+    assistant_text: String,
+    latest_status: Option<String>,
+    finished: bool,
+}
+
+#[cfg(test)]
+enum OpenCodeStreamEvent {
+    None,
+    Content(String),
+    Status(String),
+    Session(String),
+    Error(String),
+}
+
+#[cfg(test)]
+impl OpenCodeStreamingState {
+    fn ingest_line(&mut self, line: &str) -> Result<OpenCodeStreamEvent> {
+        let value = serde_json::from_str::<Value>(line)
+            .with_context(|| "opencode produced invalid JSON")?;
+        let Some(map) = value.as_object() else {
+            return Ok(OpenCodeStreamEvent::None);
+        };
+
+        if self.session_id.is_none()
+            && let Some(session_id) = value.get("sessionID").and_then(Value::as_str)
+        {
+            self.session_id = Some(session_id.to_string());
+            return Ok(OpenCodeStreamEvent::Session(session_id.to_string()));
+        }
+
+        match map.get("type").and_then(Value::as_str).unwrap_or_default() {
+            "text" => {
+                let text = value
+                    .pointer("/part/text")
+                    .or_else(|| value.get("text"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if text.is_empty() {
+                    return Ok(OpenCodeStreamEvent::None);
+                }
+                self.assistant_text.push_str(text);
+                Ok(OpenCodeStreamEvent::Content(self.assistant_text.clone()))
+            }
+            "step_start" | "step-start" => Ok(OpenCodeStreamEvent::Status(
+                "[opencode] step started".to_string(),
+            )),
+            "step_finish" | "step-finish" => {
+                self.finished = true;
+                self.latest_status = None;
+                Ok(OpenCodeStreamEvent::None)
+            }
+            "tool_use" | "tool-use" => render_opencode_tool_status(&value)
+                .map(OpenCodeStreamEvent::Status)
+                .map(Ok)
+                .unwrap_or(Ok(OpenCodeStreamEvent::None)),
+            "error" => Ok(OpenCodeStreamEvent::Error(render_opencode_error(&value))),
+            "session" => value
+                .get("id")
+                .or_else(|| value.get("sessionID"))
+                .and_then(Value::as_str)
+                .map(|session_id| {
+                    self.session_id = Some(session_id.to_string());
+                    OpenCodeStreamEvent::Session(session_id.to_string())
+                })
+                .map(Ok)
+                .unwrap_or(Ok(OpenCodeStreamEvent::None)),
+            other if other.is_empty() => Ok(OpenCodeStreamEvent::None),
+            other => Ok(OpenCodeStreamEvent::Status(format!(
+                "[debug:opencode:type] unhandled type={other}"
+            ))),
+        }
+    }
+
+    fn finish_text(&self) -> Option<String> {
+        let text = self.assistant_text.trim();
+        if text.is_empty() {
+            None
+        } else {
+            Some(text.to_string())
+        }
+    }
+}
+
+#[cfg(test)]
+fn render_opencode_tool_status(value: &Value) -> Option<String> {
+    let part = value.get("part").unwrap_or(value);
+    let tool = part
+        .get("tool")
+        .or_else(|| part.get("name"))
+        .or_else(|| value.get("tool"))
+        .and_then(Value::as_str)
+        .unwrap_or("tool");
+    let status = part
+        .get("status")
+        .or_else(|| value.get("status"))
+        .and_then(Value::as_str)
+        .unwrap_or("running");
+    let command = part
+        .pointer("/input/command")
+        .or_else(|| part.pointer("/args/command"))
+        .or_else(|| part.get("command"))
+        .and_then(Value::as_str)
+        .map(|text| truncate_tool_text(text, 120));
+    Some(match command.filter(|text| !text.is_empty()) {
+        Some(command) => format!("[opencode:{tool}:{status}] {command}"),
+        None => format!("[opencode:{tool}:{status}]"),
+    })
+}
+
+fn render_opencode_error(value: &Value) -> String {
+    value
+        .pointer("/error/data/message")
+        .or_else(|| value.pointer("/error/message"))
+        .or_else(|| value.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or("opencode run failed")
+        .to_string()
+}
+
+fn parse_sse_json_event(line: &str) -> Option<Value> {
+    line.strip_prefix("data:")
+        .map(str::trim)
+        .filter(|data| !data.is_empty() && *data != "[DONE]")
+        .and_then(|data| serde_json::from_str::<Value>(data).ok())
+}
+
+fn opencode_session_summary(value: &Value) -> Option<SessionSummary> {
+    let id = value.get("id").and_then(Value::as_str)?.to_string();
+    let directory = value.get("directory").and_then(Value::as_str)?;
+    let title = value
+        .get("title")
+        .and_then(Value::as_str)
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or("opencode session")
+        .to_string();
+    Some(SessionSummary {
+        id,
+        project_id: crate::session_store::project_id_for_path(directory),
+        title: title.clone(),
+        agent: AgentKind::OpenCode,
+        brief_reply_mode: false,
+        status: crate::models::SessionStatus::Waiting,
+        updated_at: opencode_time(value.pointer("/time/updated")),
+        unread_count: 0,
+        last_message_preview: Some(title),
+        pending_approval: None,
+    })
+}
+
+fn opencode_messages_from_value(session_id: &str, value: &Value) -> Vec<ChatMessage> {
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let info = entry.get("info")?;
+            let role = match info.get("role").and_then(Value::as_str)? {
+                "user" => crate::models::MessageRole::User,
+                "assistant" => crate::models::MessageRole::Assistant,
+                _ => return None,
+            };
+            let content = opencode_parts_text(entry.get("parts").unwrap_or(&Value::Null));
+            if content.trim().is_empty() {
+                return None;
+            }
+            Some(ChatMessage {
+                id: info
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                session_id: session_id.to_string(),
+                role,
+                content,
+                created_at: opencode_time(info.pointer("/time/created")),
+            })
+        })
+        .collect()
+}
+
+fn opencode_parts_text(parts: &Value) -> String {
+    parts
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|part| match part.get("type").and_then(Value::as_str) {
+            Some("text") => part.get("text").and_then(Value::as_str),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
+        .trim()
+        .to_string()
+}
+
+fn opencode_time(value: Option<&Value>) -> chrono::DateTime<chrono::Utc> {
+    let millis = value.and_then(Value::as_i64).unwrap_or(0);
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(millis).unwrap_or_else(chrono::Utc::now)
+}
+
+fn project_name_from_path(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(path)
+        .to_string()
+}
+
+fn opencode_permission_to_approval(value: &Value) -> ApprovalRequest {
+    let request_id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let permission = value
+        .get("permission")
+        .and_then(Value::as_str)
+        .unwrap_or("permission");
+    let patterns = value
+        .get("patterns")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|text| !text.is_empty());
+    let metadata_command = value
+        .pointer("/metadata/command")
+        .or_else(|| value.pointer("/metadata/description"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let command = metadata_command.or(patterns);
+    ApprovalRequest {
+        request_id,
+        kind: if command.is_some() {
+            ApprovalKind::ExecCommand
+        } else {
+            ApprovalKind::Permissions
+        },
+        command,
+        reason: Some(format!("OpenCode 请求 {permission} 权限")),
+        allow_accept_for_session: true,
+        allow_cancel: true,
+        resolvable: true,
+    }
+}
+
+async fn auto_approve_opencode_request(
+    request: &ApprovalRequest,
+    project_root: &Path,
+) -> Result<Option<ApprovalChoice>> {
+    match auto_approve_codex_request(request, project_root).await? {
+        Some(ApprovalChoice::Accept) => Ok(Some(ApprovalChoice::Accept)),
+        Some(other) => Ok(Some(other)),
+        None => Ok(None),
+    }
+}
+
+fn render_opencode_part_status(part: &Value) -> Option<String> {
+    match part.get("type").and_then(Value::as_str)? {
+        "tool" => {
+            let tool = part.get("tool").and_then(Value::as_str).unwrap_or("tool");
+            let status = part
+                .pointer("/state/status")
+                .and_then(Value::as_str)
+                .unwrap_or("running");
+            let command = part
+                .pointer("/state/input/command")
+                .or_else(|| part.pointer("/state/title"))
+                .and_then(Value::as_str)
+                .map(|text| truncate_tool_text(text, 120));
+            Some(match command.filter(|text| !text.is_empty()) {
+                Some(command) => format!("[opencode:{tool}:{status}] {command}"),
+                None => format!("[opencode:{tool}:{status}]"),
+            })
+        }
+        "step-start" => Some("[opencode] step started".to_string()),
+        "step-finish" => Some("[opencode] step finished".to_string()),
+        "patch" => render_opencode_patch_status(part),
+        _ => None,
+    }
+}
+
+fn render_opencode_patch_status(part: &Value) -> Option<String> {
+    let files = part.get("files").and_then(Value::as_array)?;
+    let paths = files
+        .iter()
+        .filter_map(Value::as_str)
+        .take(3)
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        None
+    } else {
+        Some(format!("[opencode:patch] {}", paths.join(", ")))
+    }
+}
+
+async fn wait_for_opencode_session_idle(
+    client: &mut OpenCodeHttpClient,
+    session_id: &str,
+    project_root: &Path,
+) -> Result<()> {
+    let mut stream = client.event_stream(project_root).await?;
+    while let Some(line) = stream.recv().await {
+        let line = line?;
+        let Some(event) = parse_sse_json_event(&line) else {
+            continue;
+        };
+        let event_type = event
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let properties = event.get("properties").unwrap_or(&Value::Null);
+        let event_session_id = properties
+            .get("sessionID")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !event_session_id.is_empty() && event_session_id != session_id {
+            continue;
+        }
+        match event_type {
+            "session.idle" => return Ok(()),
+            "session.error" => bail!("{}", render_opencode_error(properties)),
+            _ => {}
+        }
+    }
+    bail!("opencode event stream closed before session became idle")
+}
+
+fn url_path_escape(value: &str) -> String {
+    value
+        .bytes()
+        .flat_map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                vec![byte as char]
+            }
+            other => format!("%{other:02X}").chars().collect::<Vec<_>>(),
+        })
+        .collect()
 }
 
 fn extract_text_from_json(value: &Value) -> Option<String> {

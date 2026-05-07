@@ -1,6 +1,6 @@
 [package]
 name = "omni-code-bridge"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 description = "Rust bridge for Omni Code that connects mobile clients to local coding agents"
 license = "MIT"
@@ -17,7 +17,7 @@ chrono = { version = "0.4", features = ["serde", "clock"] }
 dotenvy = "0.15"
 futures-util = "0.3"
 jsonwebtoken = "9"
-reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
