@@ -15,11 +15,7 @@ pub struct ClientAuthStore {
 impl ClientAuthStore {
     pub async fn load() -> Self {
         let path = storage_path();
-        let records = match tokio::fs::read_to_string(&path).await {
-            Ok(body) => serde_json::from_str::<HashMap<String, ClientAuthRecord>>(&body)
-                .unwrap_or_default(),
-            Err(_) => HashMap::new(),
-        };
+        let records = read_records(&path).await;
         Self {
             path,
             records: RwLock::new(records),
@@ -27,6 +23,7 @@ impl ClientAuthStore {
     }
 
     pub async fn list(&self) -> Vec<ClientAuthRecord> {
+        self.reload().await;
         let mut items = self
             .records
             .read()
@@ -39,10 +36,12 @@ impl ClientAuthStore {
     }
 
     pub async fn get(&self, request_id: &str) -> Option<ClientAuthRecord> {
+        self.reload().await;
         self.records.read().await.get(request_id).cloned()
     }
 
     pub async fn find_approved_by_client_id(&self, client_id: &str) -> Option<ClientAuthRecord> {
+        self.reload().await;
         self.records
             .read()
             .await
@@ -56,12 +55,14 @@ impl ClientAuthStore {
     }
 
     pub async fn token_matches(&self, client_id: &str, token: &str) -> bool {
+        self.reload().await;
         self.records.read().await.values().any(|record| {
             record.client_id == client_id && record.token.as_deref() == Some(token)
         })
     }
 
     pub async fn upsert(&self, record: ClientAuthRecord) -> Result<ClientAuthRecord> {
+        self.reload().await;
         {
             let mut records = self.records.write().await;
             records.insert(record.request_id.clone(), record.clone());
@@ -71,6 +72,7 @@ impl ClientAuthStore {
     }
 
     pub async fn approve(&self, request_id: &str) -> Result<ClientAuthRecord> {
+        self.reload().await;
         let mut records = self.records.write().await;
         let record = records
             .get_mut(request_id)
@@ -92,6 +94,7 @@ impl ClientAuthStore {
     }
 
     pub async fn approve_all_pending(&self) -> Result<Vec<ClientAuthRecord>> {
+        self.reload().await;
         let mut records = self.records.write().await;
         let mut approved = Vec::new();
 
@@ -129,6 +132,20 @@ impl ClientAuthStore {
         tokio::fs::write(&self.path, body)
             .await
             .with_context(|| format!("failed to write client auth store: {}", self.path.display()))
+    }
+
+    async fn reload(&self) {
+        let records = read_records(&self.path).await;
+        *self.records.write().await = records;
+    }
+}
+
+async fn read_records(path: &PathBuf) -> HashMap<String, ClientAuthRecord> {
+    match tokio::fs::read_to_string(path).await {
+        Ok(body) => {
+            serde_json::from_str::<HashMap<String, ClientAuthRecord>>(&body).unwrap_or_default()
+        }
+        Err(_) => HashMap::new(),
     }
 }
 
