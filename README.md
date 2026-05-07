@@ -1,6 +1,6 @@
 # Omni Code Bridge
 
-中文说明：[README.zh-CN.md](README.zh-CN.md)
+[中文文档](README.zh-CN.md)
 
 Rust bridge for Omni Code. This repository exposes the HTTP and SSE API
 used by the mobile client and connects it to local coding agents such as
