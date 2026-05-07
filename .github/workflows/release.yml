@@ -415,19 +415,6 @@ jobs:
           	sha256sums = SKIP
 
           pkgname = omni-code-bridge
-          	pkgdesc = Rust bridge for Omni Code — connects mobile clients to local coding agents
-          	pkgver = ${VERSION}
-          	pkgrel = 1
-          	url = https://github.com/${GITHUB_REPOSITORY}
-          	arch = x86_64
-          	arch = aarch64
-          	license = MIT
-          	makedepends = cargo
-          	depends = gcc-libs
-          	source = omni-code-bridge-${VERSION}.tar.gz::${source_url}
-          	source = omni-code-bridge.service
-          	sha256sums = SKIP
-          	sha256sums = SKIP
           EOF
 
           git add PKGBUILD .SRCINFO
