@@ -1,5 +1,7 @@
 # Omni Code Bridge
 
+中文说明：[README.zh-CN.md](README.zh-CN.md)
+
 Rust bridge for Omni Code. This repository exposes the HTTP and SSE API
 used by the mobile client and connects it to local coding agents such as
 `codex` and `claudecode`.
@@ -12,7 +14,7 @@ The Flutter client lives in:
 **Homebrew (macOS / Linux):**
 
 ```bash
-brew tap omni-stream-ai/omni-code-bridge
+brew tap omni-stream-ai/homebrew-omni-code-bridge
 brew install omni-code-bridge
 ```
 
@@ -55,6 +57,13 @@ cargo run
 ```
 
 The bridge listens on `http://127.0.0.1:8787` by default.
+
+## HTTP API
+
+- `POST /client-auth/requests` to request approval for a client
+- `POST /client/messages` to push a message into a project/session flow
+- `POST /devices/register` to register a client device for push notifications
+- `GET /app-update/manifest` and `GET /app-update/apk` for the built-in APK update feed
 
 ## Client Authorization
 
