@@ -9,7 +9,6 @@ ExecStart=/usr/bin/omni-code-bridge serve
 Restart=on-failure
 RestartSec=3
 Environment=RUST_LOG=info
-EnvironmentFile=-/etc/omni-code-bridge/.env
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target

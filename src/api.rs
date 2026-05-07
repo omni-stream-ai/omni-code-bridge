@@ -506,10 +506,8 @@ async fn authorize_request(
     state: &AppState,
 ) -> Result<(), (StatusCode, String)> {
     let client_id = read_client_id(headers)?;
-
-    let env_allowed = state.is_client_id_allowed(client_id);
     let runtime_allowed = state.is_runtime_client_id_allowed(client_id).await;
-    if !env_allowed && !runtime_allowed {
+    if !runtime_allowed {
         return Err((
             StatusCode::FORBIDDEN,
             "client id is not allowed".to_string(),
@@ -517,25 +515,12 @@ async fn authorize_request(
     }
 
     let actual = bearer_token(headers);
-    if let Some(expected) = state.bridge_token()
-        && actual == Some(expected)
-    {
+    let actual = actual.ok_or((StatusCode::UNAUTHORIZED, "missing bearer token".to_string()))?;
+    if state.client_token_matches(client_id, actual).await {
         return Ok(());
     }
 
-    if runtime_allowed {
-        let actual = actual.ok_or((StatusCode::UNAUTHORIZED, "missing bearer token".to_string()))?;
-        if state.client_token_matches(client_id, actual).await {
-            return Ok(());
-        }
-        return Err((StatusCode::FORBIDDEN, "invalid bearer token".to_string()));
-    }
-
-    if state.bridge_token().is_some() {
-        return Err((StatusCode::FORBIDDEN, "invalid bearer token".to_string()));
-    }
-
-    Ok(())
+    Err((StatusCode::FORBIDDEN, "invalid bearer token".to_string()))
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {

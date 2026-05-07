@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -60,8 +60,6 @@ pub struct AppState {
     settings: BridgeSettingsStore,
     client_auth: ClientAuthStore,
     push: PushService,
-    bridge_token: Option<String>,
-    allowed_client_ids: HashSet<String>,
 }
 
 impl AppState {
@@ -69,22 +67,6 @@ impl AppState {
 
     pub async fn new() -> Self {
         let (event_tx, _) = broadcast::channel(256);
-        let bridge_token = std::env::var("ECHO_MATE_BRIDGE_TOKEN")
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
-        let allowed_client_ids = std::env::var("ECHO_MATE_ALLOWED_CLIENT_IDS")
-            .ok()
-            .map(|value| {
-                value
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|item| !item.is_empty())
-                    .map(ToString::to_string)
-                    .collect::<HashSet<_>>()
-            })
-            .unwrap_or_default();
-
         Self {
             projects: RwLock::new(HashMap::new()),
             sessions: RwLock::new(HashMap::new()),
@@ -97,17 +79,7 @@ impl AppState {
             settings: BridgeSettingsStore::load().await,
             client_auth: ClientAuthStore::load().await,
             push: PushService::new(),
-            bridge_token,
-            allowed_client_ids,
         }
-    }
-
-    pub fn bridge_token(&self) -> Option<&str> {
-        self.bridge_token.as_deref()
-    }
-
-    pub fn is_client_id_allowed(&self, client_id: &str) -> bool {
-        self.allowed_client_ids.is_empty() || self.allowed_client_ids.contains(client_id)
     }
 
     pub async fn is_runtime_client_id_allowed(&self, client_id: &str) -> bool {

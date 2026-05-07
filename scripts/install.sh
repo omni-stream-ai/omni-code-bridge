@@ -136,14 +136,24 @@ setup_systemd_service() {
 
     local service_dir="${HOME}/.config/systemd/user"
     local service_file="${service_dir}/omni-code-bridge.service"
+    local should_create_service="yes"
+    local should_start_service="yes"
 
     if [ -f "$service_file" ]; then
         echo "systemd user service already exists at ${service_file}"
     else
         echo ""
-        read -r -p "Create a systemd user service for omni-code-bridge? [Y/n] " answer
-        answer="${answer:-Y}"
-        if [[ ! "$answer" =~ ^[Yy]$ ]]; then
+        if [ -t 0 ] && [ -t 1 ]; then
+            read -r -p "Create a systemd user service for omni-code-bridge? [Y/n] " answer
+            answer="${answer:-Y}"
+            if [[ ! "$answer" =~ ^[Yy]$ ]]; then
+                should_create_service="no"
+            fi
+        else
+            echo "Non-interactive shell detected; creating a systemd user service by default."
+        fi
+
+        if [ "$should_create_service" != "yes" ]; then
             return 0
         fi
 
@@ -173,12 +183,24 @@ EOF
         echo "Enabled omni-code-bridge.service (user)"
 
         echo ""
-        read -r -p "Start the service now? [Y/n] " start_answer
-        start_answer="${start_answer:-Y}"
-        if [[ "$start_answer" =~ ^[Yy]$ ]]; then
-            systemctl --user start omni-code-bridge.service
-            echo "omni-code-bridge.service started."
-            echo "Check status: systemctl --user status omni-code-bridge"
+        if [ -t 0 ] && [ -t 1 ]; then
+            read -r -p "Start the service now? [Y/n] " start_answer
+            start_answer="${start_answer:-Y}"
+            if [[ ! "$start_answer" =~ ^[Yy]$ ]]; then
+                should_start_service="no"
+            fi
+        else
+            echo "Non-interactive shell detected; starting the service by default."
+        fi
+
+        if [ "$should_start_service" = "yes" ]; then
+            if systemctl --user start omni-code-bridge.service; then
+                echo "omni-code-bridge.service started."
+                echo "Check status: systemctl --user status omni-code-bridge"
+            else
+                echo "Failed to start omni-code-bridge.service automatically."
+                echo "You can start it later with: systemctl --user start omni-code-bridge"
+            fi
         fi
     fi
 
@@ -188,6 +210,8 @@ EOF
     echo "  systemctl --user stop omni-code-bridge"
     echo "  systemctl --user status omni-code-bridge"
     echo "  journalctl --user -u omni-code-bridge -f"
+    echo ""
+    echo "Download the client at: https://github.com/omni-stream-ai/omni-code/releases"
 }
 
 main() {

@@ -56,20 +56,9 @@ cargo run
 
 The bridge listens on `http://127.0.0.1:8787` by default.
 
-At minimum, configure:
-
-- `ECHO_MATE_BRIDGE_TOKEN`
-- `ECHO_MATE_ALLOWED_CLIENT_IDS`
-
 ## Client Authorization
 
-The bridge supports two authorization modes that can be used together:
-
-**Static mode** — set in `.env`:
-- `ECHO_MATE_BRIDGE_TOKEN`: a shared Bearer token for all clients
-- `ECHO_MATE_ALLOWED_CLIENT_IDS`: comma-separated list of allowed client IDs
-
-**Dynamic mode** — clients register and get approved via CLI:
+Clients register and get approved via CLI:
 
 1. Client sends `POST /client-auth/requests` with `{ client_id, device_name }`
 2. Admin reviews pending requests and approves them:
@@ -88,7 +77,7 @@ omni-code-bridge client-auth approve
 3. Client polls `GET /client-auth/requests/{request_id}` until `status` becomes `approved` and a `token` is returned
 4. Client uses the token as `Authorization: Bearer <token>` together with the `x-omni-code-client-id` header for all subsequent API calls
 
-Approved records are stored in `~/.omni-code/client-auth.json` (override with `ECHO_MATE_CLIENT_AUTH_PATH`).
+Approved records are stored in `~/.omni-code/client-auth.json`.
 
 ## Client APK Update Endpoints
 

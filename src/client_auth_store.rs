@@ -133,13 +133,9 @@ impl ClientAuthStore {
 }
 
 fn storage_path() -> PathBuf {
-    std::env::var("ECHO_MATE_CLIENT_AUTH_PATH")
+    std::env::var_os("HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".omni-code")
-                .join("client-auth.json")
-        })
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".omni-code")
+        .join("client-auth.json")
 }

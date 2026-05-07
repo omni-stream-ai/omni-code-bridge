@@ -145,4 +145,7 @@ if (-not $hasCurrentPath) {
     Write-Host "  `$env:Path = `"$InstallDir;`$env:Path`""
 }
 
+Write-Host ""
+Write-Host "Download the client at: https://github.com/omni-stream-ai/omni-code/releases"
+
 Remove-TempDir
