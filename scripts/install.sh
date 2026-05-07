@@ -73,12 +73,18 @@ detect_platform() {
 download_release() {
     local version="$1"
     local platform="$2"
-    local url="https://github.com/${REPO}/releases/download/${version}/${BIN_NAME}-${platform}.tar.gz"
+    local url
     local extracted_bin
+
+    if [ "$version" = "latest" ]; then
+        url="https://github.com/${REPO}/releases/latest/download/${BIN_NAME}-${platform}.tar.gz"
+    else
+        url="https://github.com/${REPO}/releases/download/${version}/${BIN_NAME}-${platform}.tar.gz"
+    fi
 
     echo "Downloading ${BIN_NAME} ${version} for ${platform}..."
     if ! curl -fsSL "$url" -o "${TEMP_DIR}/${BIN_NAME}.tar.gz"; then
-        echo "Failed to download from GitHub releases, falling back to source build..." >&2
+        echo "Failed to download from GitHub releases: ${url}" >&2
         return 1
     fi
 
@@ -119,6 +125,12 @@ build_from_source() {
     mkdir -p "$INSTALL_DIR"
     cp "target/release/${BIN_NAME}" "${INSTALL_DIR}/${BIN_NAME}"
     echo "Installed to ${INSTALL_DIR}/${BIN_NAME}"
+}
+
+has_local_source() {
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-}")" 2>/dev/null && pwd)"
+    [ -f "${script_dir}/../Cargo.toml" ]
 }
 
 get_installed_version() {
@@ -218,10 +230,6 @@ main() {
     local version="${1:-latest}"
     local platform=$(detect_platform)
 
-    if [ "$version" = "latest" ]; then
-        version=$(curl -s "https://api.github.com/repos/${REPO}/releases/latest" | grep -o '"tag_name": "[^"]*' | cut -d'"' -f4 || echo "")
-    fi
-
     local installed_version
     installed_version=$(get_installed_version)
 
@@ -232,9 +240,13 @@ main() {
 
     mkdir -p "$INSTALL_DIR"
 
-    if [ -n "$version" ] && [ "$version" != "latest" ]; then
-        download_release "$version" "$platform" || build_from_source
-    else
+    if ! download_release "$version" "$platform"; then
+        if ! has_local_source; then
+            echo "Run from a local checkout to build from source:" >&2
+            echo "  git clone https://github.com/${REPO}.git" >&2
+            echo "  cd omni-code-bridge && bash scripts/install.sh" >&2
+            exit 1
+        fi
         build_from_source
     fi
 
