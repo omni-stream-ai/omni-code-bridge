@@ -7,7 +7,7 @@ arch=('x86_64' 'aarch64')
 url="https://github.com/omni-stream-ai/omni-code-bridge"
 license=('MIT')
 depends=('gcc-libs')
-makedepends=('cargo')
+makedepends=('cargo' 'perl' 'clang' 'nasm')
 source=("$pkgname-$pkgver.tar.gz::https://github.com/omni-stream-ai/omni-code-bridge/archive/refs/tags/v${pkgver}.tar.gz"
         "omni-code-bridge.service")
 sha256sums=('SKIP'
@@ -15,6 +15,9 @@ sha256sums=('SKIP'
 
 build() {
     cd "$pkgname-$pkgver"
+    export CC=clang
+    export AR=llvm-ar
+    export RUSTFLAGS="-C linker=gcc"
     cargo build --release --locked
 }
 
