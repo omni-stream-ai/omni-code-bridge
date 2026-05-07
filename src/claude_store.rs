@@ -333,3 +333,65 @@ fn parse_timestamp(value: &str) -> Option<DateTime<Utc>> {
         .ok()
         .map(|timestamp| timestamp.with_timezone(&Utc))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_claude_messages_parses_jsonl_archive() {
+        let file = temp_jsonl_file(
+            "claude-session",
+            &[
+                r#"{"timestamp":"2026-05-01T00:00:00Z","type":"user","sessionId":"claude-1","cwd":"/tmp/project","uuid":"u1","message":{"content":"hello claude"}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:01Z","type":"assistant","sessionId":"claude-1","cwd":"/tmp/project","uuid":"a1","message":{"content":[{"type":"text","text":"hello "},{"type":"text","text":"user"}]}}"#,
+            ],
+        );
+
+        let messages = load_claude_messages(&file)
+            .expect("claude archive should parse")
+            .messages;
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].session_id, "claude-1");
+        assert_eq!(messages[0].role, MessageRole::User);
+        assert_eq!(messages[0].content, "hello claude");
+        assert_eq!(messages[1].role, MessageRole::Assistant);
+        assert_eq!(messages[1].content, "hello user");
+    }
+
+    #[test]
+    fn parse_session_summary_file_builds_claude_project_and_session() {
+        let file = temp_jsonl_file(
+            "claude-summary",
+            &[
+                r#"{"timestamp":"2026-05-01T00:00:00Z","type":"user","sessionId":"claude-2","cwd":"/tmp/claude-app","uuid":"u1","message":{"content":"fix bug"}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:01Z","type":"assistant","sessionId":"claude-2","cwd":"/tmp/claude-app","uuid":"a1","message":{"content":[{"type":"text","text":"fixed"}]}}"#,
+            ],
+        );
+
+        let record = parse_session_summary_file(&file).expect("summary should parse");
+
+        assert_eq!(record.session.id, "claude-2");
+        assert_eq!(record.session.agent, AgentKind::ClaudeCode);
+        assert_eq!(record.session.title, "fix bug");
+        assert_eq!(
+            record.session.last_message_preview.as_deref(),
+            Some("fixed")
+        );
+        assert_eq!(record.project.name, "claude-app");
+        assert_eq!(record.project.session_count, 1);
+    }
+
+    fn temp_jsonl_file(name: &str, lines: &[&str]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "omni-code-bridge-test-{}-{}",
+            name,
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join(format!("{name}.jsonl"));
+        std::fs::write(&path, lines.join("\n")).expect("write jsonl");
+        path
+    }
+}

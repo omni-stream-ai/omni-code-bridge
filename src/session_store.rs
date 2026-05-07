@@ -459,3 +459,65 @@ fn parse_timestamp(value: &str) -> Option<DateTime<Utc>> {
         .ok()
         .map(|timestamp| timestamp.with_timezone(&Utc))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_session_messages_parses_codex_jsonl_archive() {
+        let file = temp_jsonl_file(
+            "codex-session",
+            &[
+                r#"{"timestamp":"2026-05-01T00:00:00Z","type":"session_meta","payload":{"id":"codex-1","cwd":"/tmp/project"}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"hello codex"}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello "},{"type":"output_text","text":"user"}]}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:03Z","type":"event_msg","payload":{"type":"task_complete"}}"#,
+            ],
+        );
+
+        let messages = load_session_messages(&file)
+            .expect("codex archive should parse")
+            .messages;
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].session_id, "codex-1");
+        assert_eq!(messages[0].role, MessageRole::User);
+        assert_eq!(messages[0].content, "hello codex");
+        assert_eq!(messages[1].role, MessageRole::Assistant);
+        assert_eq!(messages[1].content, "hello user");
+    }
+
+    #[test]
+    fn parse_session_summary_file_builds_codex_project_and_session() {
+        let file = temp_jsonl_file(
+            "codex-summary",
+            &[
+                r#"{"timestamp":"2026-05-01T00:00:00Z","type":"session_meta","payload":{"id":"codex-2","cwd":"/tmp/example-app"}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"implement feature"}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}"#,
+            ],
+        );
+
+        let record = parse_session_summary_file(&file).expect("summary should parse");
+
+        assert_eq!(record.session.id, "codex-2");
+        assert_eq!(record.session.agent, AgentKind::Codex);
+        assert_eq!(record.session.title, "implement feature");
+        assert_eq!(record.session.last_message_preview.as_deref(), Some("done"));
+        assert_eq!(record.project.name, "example-app");
+        assert_eq!(record.project.session_count, 1);
+    }
+
+    fn temp_jsonl_file(name: &str, lines: &[&str]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "omni-code-bridge-test-{}-{}",
+            name,
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join(format!("{name}.jsonl"));
+        std::fs::write(&path, lines.join("\n")).expect("write jsonl");
+        path
+    }
+}
