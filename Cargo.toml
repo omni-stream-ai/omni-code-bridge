@@ -2,6 +2,11 @@
 name = "omni-code-bridge"
 version = "0.1.2"
 edition = "2024"
+description = "Rust bridge for Omni Code that connects mobile clients to local coding agents"
+license = "MIT"
+homepage = "https://github.com/omni-stream-ai/omni-code-bridge"
+repository = "https://github.com/omni-stream-ai/omni-code-bridge"
+readme = "README.md"
 
 [dependencies]
 anyhow = "1"
