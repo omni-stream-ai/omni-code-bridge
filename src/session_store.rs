@@ -425,7 +425,7 @@ fn sessions_root() -> PathBuf {
 pub fn project_id_for_path(path: &str) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     path.hash(&mut hasher);
-    format!("project-{:x}", hasher.finish())
+    format!("{:x}", hasher.finish())
 }
 
 fn project_name_from_path(path: &str) -> String {
