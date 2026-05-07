@@ -16,19 +16,11 @@ sha256sums=('SKIP'
 build() {
     cd "$pkgname-$pkgver"
 
-    mkdir -p .cargo
-    cat > .cargo/config.toml << 'EOF'
-[target.x86_64-unknown-linux-gnu]
-linker = "cc"
-rustflags = ["-C", "link-arg=-fuse-ld=bfd"]
-
-[target.aarch64-unknown-linux-gnu]
-linker = "cc"
-rustflags = ["-C", "link-arg=-fuse-ld=bfd"]
-EOF
-
     export CC=clang
     export AR=llvm-ar
+    export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=cc
+    export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=cc
+    export CARGO_ENCODED_RUSTFLAGS="-Clink-arg=-fuse-ld=bfd"
     cargo build --release --locked
 }
 
