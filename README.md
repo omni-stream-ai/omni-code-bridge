@@ -4,7 +4,7 @@
 
 Rust bridge for Omni Code. This repository exposes the HTTP and SSE API
 used by the mobile client and connects it to local coding agents such as
-`codex` and `claudecode`.
+`codex`, `claudecode`, and `opencode`.
 
 The Flutter client lives in:
 `https://github.com/omni-stream-ai/omni-code`
@@ -45,9 +45,13 @@ cargo install omni-code-bridge
 ## Requirements
 
 - `Rust` / `cargo`
+- Optional agent CLIs: `codex`, `claude`, or `opencode`
 - Optional: a local checkout of
   `https://github.com/omni-stream-ai/omni-code` if you want the built-in APK
   update manifest endpoints to serve a local Android build
+
+Agent binary paths can be overridden with `ECHO_MATE_CODEX_BIN` and
+`ECHO_MATE_OPENCODE_BIN`.
 
 ## Run
 

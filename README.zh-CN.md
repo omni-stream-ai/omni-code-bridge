@@ -1,6 +1,6 @@
 # Omni Code Bridge
 
-Omni Code 的 Rust 桥接服务。它对外提供 HTTP 和 SSE API，供移动端使用，并连接到本地编码代理，例如 `codex` 和 `claudecode`。
+Omni Code 的 Rust 桥接服务。它对外提供 HTTP 和 SSE API，供移动端使用，并连接到本地编码代理，例如 `codex`、`claudecode` 和 `opencode`。
 
 Flutter 客户端仓库：
 `https://github.com/omni-stream-ai/omni-code`
@@ -44,7 +44,10 @@ cargo install omni-code-bridge
 ## 依赖
 
 - `Rust` / `cargo`
+- 可选 agent CLI：`codex`、`claude` 或 `opencode`
 - 可选：本地检出 `https://github.com/omni-stream-ai/omni-code`，用于桥接服务提供内置 APK 更新接口
+
+Agent 二进制路径可以通过 `ECHO_MATE_CODEX_BIN` 和 `ECHO_MATE_OPENCODE_BIN` 覆盖。
 
 ## 运行
 
