@@ -14,7 +14,7 @@ permissions:
 env:
   BIN_NAME: omni-code-bridge
   HOMEBREW_TAP_REPO: omni-stream-ai/homebrew-omni-code-bridge
-  AUR_REPO: omni-code-bridge
+  AUR_REPO: omni-code-bridge-bin
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
@@ -345,79 +345,13 @@ jobs:
           git clone ssh://aur@aur.archlinux.org/${AUR_REPO}.git aur-pkg
           cd aur-pkg
 
-          source_url="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${TAG}.tar.gz"
+          linux_x86_sha=$(sha256sum ../dist/omni-code-bridge-linux-x64.tar.gz | awk '{print $1}')
+          linux_arm_sha=$(sha256sum ../dist/omni-code-bridge-linux-arm64.tar.gz | awk '{print $1}')
+          license_sha=$(sha256sum ../LICENSE | awk '{print $1}')
 
-          cat > omni-code-bridge.service <<'SVCEOF'
-          [Unit]
-          Description=Omni Code Bridge
-          After=network-online.target
-          Wants=network-online.target
+          bash ../scripts/generate-aur-bin.sh "${VERSION}" "${GITHUB_REPOSITORY}" "${license_sha}" "${linux_x86_sha}" "${linux_arm_sha}" .
 
-          [Service]
-          Type=simple
-          ExecStart=/usr/bin/omni-code-bridge serve
-          Restart=on-failure
-          RestartSec=3
-          Environment=RUST_LOG=info
-
-          [Install]
-          WantedBy=default.target
-          SVCEOF
-
-          cat > PKGBUILD <<EOF
-          # Maintainer: Junjie <junjie@omni-stream.ai>
-          pkgname=omni-code-bridge
-          pkgver=${VERSION}
-          pkgrel=1
-          pkgdesc="Rust bridge for Omni Code — connects mobile clients to local coding agents"
-          arch=('x86_64' 'aarch64')
-          url="https://github.com/${GITHUB_REPOSITORY}"
-          license=('MIT')
-          depends=('gcc-libs')
-          makedepends=('cargo')
-          source=("\$pkgname-\$pkgver.tar.gz::${source_url}"
-                  "omni-code-bridge.service")
-          sha256sums=('SKIP'
-                      'SKIP')
-
-          build() {
-              cd "\$pkgname-\$pkgver"
-              cargo build --release --locked
-          }
-
-          check() {
-              cd "\$pkgname-\$pkgver"
-              cargo test --release --locked
-          }
-
-          package() {
-              cd "\$pkgname-\$pkgver"
-              install -Dm755 "target/release/\$pkgname" "\$pkgdir/usr/bin/\$pkgname"
-              install -Dm644 LICENSE "\$pkgdir/usr/share/licenses/\$pkgname/LICENSE"
-              install -Dm644 "\$srcdir/omni-code-bridge.service" "\$pkgdir/usr/lib/systemd/user/omni-code-bridge.service"
-          }
-          EOF
-
-          cat > .SRCINFO <<EOF
-          pkgbase = omni-code-bridge
-          	pkgdesc = Rust bridge for Omni Code — connects mobile clients to local coding agents
-          	pkgver = ${VERSION}
-          	pkgrel = 1
-          	url = https://github.com/${GITHUB_REPOSITORY}
-          	arch = x86_64
-          	arch = aarch64
-          	license = MIT
-          	makedepends = cargo
-          	depends = gcc-libs
-          	source = omni-code-bridge-${VERSION}.tar.gz::${source_url}
-          	source = omni-code-bridge.service
-          	sha256sums = SKIP
-          	sha256sums = SKIP
-
-          pkgname = omni-code-bridge
-          EOF
-
-          git add PKGBUILD .SRCINFO
+          git add PKGBUILD .SRCINFO omni-code-bridge.service
           if git diff --cached --quiet; then
             echo "No AUR changes to commit."
             exit 0
@@ -425,5 +359,5 @@ jobs:
 
           git config user.email "junjie@omni-stream.ai"
           git config user.name "Junjie"
-          git commit -m "Update to ${VERSION}"
+          git commit -m "Update omni-code-bridge-bin to ${VERSION}"
           git push origin master

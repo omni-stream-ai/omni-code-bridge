@@ -17,8 +17,12 @@ brew install omni-code-bridge
 **Arch Linux（AUR）：**
 
 ```bash
-yay -S omni-code-bridge
+yay -S omni-code-bridge-bin
+systemctl --user daemon-reload
+systemctl --user enable --now omni-code-bridge.service
 ```
+
+该包由 GitHub Actions 自动发布。
 
 **curl（macOS / Linux）：**
 
