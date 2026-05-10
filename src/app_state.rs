@@ -547,18 +547,14 @@ impl AppState {
         request_id: &str,
         choice: ApprovalChoice,
     ) -> Result<(), String> {
-        eprintln!(
-            "[approval] submit session={session_id} request={request_id} choice={choice:?}"
-        );
+        eprintln!("[approval] submit session={session_id} request={request_id} choice={choice:?}");
         let sender = {
             let runtime = self.runtime.lock().await;
             let session = runtime
                 .get(session_id)
                 .ok_or_else(|| format!("unknown session: {session_id}"))?;
-            let already_resolved = session
-                .last_resolved_approval_request_id
-                .as_deref()
-                == Some(request_id);
+            let already_resolved =
+                session.last_resolved_approval_request_id.as_deref() == Some(request_id);
             let pending = match session.pending_approval.as_ref() {
                 Some(pending) => pending,
                 None if already_resolved => return Ok(()),
@@ -573,16 +569,13 @@ impl AppState {
             if !pending.resolvable {
                 return Err("this approval request cannot be resolved from client".to_string());
             }
-            session
-                .approval_tx
-                .clone()
-                .ok_or_else(|| {
-                    if already_resolved {
-                        "approval already resolved".to_string()
-                    } else {
-                        "approval channel is not available".to_string()
-                    }
-                })?
+            session.approval_tx.clone().ok_or_else(|| {
+                if already_resolved {
+                    "approval already resolved".to_string()
+                } else {
+                    "approval channel is not available".to_string()
+                }
+            })?
         };
 
         if sender.send(choice).is_err() {
@@ -590,10 +583,8 @@ impl AppState {
             let session = runtime
                 .get(session_id)
                 .ok_or_else(|| format!("unknown session: {session_id}"))?;
-            let already_resolved = session
-                .last_resolved_approval_request_id
-                .as_deref()
-                == Some(request_id);
+            let already_resolved =
+                session.last_resolved_approval_request_id.as_deref() == Some(request_id);
             let still_pending = session
                 .pending_approval
                 .as_ref()
@@ -883,12 +874,8 @@ impl AppState {
                 entry.last_resolved_approval_request_id = Some(request_id.to_string());
             }
         }
-        self.patch_session(
-            session_id,
-            SessionStatus::Running,
-            Some(preview.clone()),
-        )
-        .await;
+        self.patch_session(session_id, SessionStatus::Running, Some(preview.clone()))
+            .await;
         self.emit_system_message(session_id, preview.clone()).await;
         let _ = self
             .event_tx
@@ -1134,12 +1121,12 @@ impl AppState {
             local_session.updated_at = provider_session.updated_at;
             local_session.unread_count = provider_session.unread_count;
         } else {
-            local_session.unread_count =
-                local_session.unread_count.max(provider_session.unread_count);
+            local_session.unread_count = local_session
+                .unread_count
+                .max(provider_session.unread_count);
         }
 
-        if (local_session.title.trim().is_empty()
-            || local_session.title.ends_with(" 会话"))
+        if (local_session.title.trim().is_empty() || local_session.title.ends_with(" 会话"))
             && !provider_session.title.trim().is_empty()
             && !provider_session.title.ends_with(" 会话")
         {
@@ -1154,8 +1141,9 @@ impl AppState {
             local_session.last_message_preview = provider_session.last_message_preview;
         }
 
-        local_session.pending_approval =
-            local_session.pending_approval.or(provider_session.pending_approval);
+        local_session.pending_approval = local_session
+            .pending_approval
+            .or(provider_session.pending_approval);
         local_session
     }
 

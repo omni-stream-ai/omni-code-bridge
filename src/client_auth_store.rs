@@ -56,9 +56,11 @@ impl ClientAuthStore {
 
     pub async fn token_matches(&self, client_id: &str, token: &str) -> bool {
         self.reload().await;
-        self.records.read().await.values().any(|record| {
-            record.client_id == client_id && record.token.as_deref() == Some(token)
-        })
+        self.records
+            .read()
+            .await
+            .values()
+            .any(|record| record.client_id == client_id && record.token.as_deref() == Some(token))
     }
 
     pub async fn upsert(&self, record: ClientAuthRecord) -> Result<ClientAuthRecord> {
@@ -74,9 +76,7 @@ impl ClientAuthStore {
     pub async fn approve(&self, request_id: &str) -> Result<ClientAuthRecord> {
         self.reload().await;
         let mut records = self.records.write().await;
-        let record = records
-            .get_mut(request_id)
-            .context("request not found")?;
+        let record = records.get_mut(request_id).context("request not found")?;
 
         if record.status == ClientAuthStatus::Approved {
             anyhow::bail!("request {} is already approved", request_id);

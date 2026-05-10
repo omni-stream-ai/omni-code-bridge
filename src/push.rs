@@ -64,10 +64,7 @@ impl PushService {
                 .send_fcm_notification(&session, &session.title, &trimmed, &device)
                 .await
             {
-                eprintln!(
-                    "FCM push failed for client {}: {error:?}",
-                    device.client_id
-                );
+                eprintln!("FCM push failed for client {}: {error:?}", device.client_id);
             }
         }
     }

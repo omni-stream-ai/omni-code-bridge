@@ -975,21 +975,13 @@ impl OpenCodeHttpClient {
         body: Value,
     ) -> Result<Value> {
         let url = format!("{}{}", self.base_url, path);
-        let response = self
-            .http
-            .post(&url)
-            .query(query)
-            .json(&body)
-            .send()
-            .await?;
+        let response = self.http.post(&url).query(query).json(&body).send().await?;
         let status = response.status();
         if status.is_success() {
             Ok(response.json().await.unwrap_or(Value::Null))
         } else {
             let body_text = response.text().await.unwrap_or_default();
-            eprintln!(
-                "[opencode] HTTP {status} {url} body={body_text}"
-            );
+            eprintln!("[opencode] HTTP {status} {url} body={body_text}");
             bail!("opencode HTTP {status}: {body_text}");
         }
     }

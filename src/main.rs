@@ -87,9 +87,7 @@ async fn run() -> Result<()> {
             session_id,
             run_id,
             project_root,
-        }) => {
-            claude_hook::run_permission_hook(state_dir, session_id, run_id, project_root).await
-        }
+        }) => claude_hook::run_permission_hook(state_dir, session_id, run_id, project_root).await,
         Some(Command::ClientAuth(sub)) => handle_client_auth(sub).await,
         Some(Command::Serve { port }) => serve(port).await,
         None => serve(8787).await,
@@ -128,14 +126,8 @@ async fn handle_client_auth(cmd: ClientAuthCommand) -> Result<()> {
                     models::ClientAuthStatus::Pending => "pending",
                     models::ClientAuthStatus::Approved => "approved",
                 };
-                let token_display = record
-                    .token
-                    .as_deref()
-                    .unwrap_or("(none)");
-                let device = record
-                    .device_name
-                    .as_deref()
-                    .unwrap_or("(unknown)");
+                let token_display = record.token.as_deref().unwrap_or("(none)");
+                let device = record.device_name.as_deref().unwrap_or("(unknown)");
                 println!(
                     "  request_id: {}\n  client_id:  {}\n  device:     {}\n  status:     {}\n  token:      {}\n  created_at: {}\n  updated_at: {}\n",
                     record.request_id,
@@ -157,7 +149,10 @@ async fn handle_client_auth(cmd: ClientAuthCommand) -> Result<()> {
                     println!("Approved.");
                     println!("  request_id: {}", record.request_id);
                     println!("  client_id:  {}", record.client_id);
-                    println!("  token:      {}", record.token.as_deref().unwrap_or("(none)"));
+                    println!(
+                        "  token:      {}",
+                        record.token.as_deref().unwrap_or("(none)")
+                    );
                 }
                 None => {
                     let records = store.approve_all_pending().await?;
