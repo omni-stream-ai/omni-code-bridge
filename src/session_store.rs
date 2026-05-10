@@ -88,6 +88,7 @@ pub fn load_session_messages(path: &Path) -> Option<SessionMessages> {
     let mut session_id = None;
     let mut messages = Vec::new();
     let mut pending_assistant: Option<PendingAssistantMessage> = None;
+    let mut pending_user_images: Vec<String> = Vec::new();
 
     for line in content.lines() {
         let value: Value = serde_json::from_str(line).ok()?;
@@ -129,12 +130,8 @@ pub fn load_session_messages(path: &Path) -> Option<SessionMessages> {
                     &session_id.clone().unwrap_or_default(),
                     &mut pending_assistant,
                 );
-                let text = payload
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|text| !text.is_empty())
-                    .map(ToString::to_string);
+                let text = extract_user_text(payload, &pending_user_images);
+                pending_user_images.clear();
                 if let Some(text) = text {
                     messages.push(ChatMessage {
                         id: format!(
@@ -148,6 +145,12 @@ pub fn load_session_messages(path: &Path) -> Option<SessionMessages> {
                         created_at: timestamp,
                     });
                 }
+            }
+            "response_item"
+                if payload.get("type").and_then(Value::as_str) == Some("message")
+                    && payload.get("role").and_then(Value::as_str) == Some("user") =>
+            {
+                pending_user_images = extract_response_item_user_images(payload);
             }
             "response_item"
                 if payload.get("type").and_then(Value::as_str) == Some("message")
@@ -181,6 +184,155 @@ pub fn load_session_messages(path: &Path) -> Option<SessionMessages> {
         fingerprint,
         messages,
     })
+}
+
+fn extract_user_text(payload: &Value, response_item_images: &[String]) -> Option<String> {
+    let message = payload
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())?;
+
+    Some(render_user_message_markdown(
+        message,
+        payload,
+        response_item_images,
+    ))
+}
+
+fn render_user_message_markdown(
+    message: &str,
+    payload: &Value,
+    response_item_images: &[String],
+) -> String {
+    let placeholders = payload
+        .get("text_elements")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.get("placeholder").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let image_destinations = collect_user_image_destinations(payload, response_item_images);
+
+    if placeholders.is_empty() || image_destinations.is_empty() {
+        return message.to_string();
+    }
+
+    let mut content = message.to_string();
+    let mut used = 0usize;
+    for (index, (placeholder, destination)) in placeholders
+        .iter()
+        .zip(image_destinations.iter())
+        .enumerate()
+    {
+        let alt_text = image_alt_text(placeholder, index + 1);
+        let markdown = format!("![{}]({destination})", escape_markdown_alt_text(&alt_text));
+        content = content.replacen(placeholder, &markdown, 1);
+        used += 1;
+    }
+
+    for (index, destination) in image_destinations.iter().skip(used).enumerate() {
+        let alt_text = format!("Image #{}", used + index + 1);
+        if !content.is_empty() {
+            content.push_str("\n\n");
+        }
+        content.push_str(&format!(
+            "![{}]({destination})",
+            escape_markdown_alt_text(&alt_text)
+        ));
+    }
+
+    content
+}
+
+fn collect_user_image_destinations(
+    payload: &Value,
+    response_item_images: &[String],
+) -> Vec<String> {
+    let mut destinations = Vec::new();
+
+    destinations.extend(
+        response_item_images
+            .iter()
+            .map(String::as_str)
+            .filter_map(user_image_destination_from_raw),
+    );
+
+    if !destinations.is_empty() {
+        return destinations;
+    }
+
+    if let Some(local_images) = payload.get("local_images").and_then(Value::as_array) {
+        destinations.extend(
+            local_images
+                .iter()
+                .filter_map(user_image_destination_from_value),
+        );
+    }
+
+    if let Some(images) = payload.get("images").and_then(Value::as_array) {
+        destinations.extend(images.iter().filter_map(user_image_destination_from_value));
+    }
+
+    destinations
+}
+
+fn extract_response_item_user_images(payload: &Value) -> Vec<String> {
+    payload
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter(|item| item.get("type").and_then(Value::as_str) == Some("input_image"))
+                .filter_map(|item| {
+                    item.get("image_url")
+                        .and_then(Value::as_str)
+                        .or_else(|| item.get("url").and_then(Value::as_str))
+                })
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn user_image_destination_from_value(value: &Value) -> Option<String> {
+    let raw = value
+        .as_str()
+        .or_else(|| value.get("path").and_then(Value::as_str))
+        .or_else(|| value.get("url").and_then(Value::as_str))
+        .or_else(|| value.get("image_url").and_then(Value::as_str))?;
+
+    user_image_destination_from_raw(raw)
+}
+
+fn user_image_destination_from_raw(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    Some(format!("<{raw}>"))
+}
+
+fn image_alt_text(placeholder: &str, fallback_index: usize) -> String {
+    let trimmed = placeholder.trim();
+    let stripped = trimmed
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    stripped
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("Image #{fallback_index}"))
+}
+
+fn escape_markdown_alt_text(value: &str) -> String {
+    value.replace('[', r"\[").replace(']', r"\]")
 }
 
 fn flush_pending_assistant(
@@ -486,6 +638,49 @@ mod tests {
         assert_eq!(messages[0].content, "hello codex");
         assert_eq!(messages[1].role, MessageRole::Assistant);
         assert_eq!(messages[1].content, "hello user");
+    }
+
+    #[test]
+    fn load_session_messages_renders_user_images_as_markdown() {
+        let file = temp_jsonl_file(
+            "codex-session-images",
+            &[
+                r#"{"timestamp":"2026-05-01T00:00:00Z","type":"session_meta","payload":{"id":"codex-images","cwd":"/tmp/project"}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"看看这个：[Image #1]","local_images":["/tmp/image 1.png"],"text_elements":[{"placeholder":"[Image #1]"}]}}"#,
+            ],
+        );
+
+        let messages = load_session_messages(&file)
+            .expect("codex archive should parse")
+            .messages;
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].content,
+            "看看这个：![Image #1](</tmp/image 1.png>)"
+        );
+    }
+
+    #[test]
+    fn load_session_messages_renders_data_images_as_markdown() {
+        let file = temp_jsonl_file(
+            "codex-session-data-images",
+            &[
+                r#"{"timestamp":"2026-05-01T00:00:00Z","type":"session_meta","payload":{"id":"codex-data-images","cwd":"/tmp/project"}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<image name=[Image #1]>"},{"type":"input_image","image_url":"data:image/png;base64,abc123=="},{"type":"input_text","text":"</image>"},{"type":"input_text","text":"看看这个：[Image #1]"}]}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"看看这个：[Image #1]","local_images":["/tmp/image 1.png"],"text_elements":[{"placeholder":"[Image #1]"}]}}"#,
+            ],
+        );
+
+        let messages = load_session_messages(&file)
+            .expect("codex archive should parse")
+            .messages;
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].content,
+            "看看这个：![Image #1](<data:image/png;base64,abc123==>)"
+        );
     }
 
     #[test]
