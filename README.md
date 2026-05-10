@@ -22,7 +22,6 @@ brew install omni-code-bridge
 
 ```bash
 yay -S omni-code-bridge-bin
-systemctl --user daemon-reload
 systemctl --user enable --now omni-code-bridge.service
 ```
 
@@ -71,6 +70,7 @@ The bridge listens on `http://127.0.0.1:8787` by default.
 - `POST /client-auth/requests` to request approval for a client
 - `POST /client/messages` to push a message into a project/session flow
 - `POST /devices/register` to register a client device for push notifications
+- `GET /files?path=...` to return a file from a registered local project root
 - `GET /app-update/manifest` and `GET /app-update/apk` for the built-in APK update feed
 
 ## Client Authorization
@@ -112,6 +112,46 @@ These endpoints are primarily useful for local development or self-hosted
 distribution. The client now checks the official GitHub release manifest by
 default and should only use the bridge manifest when you explicitly configure a
 custom update URL.
+
+## File Fetch Endpoint
+
+The bridge can return files from registered local project directories:
+
+- `GET /files?path=<file-path>`
+
+This endpoint requires the same client authorization headers as the rest of the
+authenticated API:
+
+- `Authorization: Bearer <token>`
+- `x-omni-code-client-id: <client_id>`
+
+The response body is the raw file content. `Content-Type` is inferred from the
+file extension, so images, text files, JSON, PDF, audio, and similar assets can
+be returned directly.
+
+Supported query parameters:
+
+- `path` required. Absolute paths can be returned directly. Relative paths require `project_id` or `session_id`.
+- `project_id` optional. Restricts lookup to one project root.
+- `session_id` optional. Restricts lookup to the local project root for that session.
+
+`project_id` and `session_id` cannot be used together.
+
+Examples:
+
+```bash
+curl \
+  -H "Authorization: Bearer <token>" \
+  -H "x-omni-code-client-id: <client_id>" \
+  "http://127.0.0.1:8787/files?path=/absolute/path/to/image.png"
+```
+
+```bash
+curl \
+  -H "Authorization: Bearer <token>" \
+  -H "x-omni-code-client-id: <client_id>" \
+  "http://127.0.0.1:8787/files?project_id=<project-id>&path=assets/logo.png"
+```
 
 ## Development
 

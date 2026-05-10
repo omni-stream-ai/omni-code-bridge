@@ -1,10 +1,16 @@
-use std::{convert::Infallible, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    convert::Infallible,
+    io,
+    path::{Path as StdPath, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use axum::{
     Json, Router,
     body::Body,
     extract::Multipart,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{
         IntoResponse,
@@ -13,6 +19,7 @@ use axum::{
     routing::{get, post},
 };
 use futures_util::stream::{Stream, StreamExt};
+use serde::Deserialize;
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::{
@@ -31,6 +38,7 @@ use crate::{
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/health", get(health))
+        .route("/files", get(get_file_by_path))
         .route("/app-update/manifest", get(app_update_manifest))
         .route("/app-update/apk", get(download_app_update_apk))
         .route("/client-auth/requests", post(request_client_auth))
@@ -57,6 +65,15 @@ pub fn router() -> Router<Arc<AppState>> {
             post(resolve_approval),
         )
         .route("/sessions/{id}/events", get(session_events))
+}
+
+#[derive(Debug, Deserialize)]
+struct FileQuery {
+    path: String,
+    #[serde(default)]
+    project_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
 }
 
 async fn app_update_manifest() -> Result<Json<AppUpdateManifest>, StatusCode> {
@@ -172,6 +189,27 @@ async fn health() -> impl IntoResponse {
         "ok": true,
         "service": "omni-code-bridge",
     }))
+}
+
+async fn get_file_by_path(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<FileQuery>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    authorize_request(&headers, &state).await?;
+    let file_path = resolve_authorized_file_path(&state, &query).await?;
+    let bytes = tokio::fs::read(&file_path)
+        .await
+        .map_err(|error| map_file_resolution_error(&query.path, error))?;
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(content_type_for_path(&file_path)),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+
+    Ok((StatusCode::OK, headers, Body::from(bytes)))
 }
 
 async fn get_settings(headers: HeaderMap, State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -569,5 +607,246 @@ fn event_name(event: &SessionEvent) -> &'static str {
         SessionEvent::AgentError(_) => "agent.error",
         SessionEvent::ApprovalRequested(_) => "approval.requested",
         SessionEvent::ApprovalResolved(_) => "approval.resolved",
+    }
+}
+
+async fn resolve_authorized_file_path(
+    state: &AppState,
+    query: &FileQuery,
+) -> Result<PathBuf, (StatusCode, String)> {
+    let requested_path = query.path.trim();
+    if requested_path.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "path is required".to_string()));
+    }
+
+    let project_id = query
+        .project_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let session_id = query
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    if project_id.is_some() && session_id.is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "project_id and session_id cannot be used together".to_string(),
+        ));
+    }
+
+    let requested_path_buf = PathBuf::from(requested_path);
+    if let Some(session_id) = session_id {
+        let project_root = state
+            .project_root_path_for_session(session_id)
+            .await
+            .map_err(|error| (StatusCode::NOT_FOUND, error))?;
+        let project_root = canonicalize_local_directory(&project_root).map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("session {session_id} is not backed by a local project directory"),
+            )
+        })?;
+        return resolve_path_within_root(&project_root, &requested_path_buf)
+            .map_err(|error| map_file_resolution_error(requested_path, error));
+    }
+
+    if let Some(project_id) = project_id {
+        let project_root = state
+            .list_projects()
+            .await
+            .into_iter()
+            .find(|project| project.id == project_id)
+            .ok_or((
+                StatusCode::NOT_FOUND,
+                format!("unknown project: {project_id}"),
+            ))?
+            .root_path;
+        let project_root = canonicalize_local_directory(&project_root).map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("project {project_id} is not backed by a local directory"),
+            )
+        })?;
+        return resolve_path_within_root(&project_root, &requested_path_buf)
+            .map_err(|error| map_file_resolution_error(requested_path, error));
+    }
+
+    if requested_path_buf.is_absolute() {
+        return canonicalize_existing_file(&requested_path_buf)
+            .map_err(|error| map_file_resolution_error(requested_path, error));
+    }
+
+    Err((
+        StatusCode::BAD_REQUEST,
+        "relative path requires project_id or session_id".to_string(),
+    ))
+}
+
+fn canonicalize_local_directory(path: impl AsRef<StdPath>) -> io::Result<PathBuf> {
+    let path = std::fs::canonicalize(path)?;
+    if !path.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path is not a directory",
+        ));
+    }
+    Ok(path)
+}
+
+fn canonicalize_existing_file(path: impl AsRef<StdPath>) -> io::Result<PathBuf> {
+    let path = std::fs::canonicalize(path)?;
+    if !path.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path is not a file",
+        ));
+    }
+    Ok(path)
+}
+
+fn resolve_path_within_root(root: &StdPath, requested_path: &StdPath) -> io::Result<PathBuf> {
+    let candidate = if requested_path.is_absolute() {
+        requested_path.to_path_buf()
+    } else {
+        root.join(requested_path)
+    };
+    let candidate = canonicalize_existing_file(candidate)?;
+    if candidate.starts_with(root) {
+        return Ok(candidate);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "path is outside allowed project roots",
+    ))
+}
+
+fn map_file_resolution_error(requested_path: &str, error: io::Error) -> (StatusCode, String) {
+    match error.kind() {
+        io::ErrorKind::NotFound => (
+            StatusCode::NOT_FOUND,
+            format!("file not found: {requested_path}"),
+        ),
+        io::ErrorKind::PermissionDenied => (
+            StatusCode::FORBIDDEN,
+            format!("path is outside allowed project roots: {requested_path}"),
+        ),
+        io::ErrorKind::InvalidInput => (
+            StatusCode::BAD_REQUEST,
+            format!("path does not point to a file: {requested_path}"),
+        ),
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    }
+}
+
+fn content_type_for_path(path: &StdPath) -> &'static str {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase());
+
+    match extension.as_deref() {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("bmp") => "image/bmp",
+        Some("svg") => "image/svg+xml",
+        Some("ico") => "image/x-icon",
+        Some("avif") => "image/avif",
+        Some("mp3") => "audio/mpeg",
+        Some("wav") => "audio/wav",
+        Some("ogg") => "audio/ogg",
+        Some("m4a") => "audio/mp4",
+        Some("flac") => "audio/flac",
+        Some("mp4") => "video/mp4",
+        Some("webm") => "video/webm",
+        Some("mov") => "video/quicktime",
+        Some("pdf") => "application/pdf",
+        Some("json") => "application/json; charset=utf-8",
+        Some("toml") => "application/toml; charset=utf-8",
+        Some("xml") => "application/xml; charset=utf-8",
+        Some("js") | Some("mjs") | Some("cjs") => "application/javascript; charset=utf-8",
+        Some("zip") => "application/zip",
+        Some("gz") => "application/gzip",
+        Some("tar") => "application/x-tar",
+        Some("md") => "text/markdown; charset=utf-8",
+        Some("html") | Some("htm") => "text/html; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("csv") => "text/csv; charset=utf-8",
+        Some("yaml") | Some("yml") => "text/yaml; charset=utf-8",
+        Some("txt") | Some("rs") | Some("ts") | Some("tsx") | Some("jsx") | Some("py")
+        | Some("java") | Some("kt") | Some("swift") | Some("go") | Some("c") | Some("cc")
+        | Some("cpp") | Some("h") | Some("hpp") | Some("sh") | Some("bash") | Some("zsh")
+        | Some("fish") | Some("sql") | Some("log") | Some("dart") => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{content_type_for_path, resolve_path_within_root};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    #[test]
+    fn resolves_file_inside_root() {
+        let root = test_dir("file-api-inside");
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        let file_path = nested.join("note.txt");
+        fs::write(&file_path, "hello").unwrap();
+
+        let canonical_root = fs::canonicalize(&root).unwrap();
+        let resolved =
+            resolve_path_within_root(&canonical_root, Path::new("nested/note.txt")).unwrap();
+
+        assert_eq!(resolved, fs::canonicalize(file_path).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn blocks_parent_path_escape() {
+        let base = test_dir("file-api-scope");
+        let root = base.join("project");
+        fs::create_dir_all(&root).unwrap();
+        let outside = base.join("secret.txt");
+        fs::write(&outside, "secret").unwrap();
+
+        let canonical_root = fs::canonicalize(&root).unwrap();
+        let error =
+            resolve_path_within_root(&canonical_root, Path::new("../secret.txt")).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn detects_text_and_image_content_types() {
+        assert_eq!(
+            content_type_for_path(Path::new("/tmp/readme.md")),
+            "text/markdown; charset=utf-8"
+        );
+        assert_eq!(
+            content_type_for_path(Path::new("/tmp/image.png")),
+            "image/png"
+        );
+        assert_eq!(
+            content_type_for_path(Path::new("/tmp/archive.bin")),
+            "application/octet-stream"
+        );
+    }
+
+    fn test_dir(prefix: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("omni-code-bridge-{prefix}-{unique}"))
     }
 }

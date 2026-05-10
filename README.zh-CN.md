@@ -18,7 +18,6 @@ brew install omni-code-bridge
 
 ```bash
 yay -S omni-code-bridge-bin
-systemctl --user daemon-reload
 systemctl --user enable --now omni-code-bridge.service
 ```
 
@@ -67,6 +66,7 @@ cargo run
 - `POST /client-auth/requests` 申请客户端授权
 - `POST /client/messages` 向项目/会话流程推送消息
 - `POST /devices/register` 注册客户端设备以接收推送
+- `GET /files?path=...` 返回已登记本地项目目录中的文件
 - `GET /app-update/manifest` 和 `GET /app-update/apk` 提供内置 APK 更新源
 
 ## 客户端授权
@@ -104,6 +104,43 @@ omni-code-bridge client-auth approve
 默认会从本地检出的 `https://github.com/omni-stream-ai/omni-code` 仓库中查找 APK 构建产物，并从该仓库的 `pubspec.yaml` 读取版本号。
 
 这些接口主要用于本地开发或自托管分发。客户端默认会检查官方 GitHub Release manifest，只有在你显式配置自定义更新地址时才会使用桥接服务的 manifest。
+
+## 文件获取接口
+
+桥接服务可以返回已登记本地项目目录中的文件：
+
+- `GET /files?path=<file-path>`
+
+该接口需要和其他受保护 API 一样带上客户端授权头：
+
+- `Authorization: Bearer <token>`
+- `x-omni-code-client-id: <client_id>`
+
+响应体是文件原始内容。服务会根据扩展名自动推断 `Content-Type`，因此图片、文本、JSON、PDF、音频等文件都可以直接返回。
+
+支持的查询参数：
+
+- `path` 必填。可以直接传绝对路径；相对路径必须搭配 `project_id` 或 `session_id`。
+- `project_id` 可选。将查找范围限制在某个项目根目录下。
+- `session_id` 可选。将查找范围限制在该会话对应的本地项目根目录下。
+
+`project_id` 和 `session_id` 不能同时传。
+
+示例：
+
+```bash
+curl \
+  -H "Authorization: Bearer <token>" \
+  -H "x-omni-code-client-id: <client_id>" \
+  "http://127.0.0.1:8787/files?path=/absolute/path/to/image.png"
+```
+
+```bash
+curl \
+  -H "Authorization: Bearer <token>" \
+  -H "x-omni-code-client-id: <client_id>" \
+  "http://127.0.0.1:8787/files?project_id=<project-id>&path=assets/logo.png"
+```
 
 ## 开发
 
