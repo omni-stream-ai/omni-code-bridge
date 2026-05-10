@@ -184,7 +184,7 @@ fn parse_session_summary_file(path: &Path) -> Option<ParsedSessionSummaryRecord>
 
         match line_type {
             "user" => {
-                if let Some(text) = extract_user_text(&value) {
+                if let Some(text) = extract_summary_user_text(&value) {
                     if first_user_message.is_none() {
                         first_user_message = Some(text.clone());
                     }
@@ -192,7 +192,7 @@ fn parse_session_summary_file(path: &Path) -> Option<ParsedSessionSummaryRecord>
                 }
             }
             "assistant" => {
-                if let Some(text) = extract_assistant_text(&value) {
+                if let Some(text) = extract_summary_assistant_text(&value) {
                     last_preview = Some(text);
                 }
             }
@@ -245,25 +245,116 @@ fn parse_session_summary_file(path: &Path) -> Option<ParsedSessionSummaryRecord>
 
 fn extract_user_text(value: &Value) -> Option<String> {
     let content = value.pointer("/message/content")?;
-    if let Some(text) = content.as_str() {
-        let text = text.trim();
-        return (!text.is_empty()).then(|| text.to_string());
-    }
-    None
+    extract_text_blocks(content)
 }
 
 fn extract_assistant_text(value: &Value) -> Option<String> {
-    let content = value.pointer("/message/content")?.as_array()?;
-    let text = content
-        .iter()
-        .filter_map(|item| match item.get("type").and_then(Value::as_str) {
-            Some("text") => item.get("text").and_then(Value::as_str),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("");
+    let content = value.pointer("/message/content")?;
+    extract_text_blocks(content)
+}
+
+fn extract_summary_user_text(value: &Value) -> Option<String> {
+    if value
+        .get("isMeta")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+
+    let text = extract_user_text(value)?;
+    sanitize_summary_user_text(&text, value)
+}
+
+fn extract_summary_assistant_text(value: &Value) -> Option<String> {
+    let text = extract_assistant_text(value)?;
+    (!should_ignore_assistant_text_for_preview(&text, value)).then_some(text)
+}
+
+fn extract_text_blocks(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => normalize_text(text),
+        Value::Array(items) => {
+            let text = items
+                .iter()
+                .filter_map(|item| match item.get("type").and_then(Value::as_str) {
+                    Some("text") => item.get("text").and_then(Value::as_str),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            normalize_text(&text)
+        }
+        _ => None,
+    }
+}
+
+fn normalize_text(text: &str) -> Option<String> {
     let text = text.trim();
     (!text.is_empty()).then(|| text.to_string())
+}
+
+fn sanitize_summary_user_text(text: &str, value: &Value) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty()
+        || trimmed == "[Request interrupted by user]"
+        || trimmed.starts_with("<local-command-caveat>")
+        || trimmed.starts_with("<task-notification>")
+        || is_task_notification_message(value)
+        || is_compact_summary_message(value)
+    {
+        return None;
+    }
+
+    if is_command_wrapper_message(trimmed) {
+        return extract_tag_text(trimmed, "command-args").and_then(normalize_text);
+    }
+
+    Some(trimmed.to_string())
+}
+
+fn should_ignore_assistant_text_for_preview(text: &str, value: &Value) -> bool {
+    let trimmed = text.trim();
+    trimmed.is_empty()
+        || trimmed == "No response requested."
+        || (is_synthetic_assistant_message(value)
+            && (value
+                .get("isApiErrorMessage")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                || value.get("error").is_some()
+                || trimmed.starts_with("API Error:")))
+}
+
+fn is_compact_summary_message(value: &Value) -> bool {
+    value
+        .get("isCompactSummary")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || value
+            .get("isVisibleInTranscriptOnly")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+}
+
+fn is_task_notification_message(value: &Value) -> bool {
+    value.pointer("/origin/kind").and_then(Value::as_str) == Some("task-notification")
+}
+
+fn is_command_wrapper_message(text: &str) -> bool {
+    text.contains("<command-name>") || text.contains("<command-message>")
+}
+
+fn is_synthetic_assistant_message(value: &Value) -> bool {
+    value.pointer("/message/model").and_then(Value::as_str) == Some("<synthetic>")
+}
+
+fn extract_tag_text<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
+    let start_tag = format!("<{tag}>");
+    let end_tag = format!("</{tag}>");
+    let start = text.find(&start_tag)? + start_tag.len();
+    let end = text[start..].find(&end_tag)? + start;
+    Some(&text[start..end])
 }
 
 fn collect_jsonl_files(root: &Path) -> std::io::Result<(Vec<PathBuf>, u64)> {
@@ -381,6 +472,164 @@ mod tests {
         );
         assert_eq!(record.project.name, "claude-app");
         assert_eq!(record.project.session_count, 1);
+    }
+
+    #[test]
+    fn parse_session_summary_file_ignores_local_command_caveat_meta_message() {
+        let file = temp_jsonl_file(
+            "claude-summary-meta",
+            &[
+                r#"{"timestamp":"2026-05-01T00:00:00Z","type":"user","sessionId":"claude-3","cwd":"/tmp/claude-app","uuid":"u0","isMeta":true,"message":{"content":"<local-command-caveat>Caveat: The messages below were generated by the user while running local commands.</local-command-caveat>"}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:01Z","type":"user","sessionId":"claude-3","cwd":"/tmp/claude-app","uuid":"u1","message":{"content":"real prompt"}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:02Z","type":"assistant","sessionId":"claude-3","cwd":"/tmp/claude-app","uuid":"a1","message":{"content":[{"type":"text","text":"done"}]}}"#,
+            ],
+        );
+
+        let record = parse_session_summary_file(&file).expect("summary should parse");
+
+        assert_eq!(record.session.title, "real prompt");
+        assert_eq!(record.session.last_message_preview.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn parse_session_summary_file_ignores_slash_command_wrapper_messages() {
+        let file = temp_jsonl_file(
+            "claude-summary-command",
+            &[
+                r#"{"timestamp":"2026-05-01T00:00:00Z","type":"user","sessionId":"claude-5","cwd":"/tmp/claude-app","uuid":"u0","message":{"content":"<command-name>/clear</command-name>\n<command-message>clear</command-message>\n<command-args></command-args>"}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:01Z","type":"user","sessionId":"claude-5","cwd":"/tmp/claude-app","uuid":"u1","message":{"content":"actual request"}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:02Z","type":"assistant","sessionId":"claude-5","cwd":"/tmp/claude-app","uuid":"a1","message":{"content":[{"type":"text","text":"done"}]}}"#,
+            ],
+        );
+
+        let record = parse_session_summary_file(&file).expect("summary should parse");
+
+        assert_eq!(record.session.title, "actual request");
+        assert_eq!(record.session.last_message_preview.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn parse_session_summary_file_uses_slash_command_args_as_title() {
+        let file = temp_jsonl_file(
+            "claude-summary-command-args",
+            &[
+                r#"{"timestamp":"2026-05-01T00:00:00Z","type":"user","sessionId":"claude-7","cwd":"/tmp/claude-app","uuid":"u0","message":{"content":"<command-message>skill-creator</command-message>\n<command-name>/skill-creator</command-name>\n<command-args>根据当前 cli, 写一个 skill</command-args>"}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:01Z","type":"assistant","sessionId":"claude-7","cwd":"/tmp/claude-app","uuid":"a1","message":{"content":[{"type":"text","text":"done"}]}}"#,
+            ],
+        );
+
+        let record = parse_session_summary_file(&file).expect("summary should parse");
+
+        assert_eq!(record.session.title, "根据当前 cli, 写一个 skill");
+        assert_eq!(record.session.last_message_preview.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn parse_session_summary_file_ignores_compact_summary_messages() {
+        let file = temp_jsonl_file(
+            "claude-summary-compact",
+            &[
+                r#"{"timestamp":"2026-05-01T00:00:00Z","type":"user","sessionId":"claude-6","cwd":"/tmp/claude-app","uuid":"u0","isCompactSummary":true,"isVisibleInTranscriptOnly":true,"message":{"content":"This session is being continued from a previous conversation..."}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:01Z","type":"user","sessionId":"claude-6","cwd":"/tmp/claude-app","uuid":"u1","message":{"content":"real follow-up"}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:02Z","type":"assistant","sessionId":"claude-6","cwd":"/tmp/claude-app","uuid":"a1","message":{"content":[{"type":"text","text":"done"}]}}"#,
+            ],
+        );
+
+        let record = parse_session_summary_file(&file).expect("summary should parse");
+
+        assert_eq!(record.session.title, "real follow-up");
+    }
+
+    #[test]
+    fn parse_session_summary_file_ignores_interrupted_request_messages() {
+        let file = temp_jsonl_file(
+            "claude-summary-interrupted",
+            &[
+                r#"{"timestamp":"2026-05-01T00:00:00Z","type":"user","sessionId":"claude-8","cwd":"/tmp/claude-app","uuid":"u0","message":{"content":[{"type":"text","text":"[Request interrupted by user]"}]}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:01Z","type":"user","sessionId":"claude-8","cwd":"/tmp/claude-app","uuid":"u1","message":{"content":"real follow-up"}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:02Z","type":"assistant","sessionId":"claude-8","cwd":"/tmp/claude-app","uuid":"a1","message":{"content":[{"type":"text","text":"done"}]}}"#,
+            ],
+        );
+
+        let record = parse_session_summary_file(&file).expect("summary should parse");
+
+        assert_eq!(record.session.title, "real follow-up");
+        assert_eq!(record.session.last_message_preview.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn parse_session_summary_file_ignores_task_notification_messages() {
+        let file = temp_jsonl_file(
+            "claude-summary-task-notification",
+            &[
+                r#"{"timestamp":"2026-05-01T00:00:00Z","type":"user","sessionId":"claude-9","cwd":"/tmp/claude-app","uuid":"u0","origin":{"kind":"task-notification"},"message":{"content":"<task-notification>\n<task-id>bq7yrfohe</task-id>\n<summary>Background command \"bun dev &amp;\" completed (exit code 0)</summary>\n</task-notification>"}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:01Z","type":"user","sessionId":"claude-9","cwd":"/tmp/claude-app","uuid":"u1","message":{"content":"real follow-up"}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:02Z","type":"assistant","sessionId":"claude-9","cwd":"/tmp/claude-app","uuid":"a1","message":{"content":[{"type":"text","text":"done"}]}}"#,
+            ],
+        );
+
+        let record = parse_session_summary_file(&file).expect("summary should parse");
+
+        assert_eq!(record.session.title, "real follow-up");
+        assert_eq!(record.session.last_message_preview.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn parse_session_summary_file_ignores_no_response_requested_preview() {
+        let file = temp_jsonl_file(
+            "claude-summary-no-response-requested",
+            &[
+                r#"{"timestamp":"2026-05-01T00:00:00Z","type":"user","sessionId":"claude-10","cwd":"/tmp/claude-app","uuid":"u0","message":{"content":"real prompt"}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:01Z","type":"assistant","sessionId":"claude-10","cwd":"/tmp/claude-app","uuid":"a1","message":{"model":"<synthetic>","content":[{"type":"text","text":"No response requested."}]}}"#,
+            ],
+        );
+
+        let record = parse_session_summary_file(&file).expect("summary should parse");
+
+        assert_eq!(record.session.title, "real prompt");
+        assert_eq!(
+            record.session.last_message_preview.as_deref(),
+            Some("real prompt")
+        );
+    }
+
+    #[test]
+    fn parse_session_summary_file_ignores_synthetic_api_error_preview() {
+        let file = temp_jsonl_file(
+            "claude-summary-synthetic-error",
+            &[
+                r#"{"timestamp":"2026-05-01T00:00:00Z","type":"user","sessionId":"claude-11","cwd":"/tmp/claude-app","uuid":"u0","message":{"content":"real prompt"}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:01Z","type":"assistant","sessionId":"claude-11","cwd":"/tmp/claude-app","uuid":"a0","message":{"content":[{"type":"text","text":"working result"}]}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:02Z","type":"assistant","sessionId":"claude-11","cwd":"/tmp/claude-app","uuid":"a1","isApiErrorMessage":true,"error":"server_error","message":{"model":"<synthetic>","content":[{"type":"text","text":"API Error: 529 {\"type\":\"error\"}"}]}}"#,
+            ],
+        );
+
+        let record = parse_session_summary_file(&file).expect("summary should parse");
+
+        assert_eq!(record.session.title, "real prompt");
+        assert_eq!(
+            record.session.last_message_preview.as_deref(),
+            Some("working result")
+        );
+    }
+
+    #[test]
+    fn load_claude_messages_parses_array_user_content_and_text_blocks() {
+        let file = temp_jsonl_file(
+            "claude-array-user",
+            &[
+                r#"{"timestamp":"2026-05-01T00:00:00Z","type":"user","sessionId":"claude-4","cwd":"/tmp/project","uuid":"u1","message":{"content":[{"type":"text","text":"[Request interrupted by user]"}]}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:01Z","type":"assistant","sessionId":"claude-4","cwd":"/tmp/project","uuid":"a1","message":{"content":[{"type":"thinking","thinking":"hidden"},{"type":"text","text":"visible"}]}}"#,
+            ],
+        );
+
+        let messages = load_claude_messages(&file)
+            .expect("claude archive should parse")
+            .messages;
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content, "[Request interrupted by user]");
+        assert_eq!(messages[1].content, "visible");
     }
 
     fn temp_jsonl_file(name: &str, lines: &[&str]) -> PathBuf {
