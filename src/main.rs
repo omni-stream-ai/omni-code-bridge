@@ -11,8 +11,12 @@ mod client_auth_store;
 mod device_store;
 mod models;
 mod push;
+mod realtime;
 mod session_store;
+mod speaker;
+mod speech;
 mod tts;
+mod vad;
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 

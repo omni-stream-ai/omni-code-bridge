@@ -278,6 +278,8 @@ fn user_prompt(request: &ApprovalRequest, command: &str, project_root: &Path) ->
     let kind = match request.kind {
         ApprovalKind::CommandExecution => "command_execution",
         ApprovalKind::ExecCommand => "exec_command",
+        ApprovalKind::FileChange => "file_change",
+        ApprovalKind::ApplyPatch => "apply_patch",
         ApprovalKind::Permissions => "permissions",
     };
     format!(

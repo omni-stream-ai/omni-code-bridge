@@ -239,6 +239,83 @@ mod tests {
     }
 
     #[test]
+    fn codex_streaming_state_maps_file_change_approval_requests() {
+        let mut state = CodexAppServerStreamingState::default();
+
+        match state.ingest_value(&serde_json::json!({
+            "id": 8,
+            "method": "item/fileChange/requestApproval",
+            "params": {
+                "reason": "Would you like to make the following edits?",
+                "availableDecisions": ["accept", "acceptForSession", "cancel"],
+                "fileChanges": [
+                    { "path": "src/adapter.rs" },
+                    { "path": "src/models.rs" }
+                ]
+            }
+        })) {
+            CodexAppServerEvent::ApprovalRequested(pending) => {
+                assert_eq!(pending.request.request_id, "8");
+                assert!(matches!(pending.request.kind, ApprovalKind::FileChange));
+                assert_eq!(
+                    pending.request.command.as_deref(),
+                    Some("edit files: src/adapter.rs, src/models.rs")
+                );
+                assert_eq!(
+                    pending.request.reason.as_deref(),
+                    Some("Would you like to make the following edits?")
+                );
+                assert!(pending.request.allow_accept_for_session);
+                assert!(pending.request.allow_cancel);
+                assert!(pending.request.resolvable);
+            }
+            _ => panic!("expected file change approval request"),
+        }
+    }
+
+    #[test]
+    fn codex_streaming_state_maps_legacy_apply_patch_approval_requests() {
+        let mut state = CodexAppServerStreamingState::default();
+
+        match state.ingest_value(&serde_json::json!({
+            "id": "patch-1",
+            "method": "applyPatchApproval",
+            "params": {
+                "files": ["src/adapter.rs"]
+            }
+        })) {
+            CodexAppServerEvent::ApprovalRequested(pending) => {
+                assert_eq!(pending.request.request_id, "patch-1");
+                assert!(matches!(pending.request.kind, ApprovalKind::ApplyPatch));
+                assert_eq!(
+                    pending.request.command.as_deref(),
+                    Some("edit files: src/adapter.rs")
+                );
+                assert!(pending.request.allow_accept_for_session);
+                assert!(pending.request.allow_cancel);
+                assert!(pending.request.resolvable);
+            }
+            _ => panic!("expected apply patch approval request"),
+        }
+    }
+
+    #[test]
+    fn codex_approval_result_serializes_file_change_decisions() {
+        assert_eq!(
+            approval_result_json(&ApprovalChoice::Accept, &ApprovalKind::FileChange),
+            serde_json::json!({ "decision": "accept" })
+        );
+        assert_eq!(
+            approval_result_json(&ApprovalChoice::AcceptForSession, &ApprovalKind::FileChange),
+            serde_json::json!({ "decision": "acceptForSession" })
+        );
+        assert_eq!(
+            approval_result_json(&ApprovalChoice::AcceptForSession, &ApprovalKind::ApplyPatch),
+            serde_json::json!({ "decision": "approved_for_session" })
+        );
+    }
+
+    #[test]
     fn claude_streaming_state_parses_assistant_result_and_errors() {
         let mut state = ClaudeStreamingState::default();
 
@@ -2162,6 +2239,28 @@ impl CodexAppServerStreamingState {
                 },
                 last_choice: None,
             }),
+            "item/fileChange/requestApproval" => Some(PendingApproval {
+                request: ApprovalRequest {
+                    request_id: request_id.clone(),
+                    kind: ApprovalKind::FileChange,
+                    command: render_file_change_approval_command(params),
+                    reason: params
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string)
+                        .or_else(|| Some("Apply proposed edits".to_string())),
+                    allow_accept_for_session: approval_decisions_contain(
+                        params.get("availableDecisions"),
+                        "acceptForSession",
+                    ),
+                    allow_cancel: approval_decisions_contain(
+                        params.get("availableDecisions"),
+                        "cancel",
+                    ),
+                    resolvable: true,
+                },
+                last_choice: None,
+            }),
             "execCommandApproval" => Some(PendingApproval {
                 request: ApprovalRequest {
                     request_id: request_id.clone(),
@@ -2181,6 +2280,22 @@ impl CodexAppServerStreamingState {
                         .get("reason")
                         .and_then(Value::as_str)
                         .map(ToString::to_string),
+                    allow_accept_for_session: true,
+                    allow_cancel: true,
+                    resolvable: true,
+                },
+                last_choice: None,
+            }),
+            "applyPatchApproval" => Some(PendingApproval {
+                request: ApprovalRequest {
+                    request_id: request_id.clone(),
+                    kind: ApprovalKind::ApplyPatch,
+                    command: render_file_change_approval_command(params),
+                    reason: params
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string)
+                        .or_else(|| Some("Apply proposed edits".to_string())),
                     allow_accept_for_session: true,
                     allow_cancel: true,
                     resolvable: true,
@@ -2427,6 +2542,59 @@ fn approval_decisions_contain(value: Option<&Value>, expected: &str) -> bool {
             })
         })
         .unwrap_or(false)
+}
+
+fn render_file_change_approval_command(params: &Value) -> Option<String> {
+    let files = params
+        .get("files")
+        .or_else(|| params.get("fileChanges"))
+        .or_else(|| params.get("changes"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(file_change_path)
+                .take(5)
+                .collect::<Vec<_>>()
+        })
+        .filter(|paths| !paths.is_empty());
+
+    if let Some(paths) = files {
+        let suffix = if paths.len() == 5 { "..." } else { "" };
+        return Some(format!("edit files: {}{}", paths.join(", "), suffix));
+    }
+
+    params
+        .get("path")
+        .or_else(|| params.get("file"))
+        .or_else(|| params.pointer("/file/path"))
+        .and_then(Value::as_str)
+        .map(|path| format!("edit file: {path}"))
+        .or_else(|| Some("apply proposed edits".to_string()))
+}
+
+fn file_change_path(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(ToString::to_string)
+        .or_else(|| {
+            value
+                .get("path")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+        .or_else(|| {
+            value
+                .get("file")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+        .or_else(|| {
+            value
+                .get("relativePath")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
 }
 
 fn render_approval_summary(request: &ApprovalRequest) -> String {
@@ -3360,13 +3528,13 @@ async fn auto_approve_codex_request(
                 Some(AiApprovalDecisionKind::AskUser) | None => None,
             })
         }
-        ApprovalKind::Permissions => Ok(None),
+        ApprovalKind::FileChange | ApprovalKind::ApplyPatch | ApprovalKind::Permissions => Ok(None),
     }
 }
 
 fn approval_result_json(choice: &ApprovalChoice, kind: &ApprovalKind) -> Value {
     match kind {
-        ApprovalKind::CommandExecution => serde_json::json!({
+        ApprovalKind::CommandExecution | ApprovalKind::FileChange => serde_json::json!({
             "decision": match choice {
                 ApprovalChoice::Accept | ApprovalChoice::AlwaysAllow => Value::String("accept".to_string()),
                 ApprovalChoice::AcceptForSession => Value::String("acceptForSession".to_string()),
@@ -3375,6 +3543,14 @@ fn approval_result_json(choice: &ApprovalChoice, kind: &ApprovalKind) -> Value {
             }
         }),
         ApprovalKind::ExecCommand => serde_json::json!({
+            "decision": match choice {
+                ApprovalChoice::Accept | ApprovalChoice::AlwaysAllow => Value::String("approved".to_string()),
+                ApprovalChoice::AcceptForSession => Value::String("approved_for_session".to_string()),
+                ApprovalChoice::Decline => Value::String("denied".to_string()),
+                ApprovalChoice::Cancel => Value::String("abort".to_string()),
+            }
+        }),
+        ApprovalKind::ApplyPatch => serde_json::json!({
             "decision": match choice {
                 ApprovalChoice::Accept | ApprovalChoice::AlwaysAllow => Value::String("approved".to_string()),
                 ApprovalChoice::AcceptForSession => Value::String("approved_for_session".to_string()),
