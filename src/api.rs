@@ -795,7 +795,6 @@ async fn list_openai_models(
                     SpeechModelKind::Tts => model.capabilities.speech_synthesis,
                     SpeechModelKind::Vad => false,
                     SpeechModelKind::Speaker => false,
-                    SpeechModelKind::WakeWord => false,
                 }
         })
         .map(|model| OpenAiModel {

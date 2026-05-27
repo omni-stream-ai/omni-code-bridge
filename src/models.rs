@@ -353,7 +353,6 @@ pub enum SpeechModelKind {
     Tts,
     Vad,
     Speaker,
-    WakeWord,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -377,7 +376,6 @@ pub enum SpeechProfile {
     AsrRealtime,
     TtsDefault,
     VadDefault,
-    WakeWordDefault,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -390,8 +388,6 @@ pub struct SpeechProfileSelection {
     pub tts_default: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vad_default: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub wake_word_default: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -402,7 +398,6 @@ pub struct SpeechModelCapabilities {
     pub speech_synthesis: bool,
     pub vad: bool,
     pub speaker_embedding: bool,
-    pub wake_word: bool,
     pub endpointing: bool,
     pub punctuation: bool,
     pub inverse_text_normalization: bool,

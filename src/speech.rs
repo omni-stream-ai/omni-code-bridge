@@ -169,14 +169,6 @@ impl SpeechService {
             .unwrap_or(false)
     }
 
-    pub fn first_model_for_profile(&self, profile: SpeechProfile) -> Option<String> {
-        catalog_entries()
-            .iter()
-            .filter(|entry| entry.supports_profiles.contains(&profile))
-            .map(|entry| entry.id.to_string())
-            .next()
-    }
-
     pub async fn installed_model_path(&self, model_id: &str) -> Option<PathBuf> {
         self.refresh_installed_model(model_id)
             .await
@@ -580,7 +572,6 @@ impl SpeechProfileSelection {
             SpeechProfile::AsrRealtime => self.asr_realtime.as_deref(),
             SpeechProfile::TtsDefault => self.tts_default.as_deref(),
             SpeechProfile::VadDefault => self.vad_default.as_deref(),
-            SpeechProfile::WakeWordDefault => self.wake_word_default.as_deref(),
         }
     }
 
@@ -590,7 +581,6 @@ impl SpeechProfileSelection {
             SpeechProfile::AsrRealtime => self.asr_realtime = model_id,
             SpeechProfile::TtsDefault => self.tts_default = model_id,
             SpeechProfile::VadDefault => self.vad_default = model_id,
-            SpeechProfile::WakeWordDefault => self.wake_word_default = model_id,
         }
     }
 }
@@ -601,7 +591,6 @@ pub fn profile_slug(profile: SpeechProfile) -> &'static str {
         SpeechProfile::AsrRealtime => "asr.realtime",
         SpeechProfile::TtsDefault => "tts.default",
         SpeechProfile::VadDefault => "vad.default",
-        SpeechProfile::WakeWordDefault => "wake_word.default",
     }
 }
 
@@ -611,7 +600,6 @@ pub fn profile_from_slug(value: &str) -> Option<SpeechProfile> {
         "asr.realtime" => Some(SpeechProfile::AsrRealtime),
         "tts.default" => Some(SpeechProfile::TtsDefault),
         "vad.default" => Some(SpeechProfile::VadDefault),
-        "wake_word.default" => Some(SpeechProfile::WakeWordDefault),
         _ => None,
     }
 }
@@ -625,7 +613,6 @@ fn selected_profiles_for_model(
         SpeechProfile::AsrRealtime,
         SpeechProfile::TtsDefault,
         SpeechProfile::VadDefault,
-        SpeechProfile::WakeWordDefault,
     ]
     .into_iter()
     .filter(|profile| profiles.model_for_profile(*profile) == Some(model_id))
@@ -653,7 +640,6 @@ fn catalog_entries() -> &'static [SpeechModelCatalogEntry] {
                 speech_synthesis: false,
                 vad: false,
                 speaker_embedding: false,
-                wake_word: false,
                 endpointing: false,
                 punctuation: true,
                 inverse_text_normalization: true,
@@ -690,7 +676,6 @@ fn catalog_entries() -> &'static [SpeechModelCatalogEntry] {
                 speech_synthesis: false,
                 vad: false,
                 speaker_embedding: false,
-                wake_word: false,
                 endpointing: true,
                 punctuation: false,
                 inverse_text_normalization: false,
@@ -727,7 +712,6 @@ fn catalog_entries() -> &'static [SpeechModelCatalogEntry] {
                 speech_synthesis: false,
                 vad: false,
                 speaker_embedding: false,
-                wake_word: false,
                 endpointing: true,
                 punctuation: false,
                 inverse_text_normalization: false,
@@ -775,7 +759,6 @@ fn catalog_entries() -> &'static [SpeechModelCatalogEntry] {
                 speech_synthesis: true,
                 vad: false,
                 speaker_embedding: false,
-                wake_word: false,
                 endpointing: false,
                 punctuation: false,
                 inverse_text_normalization: false,
@@ -814,7 +797,6 @@ fn catalog_entries() -> &'static [SpeechModelCatalogEntry] {
                 speech_synthesis: true,
                 vad: false,
                 speaker_embedding: false,
-                wake_word: false,
                 endpointing: false,
                 punctuation: false,
                 inverse_text_normalization: false,
@@ -862,7 +844,6 @@ fn catalog_entries() -> &'static [SpeechModelCatalogEntry] {
                 speech_synthesis: false,
                 vad: true,
                 speaker_embedding: false,
-                wake_word: false,
                 endpointing: true,
                 punctuation: false,
                 inverse_text_normalization: false,
@@ -885,55 +866,6 @@ fn catalog_entries() -> &'static [SpeechModelCatalogEntry] {
             },
         },
         SpeechModelCatalogEntry {
-            id: "kws-zipformer-zh-en-3m",
-            kind: SpeechModelKind::WakeWord,
-            display_name: "KWS Zipformer ZH-EN 3M",
-            description:
-                "Streaming Chinese+English keyword spotting with phone-based English tokens.",
-            languages: &["zh", "en"],
-            runtime: SpeechRuntime::Streaming,
-            backend: SpeechComputeBackend::Onnx,
-            capabilities: SpeechModelCapabilities {
-                streaming: true,
-                realtime_asr: false,
-                batch_asr: false,
-                speech_synthesis: false,
-                vad: false,
-                speaker_embedding: false,
-                wake_word: true,
-                endpointing: false,
-                punctuation: false,
-                inverse_text_normalization: false,
-                multilingual: true,
-            },
-            features: &[
-                "kws",
-                "wake-word",
-                "streaming",
-                "zipformer",
-                "cpu-friendly",
-                "zh-en",
-            ],
-            supports_profiles: &[SpeechProfile::WakeWordDefault],
-            recommended_profiles: &[SpeechProfile::WakeWordDefault],
-            download_url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20.tar.bz2",
-            docs_url: Some("https://k2-fsa.github.io/sherpa/onnx/kws/pretrained_models/index.html"),
-            download_size_mb: Some(38),
-            memory_hint: Some(
-                "Small streaming model suitable for always-on local wake word detection.",
-            ),
-            notes: Some(
-                "Latest KWS model supporting both Chinese and English. \
-                 English wake words are tokenized as IPA phone symbols. \
-                 Chinese wake words use numbered pinyin (e.g. xiao3 ou1).",
-            ),
-            sample_rate_hz: Some(16_000),
-            default_voice: None,
-            voice_count_hint: None,
-            required_files: &["tokens.txt"],
-            download_layout: SpeechDownloadLayout::ArchiveTarBz2,
-        },
-        SpeechModelCatalogEntry {
             id: "3dspeaker-speech-eres2net-base",
             kind: SpeechModelKind::Speaker,
             display_name: "3D-Speaker ERes2Net Base",
@@ -948,7 +880,6 @@ fn catalog_entries() -> &'static [SpeechModelCatalogEntry] {
                 speech_synthesis: false,
                 vad: false,
                 speaker_embedding: true,
-                wake_word: false,
                 endpointing: false,
                 punctuation: false,
                 inverse_text_normalization: false,
