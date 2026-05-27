@@ -56,6 +56,7 @@ pub trait AgentProvider: Send + Sync {
         state: Arc<AppState>,
         session: SessionSummary,
         input: ChatMessage,
+        system_prompt: Option<String>,
         reply: ChatMessage,
     ) -> Result<()>;
 
@@ -112,6 +113,7 @@ impl AgentProvider for StubProvider {
         state: Arc<AppState>,
         session: SessionSummary,
         input: ChatMessage,
+        _system_prompt: Option<String>,
         reply: ChatMessage,
     ) -> Result<()> {
         let prefix = match self.kind {
@@ -371,7 +373,7 @@ mod tests {
         };
 
         let result = provider
-            .run_session(Arc::clone(&state), session, input, reply)
+            .run_session(Arc::clone(&state), session, input, None, reply)
             .await
             .expect_err("direct call without seeded reply should expose state contract");
         assert!(result.to_string().contains("unknown message"));
@@ -547,9 +549,10 @@ impl AgentProvider for CodexProvider {
         state: Arc<AppState>,
         session: SessionSummary,
         input: ChatMessage,
+        system_prompt: Option<String>,
         reply: ChatMessage,
     ) -> Result<()> {
-        run_codex(state, &session, &input, &reply).await
+        run_codex(state, &session, &input, system_prompt.as_deref(), &reply).await
     }
 
     async fn summarize_reply(
@@ -669,9 +672,10 @@ impl AgentProvider for ClaudeCodeProvider {
         state: Arc<AppState>,
         session: SessionSummary,
         input: ChatMessage,
+        system_prompt: Option<String>,
         reply: ChatMessage,
     ) -> Result<()> {
-        run_claude_code(state, &session, &input, &reply).await
+        run_claude_code(state, &session, &input, system_prompt.as_deref(), &reply).await
     }
 
     async fn summarize_reply(
@@ -732,9 +736,10 @@ impl AgentProvider for OpenCodeProvider {
         state: Arc<AppState>,
         session: SessionSummary,
         input: ChatMessage,
+        system_prompt: Option<String>,
         reply: ChatMessage,
     ) -> Result<()> {
-        run_opencode(state, &session, &input, &reply).await
+        run_opencode(state, &session, &input, system_prompt.as_deref(), &reply).await
     }
 
     async fn summarize_reply(
@@ -764,6 +769,23 @@ fn brief_reply_developer_prompt(session: &SessionSummary) -> Option<&'static str
     session.brief_reply_mode.then_some(
         "回复要求：请简短说明你做了什么和结果，尽量不超过 50 个汉字。只保留关键动作、结果或结论，避免展开解释。",
     )
+}
+
+fn turn_system_prompt<'a>(
+    session: &SessionSummary,
+    system_prompt: Option<&'a str>,
+) -> Option<String> {
+    let mut prompts = Vec::new();
+    if let Some(prompt) = brief_reply_developer_prompt(session) {
+        prompts.push(prompt.to_string());
+    }
+    if let Some(prompt) = system_prompt
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        prompts.push(prompt.to_string());
+    }
+    (!prompts.is_empty()).then(|| prompts.join("\n\n"))
 }
 
 fn codex_binary_path() -> PathBuf {
@@ -1102,6 +1124,7 @@ async fn run_codex(
     state: Arc<AppState>,
     session: &SessionSummary,
     input: &ChatMessage,
+    system_prompt: Option<&str>,
     reply: &ChatMessage,
 ) -> Result<()> {
     let project_root = state
@@ -1180,7 +1203,7 @@ async fn run_codex(
     wait_for_json_rpc_response(&mut stdout_rx, &mut raw_stdout, next_request_id - 1).await?;
 
     let existing_runtime_ref = state.provider_session_ref(&session.id).await;
-    let developer_instructions = brief_reply_developer_prompt(session);
+    let developer_instructions = turn_system_prompt(session, system_prompt);
     let thread_request_id = if let Some(thread_id) = existing_runtime_ref.as_deref() {
         send_json_rpc_request(
             &mut stdin,
@@ -1394,6 +1417,7 @@ async fn run_claude_code(
     state: Arc<AppState>,
     session: &SessionSummary,
     input: &ChatMessage,
+    system_prompt: Option<&str>,
     reply: &ChatMessage,
 ) -> Result<()> {
     let state_dir = claude_state_dir();
@@ -1447,7 +1471,7 @@ async fn run_claude_code(
         .arg("--include-partial-messages")
         .arg("--settings")
         .arg(settings.to_string());
-    if let Some(system_prompt) = brief_reply_developer_prompt(session) {
+    if let Some(system_prompt) = turn_system_prompt(session, system_prompt) {
         command.arg("--append-system-prompt").arg(system_prompt);
     }
     if existing_runtime_ref.is_some() {
@@ -1596,6 +1620,7 @@ async fn run_opencode(
     state: Arc<AppState>,
     session: &SessionSummary,
     input: &ChatMessage,
+    system_prompt: Option<&str>,
     reply: &ChatMessage,
 ) -> Result<()> {
     let project_root = state
@@ -1622,7 +1647,7 @@ async fn run_opencode(
     let mut full_text = String::new();
     let (approval_tx, mut approval_rx) = mpsc::unbounded_channel();
     state.set_approval_sender(&session.id, approval_tx).await;
-    let prompt = if let Some(system_prompt) = brief_reply_developer_prompt(session) {
+    let prompt = if let Some(system_prompt) = turn_system_prompt(session, system_prompt) {
         format!("{system_prompt}\n\n{}", input.content)
     } else {
         input.content.clone()

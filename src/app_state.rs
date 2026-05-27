@@ -498,7 +498,7 @@ impl AppState {
                 id: Uuid::new_v4().to_string(),
                 session_id: session_id.to_string(),
                 role: MessageRole::User,
-                content: decorate_user_content(input),
+                content: decorate_user_content(&input),
                 created_at: Utc::now(),
             };
             self.push_message(user_message.clone()).await;
@@ -525,9 +525,19 @@ impl AppState {
             id: Uuid::new_v4().to_string(),
             session_id: session_id.to_string(),
             role: MessageRole::User,
-            content: decorate_user_content(input),
+            content: decorate_user_content(&input),
             created_at: Utc::now(),
         };
+        let system_prompt = input
+            .system_prompt
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        eprintln!(
+            "[messages] send session={session_id} input_mode={:?} system_prompt_present={} system_prompt_len={}",
+            input.input_mode,
+            system_prompt.is_some(),
+            system_prompt.as_ref().map(|value| value.len()).unwrap_or(0),
+        );
         let pending_reply = ChatMessage {
             id: Uuid::new_v4().to_string(),
             session_id: session_id.to_string(),
@@ -572,6 +582,7 @@ impl AppState {
                     state.clone(),
                     session_snapshot,
                     user_message_for_task,
+                    system_prompt,
                     pending_reply_for_task,
                 )
                 .await;
@@ -1268,9 +1279,9 @@ fn approval_choice_preview(choice: &ApprovalChoice) -> &'static str {
     }
 }
 
-fn decorate_user_content(input: SendMessageInput) -> String {
+fn decorate_user_content(input: &SendMessageInput) -> String {
     match input.input_mode {
-        InputMode::Text => input.content,
+        InputMode::Text => input.content.clone(),
         InputMode::Voice => format!("[voice] {}", input.content),
     }
 }

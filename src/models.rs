@@ -99,6 +99,8 @@ pub enum InputMode {
 pub struct SendMessageInput {
     pub content: String,
     pub input_mode: InputMode,
+    #[serde(default)]
+    pub system_prompt: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
