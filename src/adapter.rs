@@ -56,6 +56,7 @@ pub trait AgentProvider: Send + Sync {
         state: Arc<AppState>,
         session: SessionSummary,
         input: ChatMessage,
+        system_prompt: Option<String>,
         reply: ChatMessage,
     ) -> Result<()>;
 
@@ -112,6 +113,7 @@ impl AgentProvider for StubProvider {
         state: Arc<AppState>,
         session: SessionSummary,
         input: ChatMessage,
+        _system_prompt: Option<String>,
         reply: ChatMessage,
     ) -> Result<()> {
         let prefix = match self.kind {
@@ -239,6 +241,83 @@ mod tests {
     }
 
     #[test]
+    fn codex_streaming_state_maps_file_change_approval_requests() {
+        let mut state = CodexAppServerStreamingState::default();
+
+        match state.ingest_value(&serde_json::json!({
+            "id": 8,
+            "method": "item/fileChange/requestApproval",
+            "params": {
+                "reason": "Would you like to make the following edits?",
+                "availableDecisions": ["accept", "acceptForSession", "cancel"],
+                "fileChanges": [
+                    { "path": "src/adapter.rs" },
+                    { "path": "src/models.rs" }
+                ]
+            }
+        })) {
+            CodexAppServerEvent::ApprovalRequested(pending) => {
+                assert_eq!(pending.request.request_id, "8");
+                assert!(matches!(pending.request.kind, ApprovalKind::FileChange));
+                assert_eq!(
+                    pending.request.command.as_deref(),
+                    Some("edit files: src/adapter.rs, src/models.rs")
+                );
+                assert_eq!(
+                    pending.request.reason.as_deref(),
+                    Some("Would you like to make the following edits?")
+                );
+                assert!(pending.request.allow_accept_for_session);
+                assert!(pending.request.allow_cancel);
+                assert!(pending.request.resolvable);
+            }
+            _ => panic!("expected file change approval request"),
+        }
+    }
+
+    #[test]
+    fn codex_streaming_state_maps_legacy_apply_patch_approval_requests() {
+        let mut state = CodexAppServerStreamingState::default();
+
+        match state.ingest_value(&serde_json::json!({
+            "id": "patch-1",
+            "method": "applyPatchApproval",
+            "params": {
+                "files": ["src/adapter.rs"]
+            }
+        })) {
+            CodexAppServerEvent::ApprovalRequested(pending) => {
+                assert_eq!(pending.request.request_id, "patch-1");
+                assert!(matches!(pending.request.kind, ApprovalKind::ApplyPatch));
+                assert_eq!(
+                    pending.request.command.as_deref(),
+                    Some("edit files: src/adapter.rs")
+                );
+                assert!(pending.request.allow_accept_for_session);
+                assert!(pending.request.allow_cancel);
+                assert!(pending.request.resolvable);
+            }
+            _ => panic!("expected apply patch approval request"),
+        }
+    }
+
+    #[test]
+    fn codex_approval_result_serializes_file_change_decisions() {
+        assert_eq!(
+            approval_result_json(&ApprovalChoice::Accept, &ApprovalKind::FileChange),
+            serde_json::json!({ "decision": "accept" })
+        );
+        assert_eq!(
+            approval_result_json(&ApprovalChoice::AcceptForSession, &ApprovalKind::FileChange),
+            serde_json::json!({ "decision": "acceptForSession" })
+        );
+        assert_eq!(
+            approval_result_json(&ApprovalChoice::AcceptForSession, &ApprovalKind::ApplyPatch),
+            serde_json::json!({ "decision": "approved_for_session" })
+        );
+    }
+
+    #[test]
     fn claude_streaming_state_parses_assistant_result_and_errors() {
         let mut state = ClaudeStreamingState::default();
 
@@ -260,6 +339,41 @@ mod tests {
             .ingest_line(r#"{"type":"result","result":"failed","is_error":true}"#)
             .expect_err("error result should fail");
         assert!(error.to_string().contains("failed"));
+    }
+
+    #[test]
+    fn claude_streaming_state_parses_stream_events() {
+        let mut state = ClaudeStreamingState::default();
+
+        let rendered = state
+            .ingest_line(
+                r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}"#,
+            )
+            .expect("valid content block start");
+        assert_eq!(rendered, None);
+
+        let rendered = state
+            .ingest_line(
+                r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}}"#,
+            )
+            .expect("valid content block delta");
+        assert_eq!(rendered.as_deref(), Some("hello"));
+        assert_eq!(state.finish_text().as_deref(), Some("hello"));
+
+        let rendered = state
+            .ingest_line(
+                r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" world"}}}"#,
+            )
+            .expect("valid second content block delta");
+        assert_eq!(rendered.as_deref(), Some("hello world"));
+
+        let rendered = state
+            .ingest_line(
+                r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+            )
+            .expect("valid content block stop");
+        assert_eq!(rendered.as_deref(), Some("hello world"));
+        assert_eq!(state.finish_text().as_deref(), Some("hello world"));
     }
 
     #[tokio::test]
@@ -294,7 +408,7 @@ mod tests {
         };
 
         let result = provider
-            .run_session(Arc::clone(&state), session, input, reply)
+            .run_session(Arc::clone(&state), session, input, None, reply)
             .await
             .expect_err("direct call without seeded reply should expose state contract");
         assert!(result.to_string().contains("unknown message"));
@@ -470,9 +584,10 @@ impl AgentProvider for CodexProvider {
         state: Arc<AppState>,
         session: SessionSummary,
         input: ChatMessage,
+        system_prompt: Option<String>,
         reply: ChatMessage,
     ) -> Result<()> {
-        run_codex(state, &session, &input, &reply).await
+        run_codex(state, &session, &input, system_prompt.as_deref(), &reply).await
     }
 
     async fn summarize_reply(
@@ -592,9 +707,10 @@ impl AgentProvider for ClaudeCodeProvider {
         state: Arc<AppState>,
         session: SessionSummary,
         input: ChatMessage,
+        system_prompt: Option<String>,
         reply: ChatMessage,
     ) -> Result<()> {
-        run_claude_code(state, &session, &input, &reply).await
+        run_claude_code(state, &session, &input, system_prompt.as_deref(), &reply).await
     }
 
     async fn summarize_reply(
@@ -655,9 +771,10 @@ impl AgentProvider for OpenCodeProvider {
         state: Arc<AppState>,
         session: SessionSummary,
         input: ChatMessage,
+        system_prompt: Option<String>,
         reply: ChatMessage,
     ) -> Result<()> {
-        run_opencode(state, &session, &input, &reply).await
+        run_opencode(state, &session, &input, system_prompt.as_deref(), &reply).await
     }
 
     async fn summarize_reply(
@@ -687,6 +804,23 @@ fn brief_reply_developer_prompt(session: &SessionSummary) -> Option<&'static str
     session.brief_reply_mode.then_some(
         "回复要求：请简短说明你做了什么和结果，尽量不超过 50 个汉字。只保留关键动作、结果或结论，避免展开解释。",
     )
+}
+
+fn turn_system_prompt<'a>(
+    session: &SessionSummary,
+    system_prompt: Option<&'a str>,
+) -> Option<String> {
+    let mut prompts = Vec::new();
+    if let Some(prompt) = brief_reply_developer_prompt(session) {
+        prompts.push(prompt.to_string());
+    }
+    if let Some(prompt) = system_prompt
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        prompts.push(prompt.to_string());
+    }
+    (!prompts.is_empty()).then(|| prompts.join("\n\n"))
 }
 
 fn codex_binary_path() -> PathBuf {
@@ -1025,6 +1159,7 @@ async fn run_codex(
     state: Arc<AppState>,
     session: &SessionSummary,
     input: &ChatMessage,
+    system_prompt: Option<&str>,
     reply: &ChatMessage,
 ) -> Result<()> {
     let project_root = state
@@ -1103,7 +1238,7 @@ async fn run_codex(
     wait_for_json_rpc_response(&mut stdout_rx, &mut raw_stdout, next_request_id - 1).await?;
 
     let existing_runtime_ref = state.provider_session_ref(&session.id).await;
-    let developer_instructions = brief_reply_developer_prompt(session);
+    let developer_instructions = turn_system_prompt(session, system_prompt);
     let thread_request_id = if let Some(thread_id) = existing_runtime_ref.as_deref() {
         send_json_rpc_request(
             &mut stdin,
@@ -1317,6 +1452,7 @@ async fn run_claude_code(
     state: Arc<AppState>,
     session: &SessionSummary,
     input: &ChatMessage,
+    system_prompt: Option<&str>,
     reply: &ChatMessage,
 ) -> Result<()> {
     let state_dir = claude_state_dir();
@@ -1370,7 +1506,7 @@ async fn run_claude_code(
         .arg("--include-partial-messages")
         .arg("--settings")
         .arg(settings.to_string());
-    if let Some(system_prompt) = brief_reply_developer_prompt(session) {
+    if let Some(system_prompt) = turn_system_prompt(session, system_prompt) {
         command.arg("--append-system-prompt").arg(system_prompt);
     }
     if existing_runtime_ref.is_some() {
@@ -1519,6 +1655,7 @@ async fn run_opencode(
     state: Arc<AppState>,
     session: &SessionSummary,
     input: &ChatMessage,
+    system_prompt: Option<&str>,
     reply: &ChatMessage,
 ) -> Result<()> {
     let project_root = state
@@ -1545,7 +1682,7 @@ async fn run_opencode(
     let mut full_text = String::new();
     let (approval_tx, mut approval_rx) = mpsc::unbounded_channel();
     state.set_approval_sender(&session.id, approval_tx).await;
-    let prompt = if let Some(system_prompt) = brief_reply_developer_prompt(session) {
+    let prompt = if let Some(system_prompt) = turn_system_prompt(session, system_prompt) {
         format!("{system_prompt}\n\n{}", input.content)
     } else {
         input.content.clone()
@@ -2162,6 +2299,28 @@ impl CodexAppServerStreamingState {
                 },
                 last_choice: None,
             }),
+            "item/fileChange/requestApproval" => Some(PendingApproval {
+                request: ApprovalRequest {
+                    request_id: request_id.clone(),
+                    kind: ApprovalKind::FileChange,
+                    command: render_file_change_approval_command(params),
+                    reason: params
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string)
+                        .or_else(|| Some("Apply proposed edits".to_string())),
+                    allow_accept_for_session: approval_decisions_contain(
+                        params.get("availableDecisions"),
+                        "acceptForSession",
+                    ),
+                    allow_cancel: approval_decisions_contain(
+                        params.get("availableDecisions"),
+                        "cancel",
+                    ),
+                    resolvable: true,
+                },
+                last_choice: None,
+            }),
             "execCommandApproval" => Some(PendingApproval {
                 request: ApprovalRequest {
                     request_id: request_id.clone(),
@@ -2181,6 +2340,22 @@ impl CodexAppServerStreamingState {
                         .get("reason")
                         .and_then(Value::as_str)
                         .map(ToString::to_string),
+                    allow_accept_for_session: true,
+                    allow_cancel: true,
+                    resolvable: true,
+                },
+                last_choice: None,
+            }),
+            "applyPatchApproval" => Some(PendingApproval {
+                request: ApprovalRequest {
+                    request_id: request_id.clone(),
+                    kind: ApprovalKind::ApplyPatch,
+                    command: render_file_change_approval_command(params),
+                    reason: params
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string)
+                        .or_else(|| Some("Apply proposed edits".to_string())),
                     allow_accept_for_session: true,
                     allow_cancel: true,
                     resolvable: true,
@@ -2427,6 +2602,59 @@ fn approval_decisions_contain(value: Option<&Value>, expected: &str) -> bool {
             })
         })
         .unwrap_or(false)
+}
+
+fn render_file_change_approval_command(params: &Value) -> Option<String> {
+    let files = params
+        .get("files")
+        .or_else(|| params.get("fileChanges"))
+        .or_else(|| params.get("changes"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(file_change_path)
+                .take(5)
+                .collect::<Vec<_>>()
+        })
+        .filter(|paths| !paths.is_empty());
+
+    if let Some(paths) = files {
+        let suffix = if paths.len() == 5 { "..." } else { "" };
+        return Some(format!("edit files: {}{}", paths.join(", "), suffix));
+    }
+
+    params
+        .get("path")
+        .or_else(|| params.get("file"))
+        .or_else(|| params.pointer("/file/path"))
+        .and_then(Value::as_str)
+        .map(|path| format!("edit file: {path}"))
+        .or_else(|| Some("apply proposed edits".to_string()))
+}
+
+fn file_change_path(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(ToString::to_string)
+        .or_else(|| {
+            value
+                .get("path")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+        .or_else(|| {
+            value
+                .get("file")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+        .or_else(|| {
+            value
+                .get("relativePath")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
 }
 
 fn render_approval_summary(request: &ApprovalRequest) -> String {
@@ -2748,6 +2976,7 @@ struct ClaudeStreamingState {
     assistant_blocks: Vec<String>,
     latest_status: Option<String>,
     partial_text: Option<String>,
+    stream_text: String,
 }
 
 impl ClaudeStreamingState {
@@ -2769,6 +2998,9 @@ impl ClaudeStreamingState {
                     .or_else(|| map.get("content").and_then(extract_text_from_json))
                     .or_else(|| map.get("text").and_then(extract_text_from_json)),
             )),
+            "stream_event" => {
+                Ok(self.ingest_stream_event(map.get("event").or_else(|| map.get("stream_event"))))
+            }
             "system" => {
                 self.latest_status = map
                     .get("subtype")
@@ -2809,6 +3041,63 @@ impl ClaudeStreamingState {
                 self.latest_status = Some(format!("[debug:claude:type] unhandled type={other}"));
                 Ok(None)
             }
+        }
+    }
+
+    fn ingest_stream_event(&mut self, event: Option<&Value>) -> Option<String> {
+        let Some(event) = event.and_then(Value::as_object) else {
+            return None;
+        };
+
+        match event
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+        {
+            "content_block_start" => {
+                if let Some(text) = event
+                    .get("content_block")
+                    .and_then(extract_text_from_json)
+                    .or_else(|| event.get("block").and_then(extract_text_from_json))
+                {
+                    self.stream_text.push_str(&text);
+                    self.partial_text = Some(self.stream_text.clone());
+                    self.latest_status = None;
+                    return self.render_assistant_text();
+                }
+                None
+            }
+            "content_block_delta" => {
+                let text = event
+                    .get("delta")
+                    .and_then(extract_stream_delta_text)
+                    .or_else(|| {
+                        event
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })?;
+                self.stream_text.push_str(&text);
+                self.partial_text = Some(self.stream_text.clone());
+                self.latest_status = None;
+                self.render_assistant_text()
+            }
+            "content_block_stop" | "message_stop" => {
+                let text = self.stream_text.trim().to_string();
+                if !text.is_empty() && self.assistant_blocks.last() != Some(&text) {
+                    self.display_blocks.push(text.clone());
+                    self.assistant_blocks.push(text);
+                }
+                self.partial_text = None;
+                self.stream_text.clear();
+                self.latest_status = None;
+                self.render_assistant_text()
+            }
+            "message_start" | "message_delta" => {
+                self.latest_status = None;
+                None
+            }
+            _ => None,
         }
     }
 
@@ -3244,6 +3533,27 @@ fn extract_text_from_json(value: &Value) -> Option<String> {
     }
 }
 
+fn extract_stream_delta_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.to_string()),
+        Value::Array(items) => {
+            let text = items
+                .iter()
+                .filter_map(extract_stream_delta_text)
+                .collect::<Vec<_>>()
+                .join("");
+            Some(text)
+        }
+        Value::Object(map) => map
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| map.get("delta").and_then(extract_stream_delta_text))
+            .or_else(|| map.get("content").and_then(extract_stream_delta_text)),
+        _ => None,
+    }
+}
+
 fn strip_ansi(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
@@ -3360,13 +3670,13 @@ async fn auto_approve_codex_request(
                 Some(AiApprovalDecisionKind::AskUser) | None => None,
             })
         }
-        ApprovalKind::Permissions => Ok(None),
+        ApprovalKind::FileChange | ApprovalKind::ApplyPatch | ApprovalKind::Permissions => Ok(None),
     }
 }
 
 fn approval_result_json(choice: &ApprovalChoice, kind: &ApprovalKind) -> Value {
     match kind {
-        ApprovalKind::CommandExecution => serde_json::json!({
+        ApprovalKind::CommandExecution | ApprovalKind::FileChange => serde_json::json!({
             "decision": match choice {
                 ApprovalChoice::Accept | ApprovalChoice::AlwaysAllow => Value::String("accept".to_string()),
                 ApprovalChoice::AcceptForSession => Value::String("acceptForSession".to_string()),
@@ -3375,6 +3685,14 @@ fn approval_result_json(choice: &ApprovalChoice, kind: &ApprovalKind) -> Value {
             }
         }),
         ApprovalKind::ExecCommand => serde_json::json!({
+            "decision": match choice {
+                ApprovalChoice::Accept | ApprovalChoice::AlwaysAllow => Value::String("approved".to_string()),
+                ApprovalChoice::AcceptForSession => Value::String("approved_for_session".to_string()),
+                ApprovalChoice::Decline => Value::String("denied".to_string()),
+                ApprovalChoice::Cancel => Value::String("abort".to_string()),
+            }
+        }),
+        ApprovalKind::ApplyPatch => serde_json::json!({
             "decision": match choice {
                 ApprovalChoice::Accept | ApprovalChoice::AlwaysAllow => Value::String("approved".to_string()),
                 ApprovalChoice::AcceptForSession => Value::String("approved_for_session".to_string()),

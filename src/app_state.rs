@@ -22,10 +22,11 @@ use crate::{
         ClientAuthStatus, CreateProjectInput, CreateSessionInput, InputMode, MessageDeltaEvent,
         MessageRole, ProjectSummary, PushDeviceRegistration, RegisterPushDeviceInput,
         SendMessageInput, SessionEvent, SessionStatus, SessionStatusEvent, SessionSummary,
-        TriggerClientMessageInput, TriggerClientMessageResult,
+        SpeakerFilterSettings, TriggerClientMessageInput, TriggerClientMessageResult,
     },
     push::PushService,
     session_store::project_id_for_path,
+    speech::SpeechService,
 };
 
 #[derive(Default)]
@@ -48,6 +49,18 @@ struct AggregatedListCache {
     sessions_by_id: HashMap<String, SessionSummary>,
 }
 
+#[derive(Debug, Clone)]
+pub struct TtsStreamSession {
+    pub token: String,
+    pub model_id: String,
+    pub input: String,
+    pub voice: Option<String>,
+    pub speed: Option<f32>,
+    pub response_format: Option<String>,
+    pub content_type: String,
+    pub expires_at: Instant,
+}
+
 pub struct AppState {
     projects: RwLock<HashMap<String, ProjectSummary>>,
     sessions: RwLock<HashMap<String, SessionSummary>>,
@@ -58,8 +71,10 @@ pub struct AppState {
     event_tx: broadcast::Sender<SessionEvent>,
     providers: ProviderRegistry,
     settings: BridgeSettingsStore,
+    speech: Arc<SpeechService>,
     client_auth: ClientAuthStore,
     push: PushService,
+    tts_stream_sessions: Mutex<HashMap<String, TtsStreamSession>>,
 }
 
 impl AppState {
@@ -77,9 +92,46 @@ impl AppState {
             event_tx,
             providers: ProviderRegistry::new(),
             settings: BridgeSettingsStore::load().await,
+            speech: Arc::new(SpeechService::load().await),
             client_auth: ClientAuthStore::load().await,
             push: PushService::new(),
+            tts_stream_sessions: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub async fn create_tts_stream_session(
+        &self,
+        model_id: String,
+        input: String,
+        voice: Option<String>,
+        speed: Option<f32>,
+        response_format: Option<String>,
+        content_type: String,
+    ) -> TtsStreamSession {
+        const TTS_STREAM_TTL: Duration = Duration::from_secs(120);
+        let mut sessions = self.tts_stream_sessions.lock().await;
+        let now = Instant::now();
+        sessions.retain(|_, session| session.expires_at > now);
+        let token = Uuid::new_v4().to_string().replace('-', "");
+        let session = TtsStreamSession {
+            token: token.clone(),
+            model_id,
+            input,
+            voice,
+            speed,
+            response_format,
+            content_type,
+            expires_at: now + TTS_STREAM_TTL,
+        };
+        sessions.insert(token, session.clone());
+        session
+    }
+
+    pub async fn get_tts_stream_session(&self, token: &str) -> Option<TtsStreamSession> {
+        let mut sessions = self.tts_stream_sessions.lock().await;
+        let now = Instant::now();
+        sessions.retain(|_, session| session.expires_at > now);
+        sessions.get(token).cloned()
     }
 
     pub async fn is_runtime_client_id_allowed(&self, client_id: &str) -> bool {
@@ -130,14 +182,46 @@ impl AppState {
         self.settings.get().await
     }
 
-    pub async fn save_bridge_settings(
+    pub async fn update_bridge_settings(
         &self,
-        settings: BridgeSettings,
+        input: crate::bridge_settings::BridgeSettingsInput,
     ) -> Result<BridgeSettings, String> {
         self.settings
-            .save(settings)
+            .update(|settings| {
+                settings.ai_approval = input.ai_approval;
+                if let Some(speech_profiles) = input.speech_profiles {
+                    settings.speech_profiles = speech_profiles;
+                }
+                if let Some(speech_voices) = input.speech_voices {
+                    settings.speech_voices = speech_voices;
+                }
+                if let Some(speaker_filter) = input.speaker_filter {
+                    settings.speaker_filter =
+                        crate::speaker::normalize_speaker_filter(speaker_filter);
+                }
+            })
             .await
             .map_err(|error| error.to_string())
+    }
+
+    pub async fn update_speaker_filter_settings(
+        &self,
+        input: SpeakerFilterSettings,
+    ) -> Result<BridgeSettings, String> {
+        self.settings
+            .update(|settings| {
+                settings.speaker_filter = crate::speaker::normalize_speaker_filter(input);
+            })
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn speech(&self) -> Arc<SpeechService> {
+        Arc::clone(&self.speech)
+    }
+
+    pub fn settings_store(&self) -> &BridgeSettingsStore {
+        &self.settings
     }
 
     pub async fn list_projects(&self) -> Vec<ProjectSummary> {
@@ -414,7 +498,7 @@ impl AppState {
                 id: Uuid::new_v4().to_string(),
                 session_id: session_id.to_string(),
                 role: MessageRole::User,
-                content: decorate_user_content(input),
+                content: decorate_user_content(&input),
                 created_at: Utc::now(),
             };
             self.push_message(user_message.clone()).await;
@@ -441,9 +525,19 @@ impl AppState {
             id: Uuid::new_v4().to_string(),
             session_id: session_id.to_string(),
             role: MessageRole::User,
-            content: decorate_user_content(input),
+            content: decorate_user_content(&input),
             created_at: Utc::now(),
         };
+        let system_prompt = input
+            .system_prompt
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        eprintln!(
+            "[messages] send session={session_id} input_mode={:?} system_prompt_present={} system_prompt_len={}",
+            input.input_mode,
+            system_prompt.is_some(),
+            system_prompt.as_ref().map(|value| value.len()).unwrap_or(0),
+        );
         let pending_reply = ChatMessage {
             id: Uuid::new_v4().to_string(),
             session_id: session_id.to_string(),
@@ -488,6 +582,7 @@ impl AppState {
                     state.clone(),
                     session_snapshot,
                     user_message_for_task,
+                    system_prompt,
                     pending_reply_for_task,
                 )
                 .await;
@@ -1184,9 +1279,9 @@ fn approval_choice_preview(choice: &ApprovalChoice) -> &'static str {
     }
 }
 
-fn decorate_user_content(input: SendMessageInput) -> String {
+fn decorate_user_content(input: &SendMessageInput) -> String {
     match input.input_mode {
-        InputMode::Text => input.content,
+        InputMode::Text => input.content.clone(),
         InputMode::Voice => format!("[voice] {}", input.content),
     }
 }
@@ -1200,4 +1295,36 @@ fn message_title(content: &str) -> String {
         })
         .unwrap_or("移动端消息");
     title.chars().take(24).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn tts_stream_session_can_be_read_multiple_times_until_ttl() {
+        let state = AppState::new().await;
+        let session = state
+            .create_tts_stream_session(
+                "model".to_string(),
+                "hello".to_string(),
+                Some("48".to_string()),
+                None,
+                None,
+                "audio/wav".to_string(),
+            )
+            .await;
+
+        let first = state.get_tts_stream_session(&session.token).await;
+        let second = state.get_tts_stream_session(&session.token).await;
+
+        assert_eq!(
+            first.as_ref().map(|value| value.token.as_str()),
+            Some(session.token.as_str())
+        );
+        assert_eq!(
+            second.as_ref().map(|value| value.token.as_str()),
+            Some(session.token.as_str())
+        );
+    }
 }
