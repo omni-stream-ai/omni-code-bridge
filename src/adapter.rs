@@ -341,6 +341,41 @@ mod tests {
         assert!(error.to_string().contains("failed"));
     }
 
+    #[test]
+    fn claude_streaming_state_parses_stream_events() {
+        let mut state = ClaudeStreamingState::default();
+
+        let rendered = state
+            .ingest_line(
+                r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}"#,
+            )
+            .expect("valid content block start");
+        assert_eq!(rendered, None);
+
+        let rendered = state
+            .ingest_line(
+                r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}}"#,
+            )
+            .expect("valid content block delta");
+        assert_eq!(rendered.as_deref(), Some("hello"));
+        assert_eq!(state.finish_text().as_deref(), Some("hello"));
+
+        let rendered = state
+            .ingest_line(
+                r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" world"}}}"#,
+            )
+            .expect("valid second content block delta");
+        assert_eq!(rendered.as_deref(), Some("hello world"));
+
+        let rendered = state
+            .ingest_line(
+                r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+            )
+            .expect("valid content block stop");
+        assert_eq!(rendered.as_deref(), Some("hello world"));
+        assert_eq!(state.finish_text().as_deref(), Some("hello world"));
+    }
+
     #[tokio::test]
     async fn stub_provider_completes_when_called_directly() {
         let state = Arc::new(AppState::new().await);
@@ -2941,6 +2976,7 @@ struct ClaudeStreamingState {
     assistant_blocks: Vec<String>,
     latest_status: Option<String>,
     partial_text: Option<String>,
+    stream_text: String,
 }
 
 impl ClaudeStreamingState {
@@ -2962,6 +2998,9 @@ impl ClaudeStreamingState {
                     .or_else(|| map.get("content").and_then(extract_text_from_json))
                     .or_else(|| map.get("text").and_then(extract_text_from_json)),
             )),
+            "stream_event" => {
+                Ok(self.ingest_stream_event(map.get("event").or_else(|| map.get("stream_event"))))
+            }
             "system" => {
                 self.latest_status = map
                     .get("subtype")
@@ -3002,6 +3041,63 @@ impl ClaudeStreamingState {
                 self.latest_status = Some(format!("[debug:claude:type] unhandled type={other}"));
                 Ok(None)
             }
+        }
+    }
+
+    fn ingest_stream_event(&mut self, event: Option<&Value>) -> Option<String> {
+        let Some(event) = event.and_then(Value::as_object) else {
+            return None;
+        };
+
+        match event
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+        {
+            "content_block_start" => {
+                if let Some(text) = event
+                    .get("content_block")
+                    .and_then(extract_text_from_json)
+                    .or_else(|| event.get("block").and_then(extract_text_from_json))
+                {
+                    self.stream_text.push_str(&text);
+                    self.partial_text = Some(self.stream_text.clone());
+                    self.latest_status = None;
+                    return self.render_assistant_text();
+                }
+                None
+            }
+            "content_block_delta" => {
+                let text = event
+                    .get("delta")
+                    .and_then(extract_stream_delta_text)
+                    .or_else(|| {
+                        event
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })?;
+                self.stream_text.push_str(&text);
+                self.partial_text = Some(self.stream_text.clone());
+                self.latest_status = None;
+                self.render_assistant_text()
+            }
+            "content_block_stop" | "message_stop" => {
+                let text = self.stream_text.trim().to_string();
+                if !text.is_empty() && self.assistant_blocks.last() != Some(&text) {
+                    self.display_blocks.push(text.clone());
+                    self.assistant_blocks.push(text);
+                }
+                self.partial_text = None;
+                self.stream_text.clear();
+                self.latest_status = None;
+                self.render_assistant_text()
+            }
+            "message_start" | "message_delta" => {
+                self.latest_status = None;
+                None
+            }
+            _ => None,
         }
     }
 
@@ -3433,6 +3529,27 @@ fn extract_text_from_json(value: &Value) -> Option<String> {
             .or_else(|| map.get("text").and_then(extract_text_from_json))
             .or_else(|| map.get("result").and_then(extract_text_from_json))
             .or_else(|| map.get("output_text").and_then(extract_text_from_json)),
+        _ => None,
+    }
+}
+
+fn extract_stream_delta_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.to_string()),
+        Value::Array(items) => {
+            let text = items
+                .iter()
+                .filter_map(extract_stream_delta_text)
+                .collect::<Vec<_>>()
+                .join("");
+            Some(text)
+        }
+        Value::Object(map) => map
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| map.get("delta").and_then(extract_stream_delta_text))
+            .or_else(|| map.get("content").and_then(extract_stream_delta_text)),
         _ => None,
     }
 }
