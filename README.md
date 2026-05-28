@@ -34,14 +34,6 @@ Rust bridge for [Omni Code](https://github.com/omni-stream-ai/omni-code). Expose
 > systemctl --user enable --now omni-code-bridge.service
 > ```
 
-## Requirements
-
-- `Rust` / `cargo`
-- Optional agent CLIs: `codex`, `claude`, or `opencode`
-- Optional: a local checkout of [omni-code](https://github.com/omni-stream-ai/omni-code) if you want the built-in APK update manifest endpoints to serve a local Android build
-
-Agent binary paths can be overridden with `ECHO_MATE_CODEX_BIN` and `ECHO_MATE_OPENCODE_BIN`.
-
 ## Quick Start
 
 ```bash
@@ -50,6 +42,15 @@ cargo run
 ```
 
 The bridge listens on `http://127.0.0.1:8787` by default.
+
+> `cargo run` requires the Rust toolchain. If you installed via Homebrew, AUR, or the install script, just run `omni-code-bridge` directly.
+
+## Optional Dependencies
+
+- Agent CLIs: `codex`, `claude`, or `opencode`
+- A local checkout of [omni-code](https://github.com/omni-stream-ai/omni-code) if you want the built-in APK update manifest endpoints to serve a local Android build
+
+Agent binary paths can be overridden with `ECHO_MATE_CODEX_BIN` and `ECHO_MATE_OPENCODE_BIN`.
 
 ## HTTP API
 
@@ -177,49 +178,6 @@ Example `session.update`:
 }
 ```
 
-## Speech Smoke Test
-
-For local validation there is an end-to-end smoke test script:
-
-```bash
-scripts/speech-smoke.sh --keep-artifacts
-```
-
-What it does:
-
-- Checks `GET /health`
-- Auto-provisions a local client auth token when `BRIDGE_CLIENT_ID` and `BRIDGE_TOKEN` are not set
-- Downloads missing ASR/TTS models through `/speech/models/downloads`
-- Binds `asr.batch` and `tts.default`
-- Synthesizes a wav file through `/v1/audio/speech`
-- Transcribes that wav through `/v1/audio/transcriptions` using both profile fallback and explicit model selection
-
-Useful options:
-
-| Option | Description |
-| --- | --- |
-| `--with-call-models` | Also install and bind `asr.realtime` and `vad.default` |
-| `--with-realtime` | Also run the websocket realtime ASR smoke example |
-| `--skip-download` | Fail if required models are missing |
-| `--output-dir DIR` | Store generated artifacts in a fixed directory |
-| `--no-auto-auth` | Require an existing `BRIDGE_CLIENT_ID` and `BRIDGE_TOKEN` |
-
-The script requires `curl` and `jq`.
-
-There is also a realtime websocket smoke example:
-
-```bash
-cargo run --example speech_realtime_smoke -- \
-  --bridge-url http://127.0.0.1:8787 \
-  --client-id "$BRIDGE_CLIENT_ID" \
-  --token "$BRIDGE_TOKEN" \
-  --wav /tmp/omni-code-bridge-speech-smoke-12345/tts.wav
-```
-
-The example expects a local wav file, resamples it to `16 kHz`, streams it to
-`/speech/realtime/ws`, and prints the observed realtime events and completed
-transcript.
-
 ## Client Authorization
 
 Clients register and get approved via CLI:
@@ -291,6 +249,49 @@ sh scripts/setup-git-hooks.sh
 ```
 
 Run `sh scripts/setup-git-hooks.sh` once after cloning to enable the local `commit-msg` hook.
+
+### Speech Smoke Test
+
+For local validation there is an end-to-end smoke test script:
+
+```bash
+scripts/speech-smoke.sh --keep-artifacts
+```
+
+What it does:
+
+- Checks `GET /health`
+- Auto-provisions a local client auth token when `BRIDGE_CLIENT_ID` and `BRIDGE_TOKEN` are not set
+- Downloads missing ASR/TTS models through `/speech/models/downloads`
+- Binds `asr.batch` and `tts.default`
+- Synthesizes a wav file through `/v1/audio/speech`
+- Transcribes that wav through `/v1/audio/transcriptions` using both profile fallback and explicit model selection
+
+Useful options:
+
+| Option | Description |
+| --- | --- |
+| `--with-call-models` | Also install and bind `asr.realtime` and `vad.default` |
+| `--with-realtime` | Also run the websocket realtime ASR smoke example |
+| `--skip-download` | Fail if required models are missing |
+| `--output-dir DIR` | Store generated artifacts in a fixed directory |
+| `--no-auto-auth` | Require an existing `BRIDGE_CLIENT_ID` and `BRIDGE_TOKEN` |
+
+The script requires `curl` and `jq`.
+
+There is also a realtime websocket smoke example:
+
+```bash
+cargo run --example speech_realtime_smoke -- \
+  --bridge-url http://127.0.0.1:8787 \
+  --client-id "$BRIDGE_CLIENT_ID" \
+  --token "$BRIDGE_TOKEN" \
+  --wav /tmp/omni-code-bridge-speech-smoke-12345/tts.wav
+```
+
+The example expects a local wav file, resamples it to `16 kHz`, streams it to
+`/speech/realtime/ws`, and prints the observed realtime events and completed
+transcript.
 
 ### Commit Messages
 

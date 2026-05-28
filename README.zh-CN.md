@@ -34,14 +34,6 @@ Omni Code 的 Rust 桥接服务。对外提供 HTTP 和 SSE API，供移动端�
 > systemctl --user enable --now omni-code-bridge.service
 > ```
 
-## 依赖
-
-- `Rust` / `cargo`
-- 可选 agent CLI：`codex`、`claude` 或 `opencode`
-- 可选：本地检出 [omni-code](https://github.com/omni-stream-ai/omni-code)，用于桥接服务提供内置 APK 更新接口
-
-Agent 二进制路径可以通过 `ECHO_MATE_CODEX_BIN` 和 `ECHO_MATE_OPENCODE_BIN` 覆盖。
-
 ## 快速开始
 
 ```bash
@@ -50,6 +42,15 @@ cargo run
 ```
 
 默认监听 `http://127.0.0.1:8787`。
+
+> `cargo run` 需要 Rust 工具链。如果你通过 Homebrew、AUR 或安装脚本安装，直接运行 `omni-code-bridge` 即可。
+
+## 可选依赖
+
+- Agent CLI：`codex`、`claude` 或 `opencode`
+- 本地检出 [omni-code](https://github.com/omni-stream-ai/omni-code)，用于桥接服务提供内置 APK 更新接口
+
+Agent 二进制路径可以通过 `ECHO_MATE_CODEX_BIN` 和 `ECHO_MATE_OPENCODE_BIN` 覆盖。
 
 ## HTTP API
 
@@ -175,48 +176,6 @@ TTS 模型之间切换时不会复用不兼容的 voice。
 }
 ```
 
-## 语音烟测脚本
-
-仓库里现在提供了一套本地端到端语音烟测脚本：
-
-```bash
-scripts/speech-smoke.sh --keep-artifacts
-```
-
-这套脚本会：
-
-- 检查 `GET /health`
-- 在没有提供 `BRIDGE_CLIENT_ID` 和 `BRIDGE_TOKEN` 时，自动申请并批准本机 client auth
-- 通过 `/speech/models/downloads` 下载缺失的 ASR/TTS 模型
-- 绑定 `asr.batch` 和 `tts.default`
-- 通过 `/v1/audio/speech` 合成一段 wav
-- 再通过 `/v1/audio/transcriptions` 用 profile 回退和显式模型两种方式转写这段 wav
-
-常用选项：
-
-| 选项 | 说明 |
-| --- | --- |
-| `--with-call-models` | 额外安装并绑定 `asr.realtime` 和 `vad.default` |
-| `--with-realtime` | 额外执行 websocket realtime ASR 烟测 example |
-| `--skip-download` | 如果模型未安装则直接失败 |
-| `--output-dir DIR` | 把生成的产物固定写到指定目录 |
-| `--no-auto-auth` | 强制要求先提供现成的 `BRIDGE_CLIENT_ID` 和 `BRIDGE_TOKEN` |
-
-脚本依赖 `curl` 和 `jq`。
-
-另外还提供了一个 realtime websocket 烟测 example：
-
-```bash
-cargo run --example speech_realtime_smoke -- \
-  --bridge-url http://127.0.0.1:8787 \
-  --client-id "$BRIDGE_CLIENT_ID" \
-  --token "$BRIDGE_TOKEN" \
-  --wav /tmp/omni-code-bridge-speech-smoke-12345/tts.wav
-```
-
-这个 example 会读取本地 wav，重采样到 `16 kHz`，流式发送到
-`/speech/realtime/ws`，并打印收到的 realtime 事件和最终转写结果。
-
 ## 客户端授权
 
 客户端通过 CLI 申请并审批授权：
@@ -290,6 +249,48 @@ sh scripts/setup-git-hooks.sh
 ```
 
 首次克隆后，运行 `sh scripts/setup-git-hooks.sh` 以启用本地 `commit-msg` hook。
+
+### 语音烟测脚本
+
+仓库里现在提供了一套本地端到端语音烟测脚本：
+
+```bash
+scripts/speech-smoke.sh --keep-artifacts
+```
+
+这套脚本会：
+
+- 检查 `GET /health`
+- 在没有提供 `BRIDGE_CLIENT_ID` 和 `BRIDGE_TOKEN` 时，自动申请并批准本机 client auth
+- 通过 `/speech/models/downloads` 下载缺失的 ASR/TTS 模型
+- 绑定 `asr.batch` 和 `tts.default`
+- 通过 `/v1/audio/speech` 合成一段 wav
+- 再通过 `/v1/audio/transcriptions` 用 profile 回退和显式模型两种方式转写这段 wav
+
+常用选项：
+
+| 选项 | 说明 |
+| --- | --- |
+| `--with-call-models` | 额外安装并绑定 `asr.realtime` 和 `vad.default` |
+| `--with-realtime` | 额外执行 websocket realtime ASR 烟测 example |
+| `--skip-download` | 如果模型未安装则直接失败 |
+| `--output-dir DIR` | 把生成的产物固定写到指定目录 |
+| `--no-auto-auth` | 强制要求先提供现成的 `BRIDGE_CLIENT_ID` 和 `BRIDGE_TOKEN` |
+
+脚本依赖 `curl` 和 `jq`。
+
+另外还提供了一个 realtime websocket 烟测 example：
+
+```bash
+cargo run --example speech_realtime_smoke -- \
+  --bridge-url http://127.0.0.1:8787 \
+  --client-id "$BRIDGE_CLIENT_ID" \
+  --token "$BRIDGE_TOKEN" \
+  --wav /tmp/omni-code-bridge-speech-smoke-12345/tts.wav
+```
+
+这个 example 会读取本地 wav，重采样到 `16 kHz`，流式发送到
+`/speech/realtime/ws`，并打印收到的 realtime 事件和最终转写结果。
 
 ### 提交信息
 
