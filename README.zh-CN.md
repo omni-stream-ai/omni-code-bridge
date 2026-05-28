@@ -1,58 +1,48 @@
-# Omni Code Bridge
+<p align="center">
+  <img src="https://raw.githubusercontent.com/omni-stream-ai/omni-code/main/assets/app-icon.svg" width="128" alt="Omni Code Bridge">
+</p>
 
-Omni Code 的 Rust 桥接服务。它对外提供 HTTP 和 SSE API，供移动端使用，并连接到本地编码代理，例如 `codex`、`claudecode` 和 `opencode`。
+<h1 align="center">Omni Code Bridge</h1>
 
-Flutter 客户端仓库：
-`https://github.com/omni-stream-ai/omni-code`
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT License"></a>
+  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/Rust-2024-edition-dea584?logo=rust" alt="Rust"></a>
+  <a href="https://github.com/omni-stream-ai/omni-code-bridge/releases"><img src="https://img.shields.io/github/v/release/omni-stream-ai/omni-code-bridge" alt="Release"></a>
+  <a href="https://crates.io/crates/omni-code-bridge"><img src="https://img.shields.io/crates/v/omni-code-bridge" alt="Crates.io"></a>
+</p>
+
+<p align="center">
+  <a href="README.md">English</a>
+</p>
+
+---
+
+Omni Code 的 Rust 桥接服务。对外提供 HTTP 和 SSE API，供移动端客户端连接，并桥接到本地编码代理（`codex`、`claude`、`opencode`）。
 
 ## 安装
 
-**Homebrew（macOS / Linux）：**
+| 方式 | 命令 |
+| --- | --- |
+| **Homebrew** (macOS / Linux) | `brew tap omni-stream-ai/homebrew-omni-code-bridge && brew install omni-code-bridge` |
+| **Arch Linux** (AUR) | `yay -S omni-code-bridge-bin` |
+| **cargo** | `cargo install omni-code-bridge` |
+| **curl** (macOS / Linux) | `curl -fsSL https://raw.githubusercontent.com/omni-stream-ai/omni-code-bridge/main/scripts/install.sh \| bash` |
+| **PowerShell** (Windows) | `powershell -ExecutionPolicy Bypass -Command "iwr https://raw.githubusercontent.com/omni-stream-ai/omni-code-bridge/main/scripts/install.ps1 -UseBasicParsing \| iex"` |
 
-```bash
-brew tap omni-stream-ai/homebrew-omni-code-bridge
-brew install omni-code-bridge
-```
-
-**Arch Linux（AUR）：**
-
-```bash
-yay -S omni-code-bridge-bin
-systemctl --user enable --now omni-code-bridge.service
-```
-
-该包由 GitHub Actions 自动发布。
-
-**curl（macOS / Linux）：**
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/omni-stream-ai/omni-code-bridge/main/scripts/install.sh | bash
-```
-
-**PowerShell（Windows）：**
-
-```powershell
-powershell -ExecutionPolicy Bypass -Command "iwr https://raw.githubusercontent.com/omni-stream-ai/omni-code-bridge/main/scripts/install.ps1 -UseBasicParsing | iex"
-```
-
-**cargo install：**
-
-```bash
-cargo install omni-code-bridge
-```
-
-安装完成后可以到这里下载客户端：
-`https://github.com/omni-stream-ai/omni-code/releases`
+> **Arch Linux 用户：** 安装后请启用 systemd 服务：
+> ```bash
+> systemctl --user enable --now omni-code-bridge.service
+> ```
 
 ## 依赖
 
 - `Rust` / `cargo`
 - 可选 agent CLI：`codex`、`claude` 或 `opencode`
-- 可选：本地检出 `https://github.com/omni-stream-ai/omni-code`，用于桥接服务提供内置 APK 更新接口
+- 可选：本地检出 [omni-code](https://github.com/omni-stream-ai/omni-code)，用于桥接服务提供内置 APK 更新接口
 
 Agent 二进制路径可以通过 `ECHO_MATE_CODEX_BIN` 和 `ECHO_MATE_OPENCODE_BIN` 覆盖。
 
-## 运行
+## 快速开始
 
 ```bash
 cp .env.example .env
@@ -63,14 +53,23 @@ cargo run
 
 ## HTTP API
 
-- `POST /client-auth/requests` 申请客户端授权
-- `POST /client/messages` 向项目/会话流程推送消息
-- `POST /devices/register` 注册客户端设备以接收推送
-- `GET /files?path=...` 返回已登记本地项目目录中的文件
-- `GET /app-update/manifest` 和 `GET /app-update/apk` 提供内置 APK 更新源
-- `GET /speech`、`GET /speech/models`、`POST /speech/models/downloads`、`GET /speech/models/downloads/{task_id}`、`GET/PUT /speech/profiles/{profile}/model` 用于本地语音模型管理
-- `GET /speech/realtime` 和 `GET /speech/realtime/ws` 用于 websocket 实时/通话模式语音
-- `GET /v1/models`、`POST /v1/audio/transcriptions`、`POST /v1/audio/speech` 用于 OpenAI 兼容的本地 ASR/TTS
+| 接口 | 说明 |
+| --- | --- |
+| `POST /client-auth/requests` | 申请客户端授权 |
+| `POST /client/messages` | 向项目/会话流程推送消息 |
+| `POST /devices/register` | 注册客户端设备以接收推送 |
+| `GET /files?path=...` | 返回已登记本地项目目录中的文件 |
+| `GET /app-update/manifest` | APK 更新 manifest |
+| `GET /app-update/apk` | 下载最新 APK |
+| `GET /speech`, `GET /speech/models` | 本地语音模型管理 |
+| `POST /speech/models/downloads` | 下载语音模型 |
+| `GET /speech/models/downloads/{task_id}` | 轮询下载状态 |
+| `GET/PUT /speech/profiles/{profile}/model` | 绑定模型到 profile |
+| `GET /speech/realtime` | 实时语音 descriptor |
+| `GET /speech/realtime/ws` | Websocket 实时/通话模式语音 |
+| `GET /v1/models` | OpenAI 兼容模型列表 |
+| `POST /v1/audio/transcriptions` | OpenAI 兼容 ASR |
+| `POST /v1/audio/speech` | OpenAI 兼容 TTS |
 
 ## 本地语音接口
 
@@ -96,7 +95,7 @@ cargo run
   `kokoro-int8-multi-lang-v1_1` 则会暴露多个 speaker。
 - `supports_profiles`、`recommended_profiles`、`selected_by`
 
-推荐接入流程：
+### 推荐接入流程
 
 1. 调用 `GET /speech/models`
 2. 选择兼容模型并通过 `POST /speech/models/downloads` 发起下载
@@ -109,7 +108,7 @@ Speech profile 绑定默认持久化保存到 `~/.omni-code/settings.json`。可
 TTS 音色通过 `GET/PUT /speech/models/{model_id}/voice` 按模型保存，因此在单音色和多音色
 TTS 模型之间切换时不会复用不兼容的 voice。
 
-OpenAI 兼容语音行为：
+### OpenAI 兼容语音行为
 
 - `GET /v1/models` 只返回已经安装且可被 OpenAI 兼容音频接口使用的本地模型
 - `POST /v1/audio/transcriptions` 接收标准 multipart 字段，例如 `file`、`model`、`language`、`prompt`、`response_format`、`timestamp_granularities[]`
@@ -130,10 +129,10 @@ OpenAI 兼容语音行为：
 
 - `GET /speech/realtime` 返回 websocket descriptor、音频要求、默认 profile 绑定、命令名和事件名
 - `GET /speech/realtime/ws` 升级为 websocket 会话
-- websocket 鉴权和其他受保护接口一致：
+- Websocket 鉴权和其他受保护接口一致：
   `Authorization: Bearer <token>` 和 `x-omni-code-client-id: <client_id>`
 
-当前 realtime 协议约束：
+### 实时协议约束
 
 - 客户端通过 websocket binary frame 发送原始 `pcm_s16le`
 - 采样率固定为 `16000`
@@ -142,7 +141,7 @@ OpenAI 兼容语音行为：
 - `input_audio_buffer.commit` 用于提交并冲刷当前话语
 - `input_audio_buffer.clear` 用于清空当前话语状态
 
-当前 realtime 服务端事件：
+### 服务端事件
 
 - `session.created`
 - `session.updated`
@@ -154,7 +153,7 @@ OpenAI 兼容语音行为：
 - `response.audio_transcript.completed`
 - `error`
 
-客户端做通话模型过滤时建议：
+### 客户端模型过滤
 
 - 先调用 `GET /speech/models`
 - 保留 `installed == true` 的模型
@@ -195,11 +194,13 @@ scripts/speech-smoke.sh --keep-artifacts
 
 常用选项：
 
-- `--with-call-models` 额外安装并绑定 `asr.realtime` 和 `vad.default`
-- `--with-realtime` 额外执行 websocket realtime ASR 烟测 example
-- `--skip-download` 如果模型未安装则直接失败
-- `--output-dir DIR` 把生成的产物固定写到指定目录
-- `--no-auto-auth` 强制要求先提供现成的 `BRIDGE_CLIENT_ID` 和 `BRIDGE_TOKEN`
+| 选项 | 说明 |
+| --- | --- |
+| `--with-call-models` | 额外安装并绑定 `asr.realtime` 和 `vad.default` |
+| `--with-realtime` | 额外执行 websocket realtime ASR 烟测 example |
+| `--skip-download` | 如果模型未安装则直接失败 |
+| `--output-dir DIR` | 把生成的产物固定写到指定目录 |
+| `--no-auto-auth` | 强制要求先提供现成的 `BRIDGE_CLIENT_ID` 和 `BRIDGE_TOKEN` |
 
 脚本依赖 `curl` 和 `jq`。
 
@@ -241,53 +242,45 @@ omni-code-bridge client-auth approve
 
 批准记录默认保存在 `~/.omni-code/client-auth.json`。
 
-## 客户端 APK 更新接口
-
-桥接服务可以从本地客户端仓库中找到最新 Android APK：
-
-- `GET /app-update/manifest`
-- `GET /app-update/apk`
-
-默认会从本地检出的 `https://github.com/omni-stream-ai/omni-code` 仓库中查找 APK 构建产物，并从该仓库的 `pubspec.yaml` 读取版本号。
-
-这些接口主要用于本地开发或自托管分发。客户端默认会检查官方 GitHub Release manifest，只有在你显式配置自定义更新地址时才会使用桥接服务的 manifest。
-
 ## 文件获取接口
 
-桥接服务可以返回已登记本地项目目录中的文件：
+`GET /files?path=<file-path>`
 
-- `GET /files?path=<file-path>`
-
-该接口需要和其他受保护 API 一样带上客户端授权头：
+返回已登记本地项目目录中的文件。需要带上客户端授权头：
 
 - `Authorization: Bearer <token>`
 - `x-omni-code-client-id: <client_id>`
 
-响应体是文件原始内容。服务会根据扩展名自动推断 `Content-Type`，因此图片、文本、JSON、PDF、音频等文件都可以直接返回。
+响应体是文件原始内容。服务会根据扩展名自动推断 `Content-Type`，图片、文本、JSON、PDF、音频等文件都可以直接返回。
 
-支持的查询参数：
+| 参数 | 必填 | 说明 |
+| --- | --- | --- |
+| `path` | 是 | 绝对路径可直接返回；相对路径需搭配 `project_id` 或 `session_id` |
+| `project_id` | 否 | 将查找范围限制在某个项目根目录下 |
+| `session_id` | 否 | 将查找范围限制在该会话对应的本地项目根目录下 |
 
-- `path` 必填。可以直接传绝对路径；相对路径必须搭配 `project_id` 或 `session_id`。
-- `project_id` 可选。将查找范围限制在某个项目根目录下。
-- `session_id` 可选。将查找范围限制在该会话对应的本地项目根目录下。
-
-`project_id` 和 `session_id` 不能同时传。
-
-示例：
+> `project_id` 和 `session_id` 不能同时传。
 
 ```bash
-curl \
-  -H "Authorization: Bearer <token>" \
+# 绝对路径
+curl -H "Authorization: Bearer <token>" \
   -H "x-omni-code-client-id: <client_id>" \
   "http://127.0.0.1:8787/files?path=/absolute/path/to/image.png"
-```
 
-```bash
-curl \
-  -H "Authorization: Bearer <token>" \
+# 相对路径 + project_id
+curl -H "Authorization: Bearer <token>" \
   -H "x-omni-code-client-id: <client_id>" \
   "http://127.0.0.1:8787/files?project_id=<project-id>&path=assets/logo.png"
 ```
+
+## APK 更新接口
+
+桥接服务可以从本地 [omni-code](https://github.com/omni-stream-ai/omni-code) 仓库中找到最新 Android APK：
+
+- `GET /app-update/manifest`
+- `GET /app-update/apk`
+
+默认会从本地检出仓库中查找 APK 构建产物，并从 `pubspec.yaml` 读取版本号。这些接口主要用于本地开发或自托管分发。客户端默认会检查官方 GitHub Release manifest，只有在你显式配置自定义更新地址时才会使用桥接服务的 manifest。
 
 ## 开发
 
@@ -298,7 +291,7 @@ sh scripts/setup-git-hooks.sh
 
 首次克隆后，运行 `sh scripts/setup-git-hooks.sh` 以启用本地 `commit-msg` hook。
 
-## 提交信息
+### 提交信息
 
 仓库使用 shell 版 `commit-msg` hook 校验提交信息，要求使用 Conventional Commits。GitHub Release Notes 也会基于这些提交信息生成：
 
@@ -312,4 +305,4 @@ sh scripts/setup-git-hooks.sh
 
 ## 许可证
 
-Omni Code Desktop Bridge 采用 [MIT License](LICENSE)。
+[MIT](LICENSE)
