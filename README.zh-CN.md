@@ -6,7 +6,8 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT License"></a>
-  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/Rust-2024-edition-dea584?logo=rust" alt="Rust"></a>
+  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/Rust-2024--edition-dea584?logo=rust" alt="Rust"></a>
+  <a href="https://github.com/omni-stream-ai/omni-code-bridge/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/omni-stream-ai/omni-code-bridge/ci.yml?label=CI" alt="CI"></a>
   <a href="https://github.com/omni-stream-ai/omni-code-bridge/releases"><img src="https://img.shields.io/github/v/release/omni-stream-ai/omni-code-bridge" alt="Release"></a>
   <a href="https://crates.io/crates/omni-code-bridge"><img src="https://img.shields.io/crates/v/omni-code-bridge" alt="Crates.io"></a>
 </p>
