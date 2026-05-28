@@ -228,6 +228,17 @@ jobs:
           prerelease: ${{ needs.prepare-release.outputs.prerelease }}
           files: dist/*
 
+      # ── crates.io ─────────────────────────────────────────────────────
+      - name: Install Rust toolchain
+        if: needs.prepare-release.outputs.stable == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish to crates.io
+        if: needs.prepare-release.outputs.stable == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish
+
       # ── Homebrew ──────────────────────────────────────────────────────
       - name: Checkout Homebrew tap repository
         if: needs.prepare-release.outputs.stable == 'true'
