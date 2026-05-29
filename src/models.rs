@@ -544,3 +544,27 @@ pub struct SpeakerFilterSettingsInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threshold: Option<f32>,
 }
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentInstallResult {
+    pub agent: AgentKind,
+    pub success: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentInstallInput {
+    pub agent: AgentKind,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentSummary {
+    pub kind: AgentKind,
+    pub installed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_path: Option<String>,
+    pub install_hint: String,
+}
