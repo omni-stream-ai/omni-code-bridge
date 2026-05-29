@@ -127,6 +127,8 @@ pub struct SummarizeReplyInput {
 pub struct SessionStatusEvent {
     pub session_id: String,
     pub status: SessionStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

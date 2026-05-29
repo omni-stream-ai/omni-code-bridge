@@ -519,6 +519,7 @@ impl AppState {
                 .send(SessionEvent::SessionStatus(SessionStatusEvent {
                     session_id: session_id.to_string(),
                     status: SessionStatus::Idle,
+                    error_message: None,
                 }));
             return Ok((user_message.clone(), user_message));
         }
@@ -570,6 +571,7 @@ impl AppState {
             .send(SessionEvent::SessionStatus(SessionStatusEvent {
                 session_id: session_id.to_string(),
                 status: SessionStatus::Running,
+                error_message: None,
             }));
 
         let state = Arc::clone(self);
@@ -635,6 +637,7 @@ impl AppState {
                 .send(SessionEvent::SessionStatus(SessionStatusEvent {
                     session_id: session_id.to_string(),
                     status: SessionStatus::Idle,
+                    error_message: None,
                 }));
         }
         Ok(had_active_turn)
@@ -806,6 +809,7 @@ impl AppState {
             .send(SessionEvent::SessionStatus(SessionStatusEvent {
                 session_id: session_id.to_string(),
                 status: SessionStatus::Idle,
+                error_message: None,
             }));
         if let Some(session) = self.find_session(session_id).await {
             let devices = self
@@ -830,13 +834,14 @@ impl AppState {
             .event_tx
             .send(SessionEvent::AgentError(AgentErrorEvent {
                 session_id: session_id.to_string(),
-                message,
+                message: message.clone(),
             }));
         let _ = self
             .event_tx
             .send(SessionEvent::SessionStatus(SessionStatusEvent {
                 session_id: session_id.to_string(),
                 status: SessionStatus::Failed,
+                error_message: Some(message.clone()),
             }));
     }
 
@@ -953,6 +958,7 @@ impl AppState {
             .send(SessionEvent::SessionStatus(SessionStatusEvent {
                 session_id: session_id.to_string(),
                 status: SessionStatus::AwaitingApproval,
+                error_message: None,
             }));
     }
 
@@ -988,6 +994,7 @@ impl AppState {
             .send(SessionEvent::SessionStatus(SessionStatusEvent {
                 session_id: session_id.to_string(),
                 status: SessionStatus::Running,
+                error_message: None,
             }));
     }
 
