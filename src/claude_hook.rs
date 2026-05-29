@@ -9,7 +9,7 @@ use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::models::{ApprovalChoice, ApprovalKind, ApprovalRequest};
-use crate::approval_policy;
+use crate::{ai_approval, approval_policy};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaudePermissionRequest {
@@ -149,12 +149,44 @@ pub async fn run_permission_hook(
         .unwrap_or_else(|| payload.clone());
     let command = extract_command_from_value(&tool_input).unwrap_or_default();
     let auto_allow = load_always_allow_commands(&state_dir).await;
-    if tool_name != Some("Bash")
-        || is_auto_allowed_bash_command(&command, &auto_allow)
-        || approval_policy::should_auto_approve(&command, &project_root).is_some()
-    {
+    if tool_name != Some("Bash") || is_auto_allowed_bash_command(&command, &auto_allow) {
         write_hook_decision("allow", "Allowed by omni-code Claude hook").await?;
         return Ok(());
+    }
+
+    if approval_policy::should_auto_approve(&command, &project_root).is_some() {
+        write_hook_decision("allow", "Allowed by approval policy").await?;
+        return Ok(());
+    }
+
+    // Layer 2: AI risk assessment before escalating to human
+    let ai_request = ApprovalRequest {
+        request_id: uuid::Uuid::new_v4().to_string(),
+        kind: ApprovalKind::ExecCommand,
+        command: Some(command.clone()),
+        reason: Some(format!(
+            "Claude requests {}",
+            tool_name.unwrap_or("Bash")
+        )),
+        allow_accept_for_session: false,
+        allow_cancel: true,
+        resolvable: true,
+    };
+    if let Ok(Some(decision)) = ai_approval::review_request(&ai_request, &project_root).await {
+        use ai_approval::AiApprovalDecisionKind;
+        match decision.decision {
+            AiApprovalDecisionKind::Accept => {
+                write_hook_decision("allow", &format!("AI approved: {}", decision.reason)).await?;
+                return Ok(());
+            }
+            AiApprovalDecisionKind::Decline => {
+                write_hook_decision("deny", &format!("AI declined: {}", decision.reason)).await?;
+                return Ok(());
+            }
+            AiApprovalDecisionKind::AskUser => {
+                // Fall through to human approval
+            }
+        }
     }
 
     let request_id = uuid::Uuid::new_v4().to_string();
