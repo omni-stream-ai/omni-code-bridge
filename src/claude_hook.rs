@@ -9,7 +9,7 @@ use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::models::{ApprovalChoice, ApprovalKind, ApprovalRequest};
-use crate::{ai_approval, approval_policy};
+use crate::approval_policy;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaudePermissionRequest {
@@ -152,7 +152,6 @@ pub async fn run_permission_hook(
     if tool_name != Some("Bash")
         || is_auto_allowed_bash_command(&command, &auto_allow)
         || approval_policy::should_auto_approve(&command, &project_root).is_some()
-        || ai_allows_claude_command(&command, &project_root).await
     {
         write_hook_decision("allow", "Allowed by omni-code Claude hook").await?;
         return Ok(());
@@ -298,30 +297,6 @@ impl ClaudePermissionRequest {
     }
 }
 
-async fn ai_allows_claude_command(command: &str, project_root: &Path) -> bool {
-    let request = ApprovalRequest {
-        request_id: "claude-hook-preview".to_string(),
-        kind: ApprovalKind::ExecCommand,
-        command: Some(command.to_string()),
-        reason: Some("Claude Bash permission hook".to_string()),
-        allow_accept_for_session: false,
-        allow_cancel: true,
-        resolvable: true,
-    };
-    match ai_approval::review_request(&request, project_root).await {
-        Ok(Some(decision)) => {
-            matches!(
-                decision.decision,
-                ai_approval::AiApprovalDecisionKind::Accept
-            )
-        }
-        Ok(None) => false,
-        Err(error) => {
-            eprintln!("AI approval review failed; falling back to user approval: {error:?}");
-            false
-        }
-    }
-}
 
 fn summarize_hook_status_event(
     hook_event_name: &str,

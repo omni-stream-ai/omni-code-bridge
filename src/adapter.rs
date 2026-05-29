@@ -1521,7 +1521,7 @@ async fn run_claude_code(
     }
     command
         .arg(&input.content)
-        .current_dir(project_root)
+        .current_dir(&project_root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1599,8 +1599,19 @@ async fn run_claude_code(
                 if pending_approval.is_none() {
                     if let Some(request) = next_claude_permission_request(&state_dir, &run_id, &mut seen_permission_requests).await? {
                         let approval = request.as_approval_request();
-                        pending_approval = Some(approval.request_id.clone());
-                        state.raise_approval(&session.id, approval).await;
+                        if let Some(choice) = auto_approve_codex_request(&approval, &project_root).await? {
+                            let mut response = response_from_choice(&choice);
+                            response.request_id = approval.request_id.clone();
+                            tokio::fs::write(
+                                response_path(&state_dir, &approval.request_id),
+                                serde_json::to_vec_pretty(&response)?,
+                            )
+                            .await?;
+                            state.resolve_approval(&session.id, &approval.request_id, choice).await;
+                        } else {
+                            pending_approval = Some(approval.request_id.clone());
+                            state.raise_approval(&session.id, approval).await;
+                        }
                     }
                 }
             }
@@ -3595,6 +3606,9 @@ async fn next_claude_permission_request(
             continue;
         }
         let body = tokio::fs::read(&path).await?;
+        if body.is_empty() {
+            continue;
+        }
         let request: ClaudePermissionRequest = serde_json::from_slice(&body)
             .with_context(|| format!("failed to parse {}", path.display()))?;
         if request.run_id != run_id {
@@ -3626,6 +3640,10 @@ async fn next_claude_status_event(
             continue;
         }
         let body = tokio::fs::read(&path).await?;
+        if body.is_empty() {
+            let _ = tokio::fs::remove_file(&path).await;
+            continue;
+        }
         let event: ClaudeHookStatusEvent = serde_json::from_slice(&body)
             .with_context(|| format!("failed to parse {}", path.display()))?;
         if event.run_id != run_id {
