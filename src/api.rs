@@ -23,11 +23,13 @@ use serde::Deserialize;
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::{
+    adapter,
     app_state::AppState,
     asr,
     bridge_settings::{BridgeSettings, BridgeSettingsInput},
     models::{
-        ApiResponse, AppUpdateManifest, ApprovalDecisionInput, AudioSpeechStreamResponse,
+        AgentInstallInput, AgentKind, AgentSummary, ApiResponse,
+        AppUpdateManifest, ApprovalDecisionInput, AudioSpeechStreamResponse,
         ClientAuthRequestInput, CreateProjectInput, CreateSessionInput, OpenAiAudioSpeechRequest,
         OpenAiErrorDetail, OpenAiErrorResponse, OpenAiModel, OpenAiModelList,
         OpenAiTranscriptionResponse, OpenAiVerboseTranscriptionResponse,
@@ -96,6 +98,8 @@ pub fn router() -> Router<Arc<AppState>> {
             get(list_messages).post(send_message),
         )
         .route("/sessions/{id}/summary", post(summarize_reply))
+        .route("/agents", get(list_agents))
+        .route("/agents/install", post(install_agent_handler))
         .route(
             "/sessions/{id}/approvals/{request_id}",
             post(resolve_approval),
@@ -1513,6 +1517,51 @@ async fn cancel_session_reply(
         .await
         .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_agents(headers: HeaderMap, State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if let Err(error) = authorize_request(&headers, &state).await {
+        return error.into_response();
+    }
+    let agents = vec![
+        agent_summary(AgentKind::Codex),
+        agent_summary(AgentKind::ClaudeCode),
+        agent_summary(AgentKind::OpenCode),
+    ];
+    Json(ApiResponse { data: agents }).into_response()
+}
+
+async fn install_agent_handler(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Json(input): Json<AgentInstallInput>,
+) -> impl IntoResponse {
+    if let Err(error) = authorize_request(&headers, &state).await {
+        return error.into_response();
+    }
+    let result = adapter::install_agent(input.agent).await;
+    Json(ApiResponse { data: result }).into_response()
+}
+
+fn agent_summary(kind: AgentKind) -> AgentSummary {
+    let binary_name = match kind {
+        AgentKind::Codex => "codex",
+        AgentKind::ClaudeCode => "claude",
+        AgentKind::OpenCode => "opencode",
+        AgentKind::Custom => return AgentSummary {
+            kind,
+            installed: false,
+            installed_path: None,
+            install_hint: "Custom agent does not support auto-install".to_string(),
+        },
+    };
+    let installed_path = adapter::find_executable_in_path(binary_name);
+    AgentSummary {
+        kind,
+        installed: installed_path.is_some(),
+        installed_path: installed_path.map(|p| p.display().to_string()),
+        install_hint: adapter::manual_install_hint(kind),
+    }
 }
 
 async fn resolve_approval(
