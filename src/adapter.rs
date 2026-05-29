@@ -1017,16 +1017,21 @@ impl OpenCodeHttpClient {
         session_id: &str,
         project_root: &Path,
         prompt: &str,
+        system: Option<&str>,
     ) -> Result<()> {
+        let mut body = serde_json::json!({
+            "parts": [{
+                "type": "text",
+                "text": prompt,
+            }],
+        });
+        if let Some(system) = system {
+            body["system"] = serde_json::Value::String(system.to_string());
+        }
         self.post_json_with_query(
             &format!("/session/{}/prompt_async", url_path_escape(session_id)),
             &[("directory", project_root.display().to_string())],
-            serde_json::json!({
-                "parts": [{
-                    "type": "text",
-                    "text": prompt,
-                }],
-            }),
+            body,
         )
         .await?;
         Ok(())
@@ -1682,13 +1687,9 @@ async fn run_opencode(
     let mut full_text = String::new();
     let (approval_tx, mut approval_rx) = mpsc::unbounded_channel();
     state.set_approval_sender(&session.id, approval_tx).await;
-    let prompt = if let Some(system_prompt) = turn_system_prompt(session, system_prompt) {
-        format!("{system_prompt}\n\n{}", input.content)
-    } else {
-        input.content.clone()
-    };
+    let system = turn_system_prompt(session, system_prompt);
     client
-        .prompt_async(&opencode_session_id, &project_root, &prompt)
+        .prompt_async(&opencode_session_id, &project_root, &input.content, system.as_deref())
         .await
         .context("failed to send opencode prompt")?;
     let mut event_stream = client
@@ -2072,7 +2073,7 @@ async fn summarize_with_opencode(
         .await
         .context("failed to create opencode summary session")?;
     client
-        .prompt_async(&session_id, &project_root, &summary_prompt(content))
+        .prompt_async(&session_id, &project_root, &summary_prompt(content), None)
         .await
         .context("failed to send opencode summary prompt")?;
     wait_for_opencode_session_idle(&mut client, &session_id, &project_root).await?;
