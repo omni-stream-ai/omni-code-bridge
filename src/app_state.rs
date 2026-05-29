@@ -501,6 +501,8 @@ impl AppState {
                 content: decorate_user_content(&input),
                 created_at: Utc::now(),
             };
+            self.ensure_inbox_seeded(session_id, session_snapshot.agent)
+                .await;
             self.push_message(user_message.clone()).await;
             self.patch_session(
                 session_id,
@@ -546,6 +548,8 @@ impl AppState {
             created_at: Utc::now(),
         };
 
+        self.ensure_inbox_seeded(session_id, session_snapshot.agent)
+            .await;
         self.push_message(user_message.clone()).await;
         self.push_message(pending_reply.clone()).await;
         self.patch_session(
@@ -1000,6 +1004,24 @@ impl AppState {
             .entry(message.session_id.clone())
             .or_default()
             .push(message);
+    }
+
+    /// If the in-memory message cache has no entry for this session yet,
+    /// pre-seed it from the provider's archive so that later `list_messages`
+    /// calls don't shadow the historical conversation.
+    async fn ensure_inbox_seeded(&self, session_id: &str, agent: AgentKind) {
+        if self.messages.read().await.contains_key(session_id) {
+            return;
+        }
+        let Some(provider) = self.provider_for_agent(agent) else {
+            return;
+        };
+        if let Some(existing) = provider.list_messages(session_id).await {
+            self.messages
+                .write()
+                .await
+                .insert(session_id.to_string(), existing);
+        }
     }
 
     async fn latest_assistant_preview(&self, session_id: &str) -> Option<String> {
