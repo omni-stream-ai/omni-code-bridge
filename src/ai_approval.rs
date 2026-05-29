@@ -303,11 +303,6 @@ fn has_hard_block(command: &str, project_root: &Path) -> bool {
         "private_key",
         "id_rsa",
         "authorized_keys",
-        "/etc/",
-        "/var/",
-        "/usr/",
-        "/bin/",
-        "/sbin/",
     ]
     .iter()
     .any(|marker| lower.contains(marker))
@@ -315,7 +310,10 @@ fn has_hard_block(command: &str, project_root: &Path) -> bool {
         return true;
     }
 
-    if lower.contains("rm -rf /") || lower.contains("rm -fr /") {
+    if lower.contains("rm -rf /")
+        || lower.contains("rm -fr /")
+        || rm_mentions_path_escape(command, project_root)
+    {
         return true;
     }
 
@@ -329,6 +327,58 @@ fn has_hard_block(command: &str, project_root: &Path) -> bool {
     }
 
     mentions_absolute_path_outside_project(command, project_root)
+}
+
+fn rm_mentions_path_escape(command: &str, project_root: &Path) -> bool {
+    let mut tokens = command.split_whitespace();
+    let Some(program) = tokens.next() else {
+        return false;
+    };
+    if program != "rm" {
+        return false;
+    }
+
+    tokens
+        .filter(|token| !token.starts_with('-'))
+        .any(|token| path_escapes_project(token, project_root))
+}
+
+fn path_escapes_project(raw: &str, project_root: &Path) -> bool {
+    let trimmed = raw.trim_matches(|ch: char| {
+        matches!(ch, '\'' | '"' | ',' | ')' | '(' | '[' | ']' | '{' | '}')
+    });
+    if trimmed.is_empty() {
+        return false;
+    }
+    let path = PathBuf::from(trimmed);
+    let candidate = if path.is_absolute() {
+        path
+    } else {
+        project_root.join(path)
+    };
+    normalize_without_fs(&candidate)
+        .map(|normalized| !normalized.starts_with(project_root))
+        .unwrap_or(true)
+}
+
+fn normalize_without_fs(path: &Path) -> Option<PathBuf> {
+    let mut normalized = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            std::path::Component::RootDir => normalized.push(std::path::MAIN_SEPARATOR.to_string()),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            std::path::Component::Normal(part) => normalized.push(part),
+            std::path::Component::Prefix(_) => return None,
+        }
+    }
+
+    Some(normalized)
 }
 
 fn mentions_absolute_path_outside_project(command: &str, project_root: &Path) -> bool {
