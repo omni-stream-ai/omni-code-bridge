@@ -349,7 +349,7 @@ fn flush_pending_assistant(
         .map(|block| block.trim().to_string())
         .filter(|block| !block.is_empty())
         .collect::<Vec<_>>()
-        .join("\n\n");
+        .join("\n\n---\n\n");
     if content.is_empty() {
         return;
     }

@@ -2481,7 +2481,7 @@ impl CodexAppServerStreamingState {
     }
 
     fn finish_text(&self) -> Option<String> {
-        let text = self.assistant_blocks.join("\n\n");
+        let text = self.assistant_blocks.join("\n\n---\n\n");
         if text.is_empty() { None } else { Some(text) }
     }
 
@@ -2493,7 +2493,7 @@ impl CodexAppServerStreamingState {
                 blocks.push(partial.to_string());
             }
         }
-        let text = blocks.join("\n\n").trim().to_string();
+        let text = blocks.join("\n\n---\n\n").trim().to_string();
         if text.is_empty() { None } else { Some(text) }
     }
 }
@@ -3135,7 +3135,7 @@ impl ClaudeStreamingState {
                 return Some(text.to_string());
             }
         }
-        let text = self.assistant_blocks.join("\n\n");
+        let text = self.assistant_blocks.join("\n\n---\n\n");
         if text.trim().is_empty() {
             None
         } else {
@@ -3151,7 +3151,7 @@ impl ClaudeStreamingState {
                 blocks.push(text.to_string());
             }
         }
-        let text = blocks.join("\n\n").trim().to_string();
+        let text = blocks.join("\n\n---\n\n").trim().to_string();
         if text.is_empty() { None } else { Some(text) }
     }
 }
