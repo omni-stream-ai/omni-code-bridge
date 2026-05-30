@@ -24,7 +24,7 @@ Omni Code 的 Rust 桥接服务。对外提供 HTTP 和 SSE API，供移动端�
 
 | 方式 | 命令 |
 | --- | --- |
-| **Homebrew** (macOS / Linux) | `brew tap omni-stream-ai/homebrew-omni-code-bridge && brew install omni-code-bridge` |
+| **Homebrew** (macOS / Linux) | `brew install omni-stream-ai/omni-code-bridge/omni-code-bridge` |
 | **Arch Linux** (AUR) | `yay -S omni-code-bridge-bin` |
 | **cargo** | `cargo install omni-code-bridge` |
 | **curl** (macOS / Linux) | `curl -fsSL https://raw.githubusercontent.com/omni-stream-ai/omni-code-bridge/main/scripts/install.sh \| bash` |

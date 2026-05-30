@@ -24,7 +24,7 @@ Rust bridge for [Omni Code](https://github.com/omni-stream-ai/omni-code). Expose
 
 | Method | Command |
 | --- | --- |
-| **Homebrew** (macOS / Linux) | `brew tap omni-stream-ai/homebrew-omni-code-bridge && brew install omni-code-bridge` |
+| **Homebrew** (macOS / Linux) | `brew install omni-stream-ai/omni-code-bridge/omni-code-bridge` |
 | **Arch Linux** (AUR) | `yay -S omni-code-bridge-bin` |
 | **cargo** | `cargo install omni-code-bridge` |
 | **curl** (macOS / Linux) | `curl -fsSL https://raw.githubusercontent.com/omni-stream-ai/omni-code-bridge/main/scripts/install.sh \| bash` |
