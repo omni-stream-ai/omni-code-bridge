@@ -1017,16 +1017,21 @@ impl OpenCodeHttpClient {
         session_id: &str,
         project_root: &Path,
         prompt: &str,
+        system: Option<&str>,
     ) -> Result<()> {
+        let mut body = serde_json::json!({
+            "parts": [{
+                "type": "text",
+                "text": prompt,
+            }],
+        });
+        if let Some(system) = system {
+            body["system"] = serde_json::Value::String(system.to_string());
+        }
         self.post_json_with_query(
             &format!("/session/{}/prompt_async", url_path_escape(session_id)),
             &[("directory", project_root.display().to_string())],
-            serde_json::json!({
-                "parts": [{
-                    "type": "text",
-                    "text": prompt,
-                }],
-            }),
+            body,
         )
         .await?;
         Ok(())
@@ -1148,7 +1153,7 @@ fn extract_first_http_url(text: &str) -> Option<String> {
         .map(|part| part.trim_end_matches('/').to_string())
 }
 
-fn find_executable_in_path(name: &str) -> Option<PathBuf> {
+pub fn find_executable_in_path(name: &str) -> Option<PathBuf> {
     let paths = std::env::var_os("PATH")?;
     std::env::split_paths(&paths)
         .map(|dir| dir.join(name))
@@ -1516,7 +1521,7 @@ async fn run_claude_code(
     }
     command
         .arg(&input.content)
-        .current_dir(project_root)
+        .current_dir(&project_root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1594,8 +1599,19 @@ async fn run_claude_code(
                 if pending_approval.is_none() {
                     if let Some(request) = next_claude_permission_request(&state_dir, &run_id, &mut seen_permission_requests).await? {
                         let approval = request.as_approval_request();
-                        pending_approval = Some(approval.request_id.clone());
-                        state.raise_approval(&session.id, approval).await;
+                        if let Some(choice) = auto_approve_codex_request(&approval, &project_root).await? {
+                            let mut response = response_from_choice(&choice);
+                            response.request_id = approval.request_id.clone();
+                            tokio::fs::write(
+                                response_path(&state_dir, &approval.request_id),
+                                serde_json::to_vec_pretty(&response)?,
+                            )
+                            .await?;
+                            state.resolve_approval(&session.id, &approval.request_id, choice).await;
+                        } else {
+                            pending_approval = Some(approval.request_id.clone());
+                            state.raise_approval(&session.id, approval).await;
+                        }
                     }
                 }
             }
@@ -1682,13 +1698,9 @@ async fn run_opencode(
     let mut full_text = String::new();
     let (approval_tx, mut approval_rx) = mpsc::unbounded_channel();
     state.set_approval_sender(&session.id, approval_tx).await;
-    let prompt = if let Some(system_prompt) = turn_system_prompt(session, system_prompt) {
-        format!("{system_prompt}\n\n{}", input.content)
-    } else {
-        input.content.clone()
-    };
+    let system = turn_system_prompt(session, system_prompt);
     client
-        .prompt_async(&opencode_session_id, &project_root, &prompt)
+        .prompt_async(&opencode_session_id, &project_root, &input.content, system.as_deref())
         .await
         .context("failed to send opencode prompt")?;
     let mut event_stream = client
@@ -2072,7 +2084,7 @@ async fn summarize_with_opencode(
         .await
         .context("failed to create opencode summary session")?;
     client
-        .prompt_async(&session_id, &project_root, &summary_prompt(content))
+        .prompt_async(&session_id, &project_root, &summary_prompt(content), None)
         .await
         .context("failed to send opencode summary prompt")?;
     wait_for_opencode_session_idle(&mut client, &session_id, &project_root).await?;
@@ -2469,7 +2481,7 @@ impl CodexAppServerStreamingState {
     }
 
     fn finish_text(&self) -> Option<String> {
-        let text = self.assistant_blocks.join("\n\n");
+        let text = self.assistant_blocks.join("\n\n---\n\n");
         if text.is_empty() { None } else { Some(text) }
     }
 
@@ -2481,7 +2493,7 @@ impl CodexAppServerStreamingState {
                 blocks.push(partial.to_string());
             }
         }
-        let text = blocks.join("\n\n").trim().to_string();
+        let text = blocks.join("\n\n---\n\n").trim().to_string();
         if text.is_empty() { None } else { Some(text) }
     }
 }
@@ -3123,7 +3135,7 @@ impl ClaudeStreamingState {
                 return Some(text.to_string());
             }
         }
-        let text = self.assistant_blocks.join("\n\n");
+        let text = self.assistant_blocks.join("\n\n---\n\n");
         if text.trim().is_empty() {
             None
         } else {
@@ -3139,7 +3151,7 @@ impl ClaudeStreamingState {
                 blocks.push(text.to_string());
             }
         }
-        let text = blocks.join("\n\n").trim().to_string();
+        let text = blocks.join("\n\n---\n\n").trim().to_string();
         if text.is_empty() { None } else { Some(text) }
     }
 }
@@ -3594,6 +3606,9 @@ async fn next_claude_permission_request(
             continue;
         }
         let body = tokio::fs::read(&path).await?;
+        if body.is_empty() {
+            continue;
+        }
         let request: ClaudePermissionRequest = serde_json::from_slice(&body)
             .with_context(|| format!("failed to parse {}", path.display()))?;
         if request.run_id != run_id {
@@ -3625,6 +3640,10 @@ async fn next_claude_status_event(
             continue;
         }
         let body = tokio::fs::read(&path).await?;
+        if body.is_empty() {
+            let _ = tokio::fs::remove_file(&path).await;
+            continue;
+        }
         let event: ClaudeHookStatusEvent = serde_json::from_slice(&body)
             .with_context(|| format!("failed to parse {}", path.display()))?;
         if event.run_id != run_id {
@@ -3718,5 +3737,173 @@ fn approval_result_json(choice: &ApprovalChoice, kind: &ApprovalKind) -> Value {
                 "scope": "turn",
             }),
         },
+    }
+}
+
+fn is_macos() -> bool {
+    cfg!(target_os = "macos")
+}
+
+fn is_windows() -> bool {
+    cfg!(target_os = "windows")
+}
+
+async fn command_exists(name: &str) -> bool {
+    tokio::process::Command::new(if cfg!(target_os = "windows") { "where" } else { "which" })
+        .arg(name)
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+async fn try_install_with_npm(agent: AgentKind, npm_package: &str, binary_name: &str) -> Option<crate::models::AgentInstallResult> {
+    if !command_exists("npm").await {
+        return None;
+    }
+
+    let result = tokio::process::Command::new("npm")
+        .args(["install", "-g", npm_package])
+        .output()
+        .await;
+
+    match result {
+        Ok(output) if output.status.success() => {
+            let path = find_executable_in_path(binary_name)
+                .unwrap_or_else(|| PathBuf::from(binary_name));
+            Some(crate::models::AgentInstallResult {
+                agent,
+                success: true,
+                message: Some(format!("installed successfully via npm ({npm_package})")),
+                installed_path: Some(path.display().to_string()),
+            })
+        }
+        _ => None,
+    }
+}
+
+async fn try_install_with_brew(agent: AgentKind, brew_package: &str, binary_name: &str) -> Option<crate::models::AgentInstallResult> {
+    if !is_macos() || !command_exists("brew").await {
+        return None;
+    }
+
+    let result = tokio::process::Command::new("brew")
+        .args(["install", brew_package])
+        .output()
+        .await;
+
+    match result {
+        Ok(output) if output.status.success() => {
+            let path = find_executable_in_path(binary_name)
+                .unwrap_or_else(|| PathBuf::from(binary_name));
+            Some(crate::models::AgentInstallResult {
+                agent,
+                success: true,
+                message: Some(format!("installed successfully via brew ({brew_package})")),
+                installed_path: Some(path.display().to_string()),
+            })
+        }
+        _ => None,
+    }
+}
+
+async fn try_install_with_script(
+    agent: AgentKind,
+    unix_script_url: &str,
+    windows_script_url: Option<&str>,
+    binary_name: &str,
+) -> Option<crate::models::AgentInstallResult> {
+    let result = if is_windows() {
+        let Some(url) = windows_script_url else {
+            return None;
+        };
+        tokio::process::Command::new("powershell")
+            .args(["-Command", &format!("irm {url} | iex")])
+            .output()
+            .await
+    } else {
+        tokio::process::Command::new("sh")
+            .args(["-c", &format!("curl -fsSL {unix_script_url} | sh")])
+            .output()
+            .await
+    };
+
+    let used_url = if is_windows() { windows_script_url.unwrap_or(unix_script_url) } else { unix_script_url };
+
+    match result {
+        Ok(output) if output.status.success() => {
+            let path = find_executable_in_path(binary_name)
+                .unwrap_or_else(|| PathBuf::from(binary_name));
+            Some(crate::models::AgentInstallResult {
+                agent,
+                success: true,
+                message: Some(format!("installed successfully via script ({used_url})")),
+                installed_path: Some(path.display().to_string()),
+            })
+        }
+        _ => None,
+    }
+}
+
+pub fn manual_install_hint(agent: AgentKind) -> String {
+    match agent {
+        AgentKind::Codex => {
+            "Please install manually:\n  \
+             npm: npm install -g @openai/codex\n  \
+             brew: brew install --cask codex\n  \
+             script: curl -fsSL https://chatgpt.com/codex/install.sh | sh\n  \
+             Windows: powershell -Command \"irm https://chatgpt.com/codex/install.ps1 | iex\""
+                .to_string()
+        }
+        AgentKind::ClaudeCode => {
+            "Please install manually:\n  \
+             script: curl -fsSL https://claude.ai/install.sh | bash\n  \
+             brew: brew install --cask claude-code\n  \
+             Windows: powershell -Command \"irm https://claude.ai/install.ps1 | iex\"\n  \
+             npm (deprecated): npm install -g @anthropic-ai/claude-code"
+                .to_string()
+        }
+        AgentKind::OpenCode => {
+            "Please install manually:\n  \
+             npm: npm i -g opencode-ai@latest\n  \
+             brew: brew install anomalyco/tap/opencode\n  \
+             script: curl -fsSL https://opencode.ai/install | bash\n  \
+             Windows: scoop install opencode"
+                .to_string()
+        }
+        AgentKind::Custom => "Custom agent does not support auto-install".to_string(),
+    }
+}
+
+pub async fn install_agent(agent: AgentKind) -> crate::models::AgentInstallResult {
+    let (binary_name, npm_package, brew_package, unix_script, windows_script) = match agent {
+        AgentKind::Codex => ("codex", "@openai/codex", "codex", "https://chatgpt.com/codex/install.sh", Some("https://chatgpt.com/codex/install.ps1")),
+        AgentKind::ClaudeCode => ("claude", "@anthropic-ai/claude-code", "claude-code", "https://claude.ai/install.sh", Some("https://claude.ai/install.ps1")),
+        AgentKind::OpenCode => ("opencode", "opencode-ai", "anomalyco/tap/opencode", "https://opencode.ai/install", None),
+        AgentKind::Custom => {
+            return crate::models::AgentInstallResult {
+                agent,
+                success: false,
+                message: Some("Custom agent does not support auto-install".to_string()),
+                installed_path: None,
+            };
+        }
+    };
+
+    if let Some(result) = try_install_with_npm(agent, npm_package, binary_name).await {
+        return result;
+    }
+    if let Some(result) = try_install_with_brew(agent, brew_package, binary_name).await {
+        return result;
+    }
+    if let Some(result) = try_install_with_script(agent, unix_script, windows_script, binary_name).await {
+        return result;
+    }
+
+    crate::models::AgentInstallResult {
+        agent,
+        success: false,
+        message: Some(manual_install_hint(agent)),
+        installed_path: None,
     }
 }

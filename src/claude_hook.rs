@@ -149,13 +149,44 @@ pub async fn run_permission_hook(
         .unwrap_or_else(|| payload.clone());
     let command = extract_command_from_value(&tool_input).unwrap_or_default();
     let auto_allow = load_always_allow_commands(&state_dir).await;
-    if tool_name != Some("Bash")
-        || is_auto_allowed_bash_command(&command, &auto_allow)
-        || approval_policy::should_auto_approve(&command, &project_root).is_some()
-        || ai_allows_claude_command(&command, &project_root).await
-    {
+    if tool_name != Some("Bash") || is_auto_allowed_bash_command(&command, &auto_allow) {
         write_hook_decision("allow", "Allowed by omni-code Claude hook").await?;
         return Ok(());
+    }
+
+    if approval_policy::should_auto_approve(&command, &project_root).is_some() {
+        write_hook_decision("allow", "Allowed by approval policy").await?;
+        return Ok(());
+    }
+
+    // Layer 2: AI risk assessment before escalating to human
+    let ai_request = ApprovalRequest {
+        request_id: uuid::Uuid::new_v4().to_string(),
+        kind: ApprovalKind::ExecCommand,
+        command: Some(command.clone()),
+        reason: Some(format!(
+            "Claude requests {}",
+            tool_name.unwrap_or("Bash")
+        )),
+        allow_accept_for_session: false,
+        allow_cancel: true,
+        resolvable: true,
+    };
+    if let Ok(Some(decision)) = ai_approval::review_request(&ai_request, &project_root).await {
+        use ai_approval::AiApprovalDecisionKind;
+        match decision.decision {
+            AiApprovalDecisionKind::Accept => {
+                write_hook_decision("allow", &format!("AI approved: {}", decision.reason)).await?;
+                return Ok(());
+            }
+            AiApprovalDecisionKind::Decline => {
+                write_hook_decision("deny", &format!("AI declined: {}", decision.reason)).await?;
+                return Ok(());
+            }
+            AiApprovalDecisionKind::AskUser => {
+                // Fall through to human approval
+            }
+        }
     }
 
     let request_id = uuid::Uuid::new_v4().to_string();
@@ -298,30 +329,6 @@ impl ClaudePermissionRequest {
     }
 }
 
-async fn ai_allows_claude_command(command: &str, project_root: &Path) -> bool {
-    let request = ApprovalRequest {
-        request_id: "claude-hook-preview".to_string(),
-        kind: ApprovalKind::ExecCommand,
-        command: Some(command.to_string()),
-        reason: Some("Claude Bash permission hook".to_string()),
-        allow_accept_for_session: false,
-        allow_cancel: true,
-        resolvable: true,
-    };
-    match ai_approval::review_request(&request, project_root).await {
-        Ok(Some(decision)) => {
-            matches!(
-                decision.decision,
-                ai_approval::AiApprovalDecisionKind::Accept
-            )
-        }
-        Ok(None) => false,
-        Err(error) => {
-            eprintln!("AI approval review failed; falling back to user approval: {error:?}");
-            false
-        }
-    }
-}
 
 fn summarize_hook_status_event(
     hook_event_name: &str,

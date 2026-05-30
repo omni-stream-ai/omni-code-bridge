@@ -501,6 +501,8 @@ impl AppState {
                 content: decorate_user_content(&input),
                 created_at: Utc::now(),
             };
+            self.ensure_inbox_seeded(session_id, session_snapshot.agent)
+                .await;
             self.push_message(user_message.clone()).await;
             self.patch_session(
                 session_id,
@@ -517,6 +519,7 @@ impl AppState {
                 .send(SessionEvent::SessionStatus(SessionStatusEvent {
                     session_id: session_id.to_string(),
                     status: SessionStatus::Idle,
+                    error_message: None,
                 }));
             return Ok((user_message.clone(), user_message));
         }
@@ -546,6 +549,8 @@ impl AppState {
             created_at: Utc::now(),
         };
 
+        self.ensure_inbox_seeded(session_id, session_snapshot.agent)
+            .await;
         self.push_message(user_message.clone()).await;
         self.push_message(pending_reply.clone()).await;
         self.patch_session(
@@ -566,6 +571,7 @@ impl AppState {
             .send(SessionEvent::SessionStatus(SessionStatusEvent {
                 session_id: session_id.to_string(),
                 status: SessionStatus::Running,
+                error_message: None,
             }));
 
         let state = Arc::clone(self);
@@ -631,6 +637,7 @@ impl AppState {
                 .send(SessionEvent::SessionStatus(SessionStatusEvent {
                     session_id: session_id.to_string(),
                     status: SessionStatus::Idle,
+                    error_message: None,
                 }));
         }
         Ok(had_active_turn)
@@ -802,6 +809,7 @@ impl AppState {
             .send(SessionEvent::SessionStatus(SessionStatusEvent {
                 session_id: session_id.to_string(),
                 status: SessionStatus::Idle,
+                error_message: None,
             }));
         if let Some(session) = self.find_session(session_id).await {
             let devices = self
@@ -826,13 +834,14 @@ impl AppState {
             .event_tx
             .send(SessionEvent::AgentError(AgentErrorEvent {
                 session_id: session_id.to_string(),
-                message,
+                message: message.clone(),
             }));
         let _ = self
             .event_tx
             .send(SessionEvent::SessionStatus(SessionStatusEvent {
                 session_id: session_id.to_string(),
                 status: SessionStatus::Failed,
+                error_message: Some(message.clone()),
             }));
     }
 
@@ -949,6 +958,7 @@ impl AppState {
             .send(SessionEvent::SessionStatus(SessionStatusEvent {
                 session_id: session_id.to_string(),
                 status: SessionStatus::AwaitingApproval,
+                error_message: None,
             }));
     }
 
@@ -984,6 +994,7 @@ impl AppState {
             .send(SessionEvent::SessionStatus(SessionStatusEvent {
                 session_id: session_id.to_string(),
                 status: SessionStatus::Running,
+                error_message: None,
             }));
     }
 
@@ -1000,6 +1011,24 @@ impl AppState {
             .entry(message.session_id.clone())
             .or_default()
             .push(message);
+    }
+
+    /// If the in-memory message cache has no entry for this session yet,
+    /// pre-seed it from the provider's archive so that later `list_messages`
+    /// calls don't shadow the historical conversation.
+    async fn ensure_inbox_seeded(&self, session_id: &str, agent: AgentKind) {
+        if self.messages.read().await.contains_key(session_id) {
+            return;
+        }
+        let Some(provider) = self.provider_for_agent(agent) else {
+            return;
+        };
+        if let Some(existing) = provider.list_messages(session_id).await {
+            self.messages
+                .write()
+                .await
+                .insert(session_id.to_string(), existing);
+        }
     }
 
     async fn latest_assistant_preview(&self, session_id: &str) -> Option<String> {

@@ -7,6 +7,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
+use uuid::Uuid;
 
 use crate::{
     models::{AgentKind, ChatMessage, MessageRole, ProjectSummary, SessionStatus, SessionSummary},
@@ -83,6 +84,9 @@ pub fn load_claude_messages(path: &Path) -> Option<ClaudeMessages> {
     let content = fs::read_to_string(path).ok()?;
     let mut session_id = None;
     let mut messages = Vec::new();
+    let mut pending_blocks: Vec<String> = Vec::new();
+    let mut pending_timestamp: DateTime<Utc> = Utc::now();
+    let mut pending_id: Option<String> = None;
 
     for line in content.lines() {
         let value: Value = serde_json::from_str(line).ok()?;
@@ -104,7 +108,15 @@ pub fn load_claude_messages(path: &Path) -> Option<ClaudeMessages> {
         }
 
         match line_type {
+            "user" if is_tool_result(&value) => {}
             "user" => {
+                flush_pending_claude_assistant(
+                    &mut messages,
+                    &session_id.clone().unwrap_or_default(),
+                    &mut pending_blocks,
+                    &mut pending_id,
+                    pending_timestamp,
+                );
                 if let Some(text) = extract_user_text(&value) {
                     messages.push(ChatMessage {
                         id: value
@@ -121,23 +133,28 @@ pub fn load_claude_messages(path: &Path) -> Option<ClaudeMessages> {
             }
             "assistant" => {
                 if let Some(text) = extract_assistant_text(&value) {
-                    messages.push(ChatMessage {
-                        id: value
+                    if pending_blocks.is_empty() {
+                        pending_timestamp = timestamp;
+                        pending_id = value
                             .get("uuid")
                             .and_then(Value::as_str)
                             .or_else(|| value.pointer("/message/id").and_then(Value::as_str))
-                            .unwrap_or_default()
-                            .to_string(),
-                        session_id: session_id.clone().unwrap_or_default(),
-                        role: MessageRole::Assistant,
-                        content: text,
-                        created_at: timestamp,
-                    });
+                            .map(ToString::to_string);
+                    }
+                    pending_blocks.push(text);
                 }
             }
             _ => {}
         }
     }
+
+    flush_pending_claude_assistant(
+        &mut messages,
+        &session_id.clone().unwrap_or_default(),
+        &mut pending_blocks,
+        &mut pending_id,
+        pending_timestamp,
+    );
 
     let session_id = session_id?;
     for message in &mut messages {
@@ -148,6 +165,37 @@ pub fn load_claude_messages(path: &Path) -> Option<ClaudeMessages> {
         fingerprint,
         messages,
     })
+}
+
+fn flush_pending_claude_assistant(
+    messages: &mut Vec<ChatMessage>,
+    session_id: &str,
+    pending_blocks: &mut Vec<String>,
+    pending_id: &mut Option<String>,
+    timestamp: DateTime<Utc>,
+) {
+    if pending_blocks.is_empty() {
+        return;
+    }
+    let content = pending_blocks
+        .drain(..)
+        .map(|block| block.trim().to_string())
+        .filter(|block| !block.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n---\n\n");
+    if content.is_empty() {
+        return;
+    }
+    let id = pending_id
+        .take()
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    messages.push(ChatMessage {
+        id,
+        session_id: session_id.to_string(),
+        role: MessageRole::Assistant,
+        content,
+        created_at: timestamp,
+    });
 }
 
 fn parse_session_summary_file(path: &Path) -> Option<ParsedSessionSummaryRecord> {
@@ -241,6 +289,18 @@ fn parse_session_summary_file(path: &Path) -> Option<ParsedSessionSummaryRecord>
         },
         session_file: path.to_path_buf(),
     })
+}
+
+fn is_tool_result(value: &Value) -> bool {
+    value
+        .pointer("/message/content")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .all(|item| item.get("type").and_then(Value::as_str) == Some("tool_result"))
+        })
+        .unwrap_or(false)
 }
 
 fn extract_user_text(value: &Value) -> Option<String> {
@@ -630,6 +690,63 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].content, "[Request interrupted by user]");
         assert_eq!(messages[1].content, "visible");
+    }
+
+    #[test]
+    fn load_claude_messages_merges_consecutive_assistant_blocks() {
+        let file = temp_jsonl_file(
+            "claude-merge",
+            &[
+                r#"{"timestamp":"2026-05-01T00:00:00Z","type":"user","sessionId":"claude-merge","cwd":"/tmp/project","uuid":"u1","message":{"content":"hello"}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:01Z","type":"assistant","sessionId":"claude-merge","cwd":"/tmp/project","uuid":"a1","message":{"content":[{"type":"text","text":"first block"}]}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:02Z","type":"assistant","sessionId":"claude-merge","cwd":"/tmp/project","uuid":"a2","message":{"content":[{"type":"text","text":"second block"}]}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:03Z","type":"user","sessionId":"claude-merge","cwd":"/tmp/project","uuid":"u2","message":{"content":"follow up"}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:04Z","type":"assistant","sessionId":"claude-merge","cwd":"/tmp/project","uuid":"a3","message":{"content":[{"type":"text","text":"third block"}]}}"#,
+            ],
+        );
+
+        let messages = load_claude_messages(&file)
+            .expect("claude archive should parse")
+            .messages;
+
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].role, MessageRole::User);
+        assert_eq!(messages[0].content, "hello");
+        assert_eq!(messages[1].role, MessageRole::Assistant);
+        assert_eq!(messages[1].content, "first block\n\n---\n\nsecond block");
+        assert_eq!(messages[2].role, MessageRole::User);
+        assert_eq!(messages[2].content, "follow up");
+        assert_eq!(messages[3].role, MessageRole::Assistant);
+        assert_eq!(messages[3].content, "third block");
+    }
+
+    #[test]
+    fn load_claude_messages_merges_across_tool_results() {
+        let file = temp_jsonl_file(
+            "claude-tool-merge",
+            &[
+                r#"{"timestamp":"2026-05-01T00:00:00Z","type":"user","sessionId":"claude-tr","cwd":"/tmp/project","uuid":"u1","message":{"content":"do something"}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:01Z","type":"assistant","sessionId":"claude-tr","cwd":"/tmp/project","uuid":"a1","message":{"content":[{"type":"thinking","thinking":"hidden"}]}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:02Z","type":"assistant","sessionId":"claude-tr","cwd":"/tmp/project","uuid":"a2","message":{"content":[{"type":"text","text":"let me check"}]}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:03Z","type":"assistant","sessionId":"claude-tr","cwd":"/tmp/project","uuid":"a3","message":{"content":[{"type":"tool_use","id":"tu1","name":"bash","input":{}}]}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:04Z","type":"user","sessionId":"claude-tr","cwd":"/tmp/project","uuid":"u2","message":{"content":[{"type":"tool_result","tool_use_id":"tu1","content":"ok"}]}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:05Z","type":"assistant","sessionId":"claude-tr","cwd":"/tmp/project","uuid":"a4","message":{"content":[{"type":"thinking","thinking":"hidden"}]}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:06Z","type":"assistant","sessionId":"claude-tr","cwd":"/tmp/project","uuid":"a5","message":{"content":[{"type":"text","text":"looks good"}]}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:07Z","type":"user","sessionId":"claude-tr","cwd":"/tmp/project","uuid":"u3","message":{"content":"thanks"}}"#,
+            ],
+        );
+
+        let messages = load_claude_messages(&file)
+            .expect("claude archive should parse")
+            .messages;
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].role, MessageRole::User);
+        assert_eq!(messages[0].content, "do something");
+        assert_eq!(messages[1].role, MessageRole::Assistant);
+        assert_eq!(messages[1].content, "let me check\n\n---\n\nlooks good");
+        assert_eq!(messages[2].role, MessageRole::User);
+        assert_eq!(messages[2].content, "thanks");
     }
 
     fn temp_jsonl_file(name: &str, lines: &[&str]) -> PathBuf {
