@@ -1075,7 +1075,7 @@ dependencies = [
 
 [[package]]
 name = "omni-code-bridge"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "async-trait",
