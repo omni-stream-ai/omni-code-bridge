@@ -28,7 +28,7 @@ use crate::{
     claude_store::{load_claude_archive_summary, load_claude_messages},
     models::{
         AgentKind, ApprovalChoice, ApprovalKind, ApprovalRequest, ChatMessage, ProjectSummary,
-        SessionSummary,
+        ResolvedProviderConfig, SessionSummary,
     },
     session_store::{load_session_archive_summary, load_session_messages},
 };
@@ -58,6 +58,7 @@ pub trait AgentProvider: Send + Sync {
         input: ChatMessage,
         system_prompt: Option<String>,
         reply: ChatMessage,
+        provider_config: Option<ResolvedProviderConfig>,
     ) -> Result<()>;
 
     async fn summarize_reply(
@@ -115,6 +116,7 @@ impl AgentProvider for StubProvider {
         input: ChatMessage,
         _system_prompt: Option<String>,
         reply: ChatMessage,
+        _provider_config: Option<ResolvedProviderConfig>,
     ) -> Result<()> {
         let prefix = match self.kind {
             AgentKind::ClaudeCode => "ClaudeCode",
@@ -391,6 +393,7 @@ mod tests {
             unread_count: 0,
             last_message_preview: None,
             pending_approval: None,
+            provider_id: None,
         };
         let input = ChatMessage {
             id: "input".to_string(),
@@ -408,7 +411,7 @@ mod tests {
         };
 
         let result = provider
-            .run_session(Arc::clone(&state), session, input, None, reply)
+            .run_session(Arc::clone(&state), session, input, None, reply, None)
             .await
             .expect_err("direct call without seeded reply should expose state contract");
         assert!(result.to_string().contains("unknown message"));
@@ -586,8 +589,9 @@ impl AgentProvider for CodexProvider {
         input: ChatMessage,
         system_prompt: Option<String>,
         reply: ChatMessage,
+        provider_config: Option<ResolvedProviderConfig>,
     ) -> Result<()> {
-        run_codex(state, &session, &input, system_prompt.as_deref(), &reply).await
+        run_codex(state, &session, &input, system_prompt.as_deref(), &reply, provider_config).await
     }
 
     async fn summarize_reply(
@@ -709,8 +713,9 @@ impl AgentProvider for ClaudeCodeProvider {
         input: ChatMessage,
         system_prompt: Option<String>,
         reply: ChatMessage,
+        provider_config: Option<ResolvedProviderConfig>,
     ) -> Result<()> {
-        run_claude_code(state, &session, &input, system_prompt.as_deref(), &reply).await
+        run_claude_code(state, &session, &input, system_prompt.as_deref(), &reply, provider_config).await
     }
 
     async fn summarize_reply(
@@ -773,8 +778,9 @@ impl AgentProvider for OpenCodeProvider {
         input: ChatMessage,
         system_prompt: Option<String>,
         reply: ChatMessage,
+        provider_config: Option<ResolvedProviderConfig>,
     ) -> Result<()> {
-        run_opencode(state, &session, &input, system_prompt.as_deref(), &reply).await
+        run_opencode(state, &session, &input, system_prompt.as_deref(), &reply, provider_config).await
     }
 
     async fn summarize_reply(
@@ -788,16 +794,161 @@ impl AgentProvider for OpenCodeProvider {
 }
 
 fn spawn_codex_app_server(cwd: &Path) -> Result<Child> {
+    spawn_codex_app_server_with_config(cwd, None, None)
+}
+
+fn spawn_codex_app_server_with_config(
+    cwd: &Path,
+    provider_config: Option<&ResolvedProviderConfig>,
+    codex_provider_name: Option<&str>,
+) -> Result<Child> {
     let binary = codex_binary_path();
-    Command::new(&binary)
+    let mut command = Command::new(&binary);
+    command
         .args(["app-server", "--listen", "stdio://"])
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+
+    // Apply provider configuration via -c config overrides.
+    // We override both model_provider and model_providers.<name>.base_url
+    // so that codex finds the (only) provider in the replaced table.
+    if let Some(config) = provider_config {
+        let name = codex_provider_name.unwrap_or("omni-bridge");
+        // Read the display name from config.toml (might differ from key)
+        let display_name = find_codex_provider_display_name(name).unwrap_or_else(|| name.to_string());
+
+        command.args([
+            "-c", &format!("model_provider={name}"),
+            "-c", &format!("model_providers.{name}.name={display_name}"),
+            "-c", &format!("model_providers.{name}.base_url={}", config.base_url),
+            "-c", &format!("model_providers.{name}.requires_openai_auth=false"),
+        ]);
+        if !config.api_key.is_empty() {
+            command.args(["-c", &format!("model_providers.{name}.api_key={}", config.api_key)]);
+        }
+        if let Some(ref model) = config.model {
+            command.args(["-c", &format!("model={model}")]);
+        }
+        eprintln!(
+            "[codex] applying -c overrides: provider={name} base_url={}",
+            config.base_url
+        );
+    }
+
+    command
         .spawn()
         .with_context(|| format!("failed to spawn `{}`", binary.display()))
+}
+
+fn find_codex_provider_name() -> Option<String> {
+    let path = codex_home_dir().join("config.toml");
+    let content = std::fs::read_to_string(path).ok()?;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("model_provider") && trimmed.contains('=') {
+            let value = trimmed.splitn(2, '=').nth(1)?.trim();
+            return Some(value.trim_matches('"').trim_matches('\'').to_string());
+        }
+    }
+    None
+}
+
+/// Read the `name` field from a model_providers section in config.toml.
+fn find_codex_provider_display_name(provider_key: &str) -> Option<String> {
+    let path = codex_home_dir().join("config.toml");
+    let content = std::fs::read_to_string(path).ok()?;
+    let section_header = format!("[model_providers.{provider_key}]");
+    let mut in_section = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed == section_header {
+            in_section = true;
+            continue;
+        }
+        if in_section {
+            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                break;
+            }
+            if trimmed.starts_with("name") && trimmed.contains('=') {
+                let value = trimmed.splitn(2, '=').nth(1)?.trim();
+                return Some(value.trim_matches('"').trim_matches('\'').to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Read the model_provider from codex's session data file for a given session ID.
+/// Session files are stored at ~/.codex/sessions/YYYY/MM/DD/rollout-*-<session_id>.jsonl
+fn read_codex_session_provider(session_id: &str) -> Option<String> {
+    let sessions_dir = codex_home_dir().join("sessions");
+    find_session_file(&sessions_dir, session_id).and_then(|path| {
+        let content = std::fs::read_to_string(path).ok()?;
+        let first_line = content.lines().next()?;
+        let meta: serde_json::Value = serde_json::from_str(first_line).ok()?;
+        meta.pointer("/payload/model_provider")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    })
+}
+
+fn find_session_file(dir: &Path, session_id: &str) -> Option<PathBuf> {
+    for entry in std::fs::read_dir(dir).ok()? {
+        let entry = entry.ok()?;
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(found) = find_session_file(&path, session_id) {
+                return Some(found);
+            }
+        } else {
+            let name = path.file_name()?.to_string_lossy();
+            if name.contains(session_id) && name.ends_with(".jsonl") {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+/// Path to the codex home directory (~/.codex)
+fn codex_home_dir() -> PathBuf {
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        home.join(".codex")
+    } else {
+        PathBuf::from(".codex")
+    }
+}
+
+async fn start_codex_thread(
+    stdin: &mut (impl tokio::io::AsyncWrite + Unpin),
+    next_request_id: &mut u64,
+    stdout_rx: &mut mpsc::UnboundedReceiver<std::result::Result<String, String>>,
+    raw_stdout: &mut String,
+    state: &AppState,
+    session: &SessionSummary,
+    developer_instructions: &Option<String>,
+) -> Result<serde_json::Value> {
+    let request_id = send_json_rpc_request(
+        stdin,
+        next_request_id,
+        "thread/start",
+        serde_json::json!({
+            "cwd": state
+                .project_root_path_for_session(&session.id)
+                .await
+                .map_err(anyhow::Error::msg)?,
+            "approvalPolicy": "on-request",
+            "approvalsReviewer": "user",
+            "sandbox": "workspace-write",
+            "persistExtendedHistory": false,
+            "developerInstructions": developer_instructions,
+        }),
+    )
+    .await?;
+    wait_for_json_rpc_response(stdout_rx, raw_stdout, request_id).await
 }
 
 fn brief_reply_developer_prompt(session: &SessionSummary) -> Option<&'static str> {
@@ -871,6 +1022,85 @@ fn opencode_binary_path() -> PathBuf {
     find_executable_in_path("opencode").unwrap_or_else(|| PathBuf::from("opencode"))
 }
 
+fn opencode_config_path() -> PathBuf {
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        home.join(".config/opencode/opencode.json")
+    } else {
+        PathBuf::from(".config/opencode/opencode.json")
+    }
+}
+
+/// Create a temporary opencode config file with the given provider's base_url.
+/// Returns the path to the temp config file.
+fn write_opencode_overlay_config(config: &ResolvedProviderConfig) -> Result<PathBuf> {
+    let original_path = opencode_config_path();
+    let original = std::fs::read_to_string(&original_path).unwrap_or_else(|_| {
+        r#"{"provider":{}}"#.to_string()
+    });
+    let modified = modify_opencode_config(&original, config);
+    let overlay = crate::bridge_settings::project_tmp_dir("opencode-overlay");
+    std::fs::create_dir_all(&overlay)?;
+    let path = overlay.join("opencode.json");
+    std::fs::write(&path, &modified)?;
+    Ok(path)
+}
+
+/// Modify opencode config: find a provider with matching base_url and update it,
+/// or create a new provider if none found.
+fn modify_opencode_config(original: &str, config: &ResolvedProviderConfig) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(original) else {
+        return original.to_string();
+    };
+
+    let providers = value.get_mut("provider").and_then(|v| v.as_object_mut());
+    let Some(providers) = providers else {
+        return original.to_string();
+    };
+
+    let npm = match config.format {
+        crate::models::ApiFormat::AnthropicMessages => "@ai-sdk/anthropic",
+        _ => "@ai-sdk/openai-compatible",
+    };
+
+    // Find provider to update: prefer one with matching base_url, otherwise first
+    let target_key = providers
+        .iter()
+        .find(|(_, v)| {
+            v.get("options")
+                .and_then(|o| o.get("baseURL"))
+                .and_then(|u| u.as_str())
+                == Some(&config.base_url)
+        })
+        .map(|(k, _)| k.clone())
+        .or_else(|| providers.keys().next().cloned());
+
+    if let Some(key) = target_key {
+        if let Some(provider) = providers.get_mut(&key).and_then(|v| v.as_object_mut()) {
+            let options = provider
+                .entry("options")
+                .or_insert_with(|| serde_json::json!({}));
+            if let Some(obj) = options.as_object_mut() {
+                obj.insert("baseURL".to_string(), serde_json::json!(config.base_url));
+                if !config.api_key.is_empty() {
+                    obj.insert("apiKey".to_string(), serde_json::json!(config.api_key));
+                }
+            }
+            provider.insert("npm".to_string(), serde_json::json!(npm));
+        }
+    } else {
+        let mut options = serde_json::json!({ "baseURL": config.base_url });
+        if !config.api_key.is_empty() {
+            options["apiKey"] = serde_json::json!(config.api_key);
+        }
+        providers.insert(
+            "omni-bridge".to_string(),
+            serde_json::json!({ "npm": npm, "options": options }),
+        );
+    }
+
+    serde_json::to_string_pretty(&value).unwrap_or_else(|_| original.to_string())
+}
+
 struct OpenCodeHttpClient {
     base_url: String,
     http: reqwest::Client,
@@ -880,14 +1110,37 @@ struct OpenCodeHttpClient {
 
 impl OpenCodeHttpClient {
     async fn start() -> Result<Self> {
-        let mut child = Command::new(opencode_binary_path())
+        Self::start_with_config(None).await
+    }
+
+    async fn start_with_config(provider_config: Option<&ResolvedProviderConfig>) -> Result<Self> {
+        let mut command = Command::new(opencode_binary_path());
+        command
             .arg("serve")
             .arg("--hostname")
             .arg("127.0.0.1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+
+        // Apply provider configuration via OPENCODE_CONFIG overlay file
+        if let Some(config) = provider_config {
+            match write_opencode_overlay_config(config) {
+                Ok(path) => {
+                    command.env("OPENCODE_CONFIG", &path);
+                    eprintln!("[opencode] using overlay config: base_url={}", config.base_url);
+                }
+                Err(err) => {
+                    eprintln!("[opencode] warning: failed to create overlay config: {err}");
+                }
+            }
+            if let Some(ref model) = config.model {
+                command.env("OPENCODE_MODEL", model);
+            }
+        }
+
+        let mut child = command
             .spawn()
             .context("failed to spawn `opencode serve`")?;
         let stdout = child
@@ -1018,6 +1271,7 @@ impl OpenCodeHttpClient {
         project_root: &Path,
         prompt: &str,
         system: Option<&str>,
+        model: Option<&str>,
     ) -> Result<()> {
         let mut body = serde_json::json!({
             "parts": [{
@@ -1027,6 +1281,9 @@ impl OpenCodeHttpClient {
         });
         if let Some(system) = system {
             body["system"] = serde_json::Value::String(system.to_string());
+        }
+        if let Some(model) = model {
+            body["model"] = serde_json::Value::String(model.to_string());
         }
         self.post_json_with_query(
             &format!("/session/{}/prompt_async", url_path_escape(session_id)),
@@ -1166,14 +1423,29 @@ async fn run_codex(
     input: &ChatMessage,
     system_prompt: Option<&str>,
     reply: &ChatMessage,
+    provider_config: Option<ResolvedProviderConfig>,
 ) -> Result<()> {
     let project_root = state
         .project_root_path_for_session(&session.id)
         .await
         .map(PathBuf::from)
         .map_err(anyhow::Error::msg)?;
-    let mut child =
-        spawn_codex_app_server(&project_root).context("failed to spawn `codex app-server`")?;
+    // Resolve the codex provider name for this session, with fallback chain:
+    // 1. Stored in runtime state (from a previous thread/start by us)
+    // 2. Codex session data file (model_provider in session_meta)
+    // 3. Current config.toml's model_provider
+    // 4. "omni-bridge" as last resort
+    let codex_provider_name = state
+        .codex_provider_name(&session.id)
+        .await
+        .or_else(|| read_codex_session_provider(&session.id))
+        .or_else(find_codex_provider_name);
+    let mut child = spawn_codex_app_server_with_config(
+        &project_root,
+        provider_config.as_ref(),
+        codex_provider_name.as_deref(),
+    )
+    .context("failed to spawn `codex app-server`")?;
 
     let mut stdin = child
         .stdin
@@ -1244,8 +1516,10 @@ async fn run_codex(
 
     let existing_runtime_ref = state.provider_session_ref(&session.id).await;
     let developer_instructions = turn_system_prompt(session, system_prompt);
-    let thread_request_id = if let Some(thread_id) = existing_runtime_ref.as_deref() {
-        send_json_rpc_request(
+
+    // Try to resume existing thread; if it fails (e.g. provider mismatch), fall back to thread/start.
+    let thread_response = if let Some(thread_id) = existing_runtime_ref.as_deref() {
+        let resume_id = send_json_rpc_request(
             &mut stdin,
             &mut next_request_id,
             "thread/resume",
@@ -1255,28 +1529,23 @@ async fn run_codex(
                 "developerInstructions": developer_instructions,
             }),
         )
-        .await?
+        .await?;
+        match wait_for_json_rpc_response(&mut stdout_rx, &mut raw_stdout, resume_id).await {
+            Ok(resp) if resp.get("error").is_none() => resp,
+            Ok(resp) => {
+                eprintln!("[codex] thread/resume failed, falling back to thread/start: {}", resp);
+                state.set_codex_provider_name(&session.id, None).await;
+                start_codex_thread(&mut stdin, &mut next_request_id, &mut stdout_rx, &mut raw_stdout, &state, &session, &developer_instructions).await?
+            }
+            Err(e) => {
+                eprintln!("[codex] thread/resume failed, falling back to thread/start: {e}");
+                state.set_codex_provider_name(&session.id, None).await;
+                start_codex_thread(&mut stdin, &mut next_request_id, &mut stdout_rx, &mut raw_stdout, &state, &session, &developer_instructions).await?
+            }
+        }
     } else {
-        send_json_rpc_request(
-            &mut stdin,
-            &mut next_request_id,
-            "thread/start",
-            serde_json::json!({
-                "cwd": state
-                    .project_root_path_for_session(&session.id)
-                    .await
-                    .map_err(anyhow::Error::msg)?,
-                "approvalPolicy": "on-request",
-                "approvalsReviewer": "user",
-                "sandbox": "workspace-write",
-                "persistExtendedHistory": false,
-                "developerInstructions": developer_instructions,
-            }),
-        )
-        .await?
+        start_codex_thread(&mut stdin, &mut next_request_id, &mut stdout_rx, &mut raw_stdout, &state, &session, &developer_instructions).await?
     };
-    let thread_response =
-        wait_for_json_rpc_response(&mut stdout_rx, &mut raw_stdout, thread_request_id).await?;
     let thread_id = thread_response
         .pointer("/thread/id")
         .and_then(Value::as_str)
@@ -1292,6 +1561,12 @@ async fn run_codex(
     state
         .set_provider_session_ref(&session.id, Some(thread_id.clone()))
         .await;
+    // Store the provider name so future resumes use the same provider
+    if provider_config.is_some() {
+        let name = codex_provider_name
+            .unwrap_or_else(|| "omni-bridge".to_string());
+        state.set_codex_provider_name(&session.id, Some(name)).await;
+    }
     parsed.session_id = Some(thread_id.clone());
 
     let turn_request_id = send_json_rpc_request(
@@ -1442,7 +1717,10 @@ async fn run_codex(
         if stderr.is_empty() {
             bail!("codex exited with status {code}");
         } else {
-            bail!("codex exited with status {code}: {stderr}");
+            // stderr may contain retry messages like "Reconnecting... 1/5".
+            // Use the last line as the actual error message.
+            let last_line = stderr.lines().last().unwrap_or(stderr);
+            bail!("codex exited with status {code}: {last_line}");
         }
     }
 
@@ -1459,6 +1737,7 @@ async fn run_claude_code(
     input: &ChatMessage,
     system_prompt: Option<&str>,
     reply: &ChatMessage,
+    provider_config: Option<ResolvedProviderConfig>,
 ) -> Result<()> {
     let state_dir = claude_state_dir();
     ensure_runtime_dirs(&state_dir).await?;
@@ -1511,6 +1790,23 @@ async fn run_claude_code(
         .arg("--include-partial-messages")
         .arg("--settings")
         .arg(settings.to_string());
+
+    // Apply provider configuration
+    if let Some(ref config) = provider_config {
+        // Set environment variables for API configuration
+        if !config.base_url.is_empty() {
+            command.env("ANTHROPIC_BASE_URL", &config.base_url);
+        }
+        if !config.api_key.is_empty() {
+            command.env("ANTHROPIC_API_KEY", &config.api_key);
+        }
+        // Claude Code only supports anthropic-messages format
+        // Model can be set via --model flag
+        if let Some(ref model) = config.model {
+            command.arg("--model").arg(model);
+        }
+    }
+
     if let Some(system_prompt) = turn_system_prompt(session, system_prompt) {
         command.arg("--append-system-prompt").arg(system_prompt);
     }
@@ -1673,13 +1969,15 @@ async fn run_opencode(
     input: &ChatMessage,
     system_prompt: Option<&str>,
     reply: &ChatMessage,
+    provider_config: Option<ResolvedProviderConfig>,
 ) -> Result<()> {
     let project_root = state
         .project_root_path_for_session(&session.id)
         .await
         .map(PathBuf::from)
         .map_err(anyhow::Error::msg)?;
-    let mut client = OpenCodeHttpClient::start().await?;
+
+    let mut client = OpenCodeHttpClient::start_with_config(provider_config.as_ref()).await?;
     let opencode_session_id =
         if let Some(session_id) = state.provider_session_ref(&session.id).await {
             session_id
@@ -1699,8 +1997,9 @@ async fn run_opencode(
     let (approval_tx, mut approval_rx) = mpsc::unbounded_channel();
     state.set_approval_sender(&session.id, approval_tx).await;
     let system = turn_system_prompt(session, system_prompt);
+    let model = provider_config.as_ref().and_then(|c| c.model.as_deref());
     client
-        .prompt_async(&opencode_session_id, &project_root, &input.content, system.as_deref())
+        .prompt_async(&opencode_session_id, &project_root, &input.content, system.as_deref(), model)
         .await
         .context("failed to send opencode prompt")?;
     let mut event_stream = client
@@ -1802,6 +2101,11 @@ async fn run_opencode(
         .context("opencode response did not include assistant text")?;
     push_incremental_text(&state, &session.id, &reply.id, &mut last_rendered, &text).await;
     client.shutdown().await;
+    // Clean up overlay config if we created one
+    if provider_config.is_some() {
+        let overlay = crate::bridge_settings::project_tmp_dir("opencode-overlay");
+        let _ = std::fs::remove_dir_all(&overlay);
+    }
     state
         .finish_assistant_message(&session.id, &reply.id)
         .await
@@ -2084,7 +2388,7 @@ async fn summarize_with_opencode(
         .await
         .context("failed to create opencode summary session")?;
     client
-        .prompt_async(&session_id, &project_root, &summary_prompt(content), None)
+        .prompt_async(&session_id, &project_root, &summary_prompt(content), None, None)
         .await
         .context("failed to send opencode summary prompt")?;
     wait_for_opencode_session_idle(&mut client, &session_id, &project_root).await?;
@@ -3306,6 +3610,7 @@ fn opencode_session_summary(value: &Value) -> Option<SessionSummary> {
         unread_count: 0,
         last_message_preview: Some(title),
         pending_approval: None,
+        provider_id: None,
     })
 }
 

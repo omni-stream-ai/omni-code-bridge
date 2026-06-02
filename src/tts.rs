@@ -487,7 +487,7 @@ fn sanitized_lexicon_path(lexicon_path: &Path, tokens_path: &Path) -> Option<Pat
         return Some(lexicon_path.to_path_buf());
     }
 
-    let output_dir = std::env::temp_dir().join("omni-code-bridge-speech-lexicons");
+    let output_dir = crate::bridge_settings::project_tmp_dir("speech-lexicons");
     fs::create_dir_all(&output_dir).ok()?;
 
     let mut hasher = DefaultHasher::new();

@@ -17,12 +17,13 @@ use crate::{
     client_auth_store::ClientAuthStore,
     device_store::{load_device_registrations, save_device_registrations},
     models::{
-        AgentErrorEvent, AgentKind, ApprovalChoice, ApprovalRequest, ApprovalRequestEvent,
-        ApprovalResolvedEvent, ChatMessage, ClientAuthRecord, ClientAuthRequestInput,
-        ClientAuthStatus, CreateProjectInput, CreateSessionInput, InputMode, MessageDeltaEvent,
-        MessageRole, ProjectSummary, PushDeviceRegistration, RegisterPushDeviceInput,
-        SendMessageInput, SessionEvent, SessionStatus, SessionStatusEvent, SessionSummary,
-        SpeakerFilterSettings, TriggerClientMessageInput, TriggerClientMessageResult,
+        AgentErrorEvent, AgentKind, ApiFormat, ApprovalChoice, ApprovalRequest,
+        ApprovalRequestEvent, ApprovalResolvedEvent, ChatMessage, ClientAuthRecord,
+        ClientAuthRequestInput, ClientAuthStatus, CreateProjectInput, CreateSessionInput,
+        InputMode, MessageDeltaEvent, MessageRole, ModelProviderConfig, ProjectSummary,
+        PushDeviceRegistration, RegisterPushDeviceInput, ResolvedProviderConfig, SendMessageInput,
+        SessionEvent, SessionStatus, SessionStatusEvent, SessionSummary, SpeakerFilterSettings,
+        TriggerClientMessageInput, TriggerClientMessageResult,
     },
     push::PushService,
     session_store::project_id_for_path,
@@ -32,6 +33,9 @@ use crate::{
 #[derive(Default)]
 struct SessionRuntimeState {
     provider_session_ref: Option<String>,
+    /// The codex model_provider name used when creating the current thread.
+    /// Stored so we can resume with the same provider (codex binds threads to providers).
+    codex_provider_name: Option<String>,
     pending_approval: Option<ApprovalRequest>,
     last_resolved_approval_request_id: Option<String>,
     approval_tx: Option<mpsc::UnboundedSender<ApprovalChoice>>,
@@ -186,9 +190,17 @@ impl AppState {
         &self,
         input: crate::bridge_settings::BridgeSettingsInput,
     ) -> Result<BridgeSettings, String> {
+        // Validate model_providers before applying
+        if let Some(ref providers) = input.model_providers {
+            crate::bridge_settings::validate_model_providers(providers)?;
+        }
+
         self.settings
             .update(|settings| {
                 settings.ai_approval = input.ai_approval;
+                if let Some(model_providers) = input.model_providers {
+                    settings.model_providers = model_providers;
+                }
                 if let Some(speech_profiles) = input.speech_profiles {
                     settings.speech_profiles = speech_profiles;
                 }
@@ -313,6 +325,7 @@ impl AppState {
             unread_count: 0,
             last_message_preview: Some("新会话已创建".to_string()),
             pending_approval: None,
+            provider_id: input.provider_id,
         };
 
         self.sessions
@@ -327,6 +340,7 @@ impl AppState {
             session.id.clone(),
             SessionRuntimeState {
                 provider_session_ref: None,
+                codex_provider_name: None,
                 pending_approval: None,
                 last_resolved_approval_request_id: None,
                 approval_tx: None,
@@ -408,6 +422,7 @@ impl AppState {
             unread_count: 1,
             last_message_preview: Some(content.clone()),
             pending_approval: None,
+            provider_id: None,
         };
         let message = ChatMessage {
             id: Uuid::new_v4().to_string(),
@@ -463,6 +478,163 @@ impl AppState {
 
     pub fn subscribe(&self) -> broadcast::Receiver<SessionEvent> {
         self.event_tx.subscribe()
+    }
+
+    /// Resolve provider configuration for a message based on priority:
+    /// 1. Message-level provider_id
+    /// 2. Session-level provider_id
+    /// 3. Project-level provider (highest priority enabled provider matching agent format)
+    /// 4. Global provider (highest priority enabled provider matching agent format)
+    pub async fn resolve_provider_config(
+        &self,
+        session: &SessionSummary,
+        message_provider_id: &Option<String>,
+    ) -> Option<ResolvedProviderConfig> {
+        let settings = self.bridge_settings().await;
+        let agent = session.agent;
+
+        // Helper: check if a format is compatible with the agent
+        let is_format_compatible = |format: &ApiFormat| match agent {
+            AgentKind::ClaudeCode => *format == ApiFormat::AnthropicMessages,
+            AgentKind::Codex => *format == ApiFormat::Codex,
+            AgentKind::OpenCode => {
+                *format == ApiFormat::OpenAiCompatible
+                    || *format == ApiFormat::AnthropicMessages
+                    || *format == ApiFormat::Codex
+            }
+            AgentKind::Custom => *format == ApiFormat::OpenAiCompatible,
+        };
+
+        // Helper: find best provider from a list
+        let find_best_provider = |providers: &[ModelProviderConfig]| -> Option<ResolvedProviderConfig> {
+            providers
+                .iter()
+                .filter(|p| p.enabled)
+                .filter(|p| is_format_compatible(&p.format))
+                .min_by_key(|p| p.priority)
+                .map(|p| ResolvedProviderConfig {
+                    base_url: p.base_url.clone(),
+                    api_key: p.api_key.clone(),
+                    model: p.model.clone(),
+                    format: p.format,
+                })
+        };
+
+        // 1. Message-level provider_id
+        if let Some(provider_id) = message_provider_id {
+            eprintln!("[provider] trying message-level provider_id={provider_id}");
+            if let Some(config) = self.find_provider_by_id(provider_id, agent, &settings).await {
+                eprintln!("[provider] resolved via message-level: base_url={} model={:?} format={:?}", config.base_url, config.model, config.format);
+                return Some(config);
+            }
+            eprintln!("[provider] message-level provider_id={provider_id} not found, falling through");
+        }
+
+        // 2. Session-level provider_id
+        if let Some(provider_id) = &session.provider_id {
+            eprintln!("[provider] trying session-level provider_id={provider_id}");
+            if let Some(config) = self.find_provider_by_id(provider_id, agent, &settings).await {
+                eprintln!("[provider] resolved via session-level: base_url={} model={:?} format={:?}", config.base_url, config.model, config.format);
+                return Some(config);
+            }
+            eprintln!("[provider] session-level provider_id={provider_id} not found, falling through");
+        }
+
+        // 3. Project-level providers
+        if let Some(project_providers) = self.load_project_providers(&session.project_id).await {
+            if let Some(config) = find_best_provider(&project_providers) {
+                eprintln!(
+                    "[provider] using project-level provider for session={}: base_url={} format={:?}",
+                    session.id, config.base_url, config.format
+                );
+                return Some(config);
+            }
+        }
+
+        // 4. Global providers (sorted by priority)
+        let config = find_best_provider(&settings.model_providers);
+        if let Some(ref c) = config {
+            eprintln!("[provider] using global provider: base_url={} model={:?} format={:?}", c.base_url, c.model, c.format);
+        }
+        config
+    }
+
+    /// Load project-level provider configuration from .omni-code/providers.json
+    async fn load_project_providers(&self, project_id: &str) -> Option<Vec<ModelProviderConfig>> {
+        let project_root = self.find_project(project_id).await?.root_path;
+        let config_path = std::path::PathBuf::from(&project_root)
+            .join(".omni-code")
+            .join("providers.json");
+
+        if !config_path.exists() {
+            return None;
+        }
+
+        match tokio::fs::read_to_string(&config_path).await {
+            Ok(body) => match serde_json::from_str::<Vec<ModelProviderConfig>>(&body) {
+                Ok(providers) => {
+                    eprintln!(
+                        "[provider] loaded {} project-level providers from {}",
+                        providers.len(),
+                        config_path.display()
+                    );
+                    Some(providers)
+                }
+                Err(error) => {
+                    eprintln!(
+                        "[provider] warning: failed to parse {}: {}",
+                        config_path.display(),
+                        error
+                    );
+                    None
+                }
+            },
+            Err(error) => {
+                eprintln!(
+                    "[provider] warning: failed to read {}: {}",
+                    config_path.display(),
+                    error
+                );
+                None
+            }
+        }
+    }
+
+    /// Find a provider by ID and validate it's compatible with the agent
+    async fn find_provider_by_id(
+        &self,
+        provider_id: &str,
+        agent: AgentKind,
+        settings: &BridgeSettings,
+    ) -> Option<ResolvedProviderConfig> {
+        let provider = settings.model_providers.iter().find(|p| p.id == provider_id)?;
+
+        // Validate format compatibility
+        let is_compatible = match agent {
+            AgentKind::ClaudeCode => provider.format == ApiFormat::AnthropicMessages,
+            AgentKind::Codex => provider.format == ApiFormat::Codex,
+            AgentKind::OpenCode => {
+                provider.format == ApiFormat::OpenAiCompatible
+                    || provider.format == ApiFormat::AnthropicMessages
+                    || provider.format == ApiFormat::Codex
+            }
+            AgentKind::Custom => provider.format == ApiFormat::OpenAiCompatible,
+        };
+
+        if !is_compatible {
+            eprintln!(
+                "[provider] warning: provider {} format {:?} is not compatible with agent {:?}",
+                provider_id, provider.format, agent
+            );
+            // Allow it anyway but log warning
+        }
+
+        Some(ResolvedProviderConfig {
+            base_url: provider.base_url.clone(),
+            api_key: provider.api_key.clone(),
+            model: provider.model.clone(),
+            format: provider.format,
+        })
     }
 
     pub async fn send_message(
@@ -536,10 +708,12 @@ impl AppState {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
         eprintln!(
-            "[messages] send session={session_id} input_mode={:?} system_prompt_present={} system_prompt_len={}",
+            "[messages] send session={session_id} input_mode={:?} system_prompt_present={} system_prompt_len={} message_provider_id={:?} session_provider_id={:?}",
             input.input_mode,
             system_prompt.is_some(),
             system_prompt.as_ref().map(|value| value.len()).unwrap_or(0),
+            input.provider_id,
+            session_snapshot.provider_id,
         );
         let pending_reply = ChatMessage {
             id: Uuid::new_v4().to_string(),
@@ -574,6 +748,17 @@ impl AppState {
                 error_message: None,
             }));
 
+        // Resolve provider configuration
+        let provider_config = self
+            .resolve_provider_config(&session_snapshot, &input.provider_id)
+            .await;
+        if let Some(ref config) = provider_config {
+            eprintln!(
+                "[provider] resolved provider for session={session_id}: base_url={} model={:?} format={:?}",
+                config.base_url, config.model, config.format
+            );
+        }
+
         let state = Arc::clone(self);
         let provider = self
             .provider_for_agent(session_snapshot.agent)
@@ -590,9 +775,14 @@ impl AppState {
                     user_message_for_task,
                     system_prompt,
                     pending_reply_for_task,
+                    provider_config,
                 )
                 .await;
             if let Err(error) = result {
+                eprintln!(
+                    "[session] session={} failed: {:#}",
+                    session_id_for_task, error
+                );
                 state
                     .fail_session(&session_id_for_task, error.to_string())
                     .await;
@@ -853,6 +1043,22 @@ impl AppState {
         entry.provider_session_ref = session_ref;
     }
 
+    pub async fn set_codex_provider_name(&self, session_id: &str, name: Option<String>) {
+        let mut runtime = self.runtime.lock().await;
+        let entry = runtime
+            .entry(session_id.to_string())
+            .or_insert_with(SessionRuntimeState::default);
+        entry.codex_provider_name = name;
+    }
+
+    pub async fn codex_provider_name(&self, session_id: &str) -> Option<String> {
+        self.runtime
+            .lock()
+            .await
+            .get(session_id)
+            .and_then(|item| item.codex_provider_name.clone())
+    }
+
     pub async fn provider_session_ref(&self, session_id: &str) -> Option<String> {
         let runtime = self.runtime.lock().await;
         if let Some(item) = runtime
@@ -1072,6 +1278,31 @@ impl AppState {
             self.invalidate_list_cache().await;
             self.refresh_project_summary(&project_id).await;
         }
+    }
+
+    pub async fn update_session_provider(
+        &self,
+        session_id: &str,
+        provider_id: Option<String>,
+    ) -> Result<SessionSummary, String> {
+        let mut sessions = self.sessions.write().await;
+        let mut session = sessions.remove(session_id);
+        drop(sessions);
+        if session.is_none() {
+            session = self.find_session(session_id).await;
+        }
+        let mut current = session.ok_or_else(|| format!("unknown session: {session_id}"))?;
+        current.provider_id = provider_id;
+        current.updated_at = Utc::now();
+        let project_id = current.project_id.clone();
+        let summary = current.clone();
+        self.sessions
+            .write()
+            .await
+            .insert(current.id.clone(), current);
+        self.invalidate_list_cache().await;
+        self.refresh_project_summary(&project_id).await;
+        Ok(summary)
     }
 
     async fn refresh_project_summary(&self, project_id: &str) {

@@ -16,7 +16,7 @@ use axum::{
         IntoResponse,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::{delete, get, post},
+    routing::{delete, get, patch, post},
 };
 use futures_util::stream::{Stream, StreamExt};
 use serde::Deserialize;
@@ -28,7 +28,7 @@ use crate::{
     asr,
     bridge_settings::{BridgeSettings, BridgeSettingsInput},
     models::{
-        AgentInstallInput, AgentKind, AgentSummary, ApiResponse,
+        AgentInstallInput, AgentKind, AgentSummary, ApiError, ApiResponse,
         AppUpdateManifest, ApprovalDecisionInput, AudioSpeechStreamResponse,
         ClientAuthRequestInput, CreateProjectInput, CreateSessionInput, OpenAiAudioSpeechRequest,
         OpenAiErrorDetail, OpenAiErrorResponse, OpenAiModel, OpenAiModelList,
@@ -36,7 +36,7 @@ use crate::{
         OpenAiVerboseTranscriptionSegment, RegisterPushDeviceInput, ReplySummary, SendMessageInput,
         SessionEvent, SpeakerFilterSettingsInput, SpeechModelDownloadInput, SpeechModelKind,
         SpeechProfile, SpeechProfileSelectionInput, SpeechVoiceSelectionInput, SummarizeReplyInput,
-        TriggerClientMessageInput,
+        TriggerClientMessageInput, UpdateSessionInput,
     },
     realtime, speaker,
     speech::{
@@ -97,6 +97,7 @@ pub fn router() -> Router<Arc<AppState>> {
             "/sessions/{id}/messages",
             get(list_messages).post(send_message),
         )
+        .route("/sessions/{id}", patch(update_session))
         .route("/sessions/{id}/summary", post(summarize_reply))
         .route("/agents", get(list_agents))
         .route("/agents/install", post(install_agent_handler))
@@ -116,9 +117,9 @@ struct FileQuery {
     session_id: Option<String>,
 }
 
-async fn app_update_manifest() -> Result<Json<AppUpdateManifest>, StatusCode> {
+async fn app_update_manifest() -> Result<Json<AppUpdateManifest>, ApiError> {
     let Some(apk_path) = find_mobile_apk() else {
-        return Err(StatusCode::NOT_FOUND);
+        return Err(StatusCode::NOT_FOUND.into());
     };
     let version_name =
         read_mobile_version_name().unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
@@ -133,11 +134,11 @@ async fn app_update_manifest() -> Result<Json<AppUpdateManifest>, StatusCode> {
     Ok(Json(manifest))
 }
 
-async fn download_app_update_apk() -> Result<impl IntoResponse, (StatusCode, String)> {
-    let apk_path = find_mobile_apk().ok_or((
-        StatusCode::NOT_FOUND,
-        "mobile apk has not been built".to_string(),
-    ))?;
+async fn download_app_update_apk() -> Result<impl IntoResponse, ApiError> {
+    let apk_path = find_mobile_apk().ok_or(ApiError {
+        status: StatusCode::NOT_FOUND,
+        message: "mobile apk has not been built".to_string(),
+    })?;
     let file_name = apk_path
         .file_name()
         .and_then(|value| value.to_str())
@@ -235,7 +236,7 @@ async fn get_file_by_path(
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
     Query(query): Query<FileQuery>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, ApiError> {
     authorize_request(&headers, &state).await?;
     let file_path = resolve_authorized_file_path(&state, &query).await?;
     let bytes = tokio::fs::read(&file_path)
@@ -266,7 +267,7 @@ async fn update_settings(
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
     Json(input): Json<BridgeSettingsInput>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, ApiError> {
     authorize_request(&headers, &state).await?;
     let settings = state
         .update_bridge_settings(input)
@@ -305,7 +306,7 @@ async fn create_session(
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
     Json(input): Json<CreateSessionInput>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, ApiError> {
     authorize_request(&headers, &state).await?;
     let session = state
         .create_session(input)
@@ -330,7 +331,7 @@ async fn register_push_device(
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
     Json(input): Json<RegisterPushDeviceInput>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, ApiError> {
     authorize_request(&headers, &state).await?;
     let client_id = read_client_id(&headers)?;
     let device = state.register_push_device(client_id, input).await;
@@ -341,12 +342,15 @@ async fn list_project_sessions(
     Path(id): Path<String>,
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
-) -> Result<Json<ApiResponse<Vec<crate::models::SessionSummary>>>, StatusCode> {
+) -> Result<Json<ApiResponse<Vec<crate::models::SessionSummary>>>, ApiError> {
     authorize_request_status(&headers, &state).await?;
     let sessions = state
         .list_project_sessions(&id)
         .await
-        .ok_or(StatusCode::NOT_FOUND)?;
+        .ok_or(ApiError {
+            status: StatusCode::NOT_FOUND,
+            message: "project not found".to_string(),
+        })?;
     Ok(Json(ApiResponse { data: sessions }))
 }
 
@@ -878,7 +882,7 @@ async fn create_speech_download(
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
     Json(input): Json<SpeechModelDownloadInput>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, ApiError> {
     authorize_request(&headers, &state).await?;
     let task = state
         .speech()
@@ -892,19 +896,19 @@ async fn get_speech_download(
     Path(task_id): Path<String>,
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, ApiError> {
     authorize_request(&headers, &state).await?;
-    let task = state.speech().get_download(&task_id).await.ok_or((
-        StatusCode::NOT_FOUND,
-        "speech download task not found".to_string(),
-    ))?;
+    let task = state.speech().get_download(&task_id).await.ok_or(ApiError {
+        status: StatusCode::NOT_FOUND,
+        message: "speech download task not found".to_string(),
+    })?;
     Ok(Json(ApiResponse { data: task }))
 }
 
 async fn list_speakers(
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, ApiError> {
     authorize_request(&headers, &state).await?;
     let speakers = speaker::list_speakers()
         .await
@@ -916,7 +920,7 @@ async fn enroll_speaker(
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
     mut multipart: Multipart,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, ApiError> {
     authorize_request(&headers, &state).await?;
     let mut file_bytes = None;
     let mut file_name = "speaker.wav".to_string();
@@ -980,7 +984,7 @@ async fn delete_speaker(
     Path(speaker_id): Path<String>,
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, ApiError> {
     authorize_request(&headers, &state).await?;
     speaker::delete_speaker(&speaker_id)
         .await
@@ -1001,7 +1005,7 @@ async fn delete_speaker(
 async fn get_speaker_filter(
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, ApiError> {
     authorize_request(&headers, &state).await?;
     Ok(Json(ApiResponse {
         data: state.bridge_settings().await.speaker_filter,
@@ -1012,7 +1016,7 @@ async fn update_speaker_filter(
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
     Json(input): Json<SpeakerFilterSettingsInput>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, ApiError> {
     authorize_request(&headers, &state).await?;
     let settings = speaker::normalize_speaker_filter(crate::models::SpeakerFilterSettings {
         enabled: input.enabled,
@@ -1024,7 +1028,10 @@ async fn update_speaker_filter(
             .await
             .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
         if !speakers.iter().any(|speaker| speaker.id == speaker_id) {
-            return Err((StatusCode::BAD_REQUEST, "unknown speaker_id".to_string()));
+            return Err(ApiError {
+                status: StatusCode::BAD_REQUEST,
+                message: "unknown speaker_id".to_string(),
+            });
         }
     }
     let settings = state
@@ -1039,7 +1046,7 @@ async fn get_speech_model_voice(
     Path(model_id): Path<String>,
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, ApiError> {
     authorize_request(&headers, &state).await?;
     validate_tts_model_voice(&state.speech(), &model_id, None)
         .await
@@ -1058,7 +1065,7 @@ async fn update_speech_model_voice(
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
     Json(input): Json<SpeechVoiceSelectionInput>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, ApiError> {
     authorize_request(&headers, &state).await?;
     let voices = set_tts_model_voice(
         state.settings_store(),
@@ -1075,12 +1082,12 @@ async fn get_speech_profile_model(
     Path(profile): Path<String>,
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, ApiError> {
     authorize_request(&headers, &state).await?;
-    let profile = speech::profile_from_slug(&profile).ok_or((
-        StatusCode::BAD_REQUEST,
-        "unknown speech profile".to_string(),
-    ))?;
+    let profile = speech::profile_from_slug(&profile).ok_or(ApiError {
+        status: StatusCode::BAD_REQUEST,
+        message: "unknown speech profile".to_string(),
+    })?;
     let settings = state.bridge_settings().await;
     Ok(Json(ApiResponse {
         data: serde_json::json!({
@@ -1095,12 +1102,12 @@ async fn update_speech_profile_model(
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
     Json(input): Json<SpeechProfileSelectionInput>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, ApiError> {
     authorize_request(&headers, &state).await?;
-    let profile = speech::profile_from_slug(&profile).ok_or((
-        StatusCode::BAD_REQUEST,
-        "unknown speech profile".to_string(),
-    ))?;
+    let profile = speech::profile_from_slug(&profile).ok_or(ApiError {
+        status: StatusCode::BAD_REQUEST,
+        message: "unknown speech profile".to_string(),
+    })?;
     let profiles = set_profile_model(
         state.settings_store(),
         &state.speech(),
@@ -1440,7 +1447,7 @@ async fn trigger_client_message(
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
     Json(input): Json<TriggerClientMessageInput>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, ApiError> {
     authorize_request(&headers, &state).await?;
     let result = state
         .trigger_client_message(input)
@@ -1454,12 +1461,15 @@ async fn list_messages(
     Path(id): Path<String>,
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
-) -> Result<Json<ApiResponse<Vec<crate::models::ChatMessage>>>, StatusCode> {
+) -> Result<Json<ApiResponse<Vec<crate::models::ChatMessage>>>, ApiError> {
     authorize_request_status(&headers, &state).await?;
     let messages = state
         .list_messages(&id)
         .await
-        .ok_or(StatusCode::NOT_FOUND)?;
+        .ok_or(ApiError {
+            status: StatusCode::NOT_FOUND,
+            message: "session not found".to_string(),
+        })?;
     Ok(Json(ApiResponse { data: messages }))
 }
 
@@ -1468,12 +1478,15 @@ async fn send_message(
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
     Json(input): Json<SendMessageInput>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, ApiError> {
     authorize_request(&headers, &state).await?;
     let (user_message, pending_reply) = state
         .send_message(&id, input)
         .await
-        .map_err(|err| (StatusCode::NOT_FOUND, err))?;
+        .map_err(|err| ApiError {
+            status: StatusCode::NOT_FOUND,
+            message: err,
+        })?;
 
     Ok((
         StatusCode::CREATED,
@@ -1491,7 +1504,7 @@ async fn summarize_reply(
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
     Json(input): Json<SummarizeReplyInput>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, ApiError> {
     authorize_request(&headers, &state).await?;
     let text = state
         .summarize_reply(&id, input.content)
@@ -1506,11 +1519,29 @@ async fn summarize_reply(
     ))
 }
 
+async fn update_session(
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Json(input): Json<UpdateSessionInput>,
+) -> Result<impl IntoResponse, ApiError> {
+    authorize_request(&headers, &state).await?;
+    let provider_id = input.provider_id.flatten();
+    let session = state
+        .update_session_provider(&id, provider_id)
+        .await
+        .map_err(|err| ApiError {
+            status: StatusCode::NOT_FOUND,
+            message: err,
+        })?;
+    Ok(Json(ApiResponse { data: session }))
+}
+
 async fn cancel_session_reply(
     Path(id): Path<String>,
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, ApiError> {
     authorize_request(&headers, &state).await?;
     state
         .cancel_turn(&id)
@@ -1569,7 +1600,7 @@ async fn resolve_approval(
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
     Json(input): Json<ApprovalDecisionInput>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, ApiError> {
     authorize_request(&headers, &state).await?;
     state
         .submit_approval(&id, &request_id, input.choice)
@@ -1583,10 +1614,13 @@ async fn session_events(
     Path(id): Path<String>,
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
     authorize_request_status(&headers, &state).await?;
     if state.list_messages(&id).await.is_none() {
-        return Err(StatusCode::NOT_FOUND);
+        return Err(ApiError {
+            status: StatusCode::NOT_FOUND,
+            message: "session not found".to_string(),
+        });
     }
 
     let stream = BroadcastStream::new(state.subscribe()).filter_map(move |item| {
@@ -1612,7 +1646,7 @@ async fn session_events(
 async fn request_client_auth(
     State(state): State<Arc<AppState>>,
     Json(input): Json<ClientAuthRequestInput>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, ApiError> {
     let record = state
         .request_client_auth(input)
         .await
@@ -1623,34 +1657,43 @@ async fn request_client_auth(
 async fn get_client_auth_request(
     Path(request_id): Path<String>,
     State(state): State<Arc<AppState>>,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> Result<impl IntoResponse, ApiError> {
     let record = state
         .get_client_auth_request(&request_id)
         .await
-        .ok_or(StatusCode::NOT_FOUND)?;
+        .ok_or(ApiError {
+            status: StatusCode::NOT_FOUND,
+            message: "auth request not found".to_string(),
+        })?;
     Ok(Json(ApiResponse { data: record }))
 }
 
 async fn authorize_request(
     headers: &HeaderMap,
     state: &AppState,
-) -> Result<(), (StatusCode, String)> {
+) -> Result<(), ApiError> {
     let client_id = read_client_id(headers)?;
     let runtime_allowed = state.is_runtime_client_id_allowed(client_id).await;
     if !runtime_allowed {
-        return Err((
-            StatusCode::FORBIDDEN,
-            "client id is not allowed".to_string(),
-        ));
+        return Err(ApiError {
+            status: StatusCode::FORBIDDEN,
+            message: "client id is not allowed".to_string(),
+        });
     }
 
     let actual = bearer_token(headers);
-    let actual = actual.ok_or((StatusCode::UNAUTHORIZED, "missing bearer token".to_string()))?;
+    let actual = actual.ok_or(ApiError {
+        status: StatusCode::UNAUTHORIZED,
+        message: "missing bearer token".to_string(),
+    })?;
     if state.client_token_matches(client_id, actual).await {
         return Ok(());
     }
 
-    Err((StatusCode::FORBIDDEN, "invalid bearer token".to_string()))
+    Err(ApiError {
+        status: StatusCode::FORBIDDEN,
+        message: "invalid bearer token".to_string(),
+    })
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -1663,19 +1706,20 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
-fn read_client_id(headers: &HeaderMap) -> Result<&str, (StatusCode, String)> {
+fn read_client_id(headers: &HeaderMap) -> Result<&str, ApiError> {
     headers
         .get("x-omni-code-client-id")
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or((StatusCode::UNAUTHORIZED, "missing client id".to_string()))
+        .ok_or(ApiError {
+            status: StatusCode::UNAUTHORIZED,
+            message: "missing client id".to_string(),
+        })
 }
 
-async fn authorize_request_status(headers: &HeaderMap, state: &AppState) -> Result<(), StatusCode> {
-    authorize_request(headers, state)
-        .await
-        .map_err(|(status, _)| status)
+async fn authorize_request_status(headers: &HeaderMap, state: &AppState) -> Result<(), ApiError> {
+    authorize_request(headers, state).await
 }
 
 fn event_belongs_to_session(event: &SessionEvent, session_id: &str) -> bool {
@@ -1705,10 +1749,10 @@ fn event_name(event: &SessionEvent) -> &'static str {
 async fn resolve_authorized_file_path(
     state: &AppState,
     query: &FileQuery,
-) -> Result<PathBuf, (StatusCode, String)> {
+) -> Result<PathBuf, ApiError> {
     let requested_path = query.path.trim();
     if requested_path.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "path is required".to_string()));
+        return Err((StatusCode::BAD_REQUEST, "path is required".to_string()).into());
     }
 
     let project_id = query
@@ -1726,7 +1770,8 @@ async fn resolve_authorized_file_path(
         return Err((
             StatusCode::BAD_REQUEST,
             "project_id and session_id cannot be used together".to_string(),
-        ));
+        )
+            .into());
     }
 
     let requested_path_buf = PathBuf::from(requested_path);
@@ -1774,7 +1819,8 @@ async fn resolve_authorized_file_path(
     Err((
         StatusCode::BAD_REQUEST,
         "relative path requires project_id or session_id".to_string(),
-    ))
+    )
+        .into())
 }
 
 fn canonicalize_local_directory(path: impl AsRef<StdPath>) -> io::Result<PathBuf> {
@@ -1815,8 +1861,8 @@ fn resolve_path_within_root(root: &StdPath, requested_path: &StdPath) -> io::Res
     ))
 }
 
-fn map_file_resolution_error(requested_path: &str, error: io::Error) -> (StatusCode, String) {
-    match error.kind() {
+fn map_file_resolution_error(requested_path: &str, error: io::Error) -> ApiError {
+    let (status, message) = match error.kind() {
         io::ErrorKind::NotFound => (
             StatusCode::NOT_FOUND,
             format!("file not found: {requested_path}"),
@@ -1830,7 +1876,8 @@ fn map_file_resolution_error(requested_path: &str, error: io::Error) -> (StatusC
             format!("path does not point to a file: {requested_path}"),
         ),
         _ => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
-    }
+    };
+    ApiError { status, message }
 }
 
 fn content_type_for_path(path: &StdPath) -> &'static str {

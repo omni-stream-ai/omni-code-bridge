@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-use crate::models::{SpeakerFilterSettings, SpeechProfileSelection, SpeechVoiceSelection};
+use crate::models::{ModelProviderConfig, SpeakerFilterSettings, SpeechProfileSelection, SpeechVoiceSelection};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiApprovalSettings {
@@ -19,6 +19,9 @@ pub struct AiApprovalSettings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BridgeSettings {
     pub ai_approval: AiApprovalSettings,
+    /// Global model provider configurations (sorted by priority)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_providers: Vec<ModelProviderConfig>,
     #[serde(default)]
     pub speech_profiles: SpeechProfileSelection,
     #[serde(default)]
@@ -30,6 +33,9 @@ pub struct BridgeSettings {
 #[derive(Debug, Clone, Deserialize)]
 pub struct BridgeSettingsInput {
     pub ai_approval: AiApprovalSettings,
+    /// Global model provider configurations (replaces existing list when set)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_providers: Option<Vec<ModelProviderConfig>>,
     #[serde(default)]
     pub speech_profiles: Option<SpeechProfileSelection>,
     #[serde(default)]
@@ -64,6 +70,7 @@ impl Default for BridgeSettings {
     fn default() -> Self {
         Self {
             ai_approval: AiApprovalSettings::default(),
+            model_providers: Vec::new(),
             speech_profiles: SpeechProfileSelection::default(),
             speech_voices: SpeechVoiceSelection::default(),
             speaker_filter: SpeakerFilterSettings::default(),
@@ -132,6 +139,54 @@ pub fn settings_path() -> PathBuf {
         })
 }
 
+/// Project-scoped temporary directory (~/.omni-code/tmp/<subdir>).
+/// Cross-platform: uses the same base directory as settings.
+pub fn project_tmp_dir(subdir: &str) -> PathBuf {
+    default_home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".omni-code")
+        .join("tmp")
+        .join(subdir)
+}
+
+/// Validate a list of model provider configurations
+pub fn validate_model_providers(providers: &[ModelProviderConfig]) -> Result<(), String> {
+    let mut seen_ids = std::collections::HashSet::new();
+
+    for provider in providers {
+        // Validate ID is not empty
+        if provider.id.trim().is_empty() {
+            return Err("provider id must not be empty".to_string());
+        }
+
+        // Validate ID is unique
+        if !seen_ids.insert(&provider.id) {
+            return Err(format!("duplicate provider id: {}", provider.id));
+        }
+
+        // Validate base_url is not empty
+        if provider.base_url.trim().is_empty() {
+            return Err(format!("provider {} base_url must not be empty", provider.id));
+        }
+
+        // Validate base_url starts with http:// or https://
+        let base_url = provider.base_url.trim();
+        if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
+            return Err(format!(
+                "provider {} base_url must start with http:// or https://",
+                provider.id
+            ));
+        }
+
+        // Validate name is not empty
+        if provider.name.trim().is_empty() {
+            return Err(format!("provider {} name must not be empty", provider.id));
+        }
+    }
+
+    Ok(())
+}
+
 fn default_home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
@@ -160,7 +215,7 @@ fn env_bool(name: &str) -> bool {
 mod tests {
     use super::{
         AiApprovalSettings, BridgeSettings, BridgeSettingsInput, BridgeSettingsStore,
-        default_home_dir,
+        ModelProviderConfig, default_home_dir, validate_model_providers,
     };
     use std::{
         path::PathBuf,
@@ -207,6 +262,7 @@ mod tests {
             path: test_path("bridge-settings-update"),
             settings: tokio::sync::RwLock::new(BridgeSettings {
                 ai_approval: AiApprovalSettings::default(),
+                model_providers: Vec::new(),
                 speech_profiles: Default::default(),
                 speech_voices: Default::default(),
                 speaker_filter: Default::default(),
@@ -249,5 +305,104 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("omni-code-bridge-{prefix}-{unique}.json"))
+    }
+
+    #[test]
+    fn validate_model_providers_accepts_valid_config() {
+        let providers = vec![
+            ModelProviderConfig {
+                id: "openai".to_string(),
+                name: "OpenAI".to_string(),
+                base_url: "https://api.openai.com/v1".to_string(),
+                api_key: "sk-test".to_string(),
+                model: Some("gpt-4o".to_string()),
+                format: crate::models::ApiFormat::OpenAiCompatible,
+                enabled: true,
+                priority: 1,
+            },
+            ModelProviderConfig {
+                id: "anthropic".to_string(),
+                name: "Anthropic".to_string(),
+                base_url: "https://api.anthropic.com".to_string(),
+                api_key: "sk-ant-test".to_string(),
+                model: None,
+                format: crate::models::ApiFormat::AnthropicMessages,
+                enabled: true,
+                priority: 2,
+            },
+        ];
+        assert!(validate_model_providers(&providers).is_ok());
+    }
+
+    #[test]
+    fn validate_model_providers_rejects_empty_id() {
+        let providers = vec![ModelProviderConfig {
+            id: "".to_string(),
+            name: "Test".to_string(),
+            base_url: "https://api.example.com".to_string(),
+            api_key: String::new(),
+            model: None,
+            format: crate::models::ApiFormat::OpenAiCompatible,
+            enabled: true,
+            priority: 1,
+        }];
+        assert!(validate_model_providers(&providers).is_err());
+    }
+
+    #[test]
+    fn validate_model_providers_rejects_duplicate_id() {
+        let providers = vec![
+            ModelProviderConfig {
+                id: "same-id".to_string(),
+                name: "First".to_string(),
+                base_url: "https://api.example.com".to_string(),
+                api_key: String::new(),
+                model: None,
+                format: crate::models::ApiFormat::OpenAiCompatible,
+                enabled: true,
+                priority: 1,
+            },
+            ModelProviderConfig {
+                id: "same-id".to_string(),
+                name: "Second".to_string(),
+                base_url: "https://api.other.com".to_string(),
+                api_key: String::new(),
+                model: None,
+                format: crate::models::ApiFormat::OpenAiCompatible,
+                enabled: true,
+                priority: 2,
+            },
+        ];
+        assert!(validate_model_providers(&providers).is_err());
+    }
+
+    #[test]
+    fn validate_model_providers_rejects_empty_base_url() {
+        let providers = vec![ModelProviderConfig {
+            id: "test".to_string(),
+            name: "Test".to_string(),
+            base_url: "".to_string(),
+            api_key: String::new(),
+            model: None,
+            format: crate::models::ApiFormat::OpenAiCompatible,
+            enabled: true,
+            priority: 1,
+        }];
+        assert!(validate_model_providers(&providers).is_err());
+    }
+
+    #[test]
+    fn validate_model_providers_rejects_invalid_base_url() {
+        let providers = vec![ModelProviderConfig {
+            id: "test".to_string(),
+            name: "Test".to_string(),
+            base_url: "ftp://invalid.com".to_string(),
+            api_key: String::new(),
+            model: None,
+            format: crate::models::ApiFormat::OpenAiCompatible,
+            enabled: true,
+            priority: 1,
+        }];
+        assert!(validate_model_providers(&providers).is_err());
     }
 }

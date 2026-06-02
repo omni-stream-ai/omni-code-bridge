@@ -286,6 +286,7 @@ fn parse_session_summary_file(path: &Path) -> Option<ParsedSessionSummaryRecord>
             unread_count: 0,
             last_message_preview: last_preview,
             pending_approval: None,
+            provider_id: None,
         },
         session_file: path.to_path_buf(),
     })

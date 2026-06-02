@@ -1,7 +1,4 @@
-use std::{
-    env,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -39,9 +36,7 @@ pub struct ClaudeHookStatusEvent {
 }
 
 pub fn claude_state_dir() -> PathBuf {
-    env::temp_dir()
-        .join("omni-code-bridge")
-        .join("claude-permissions")
+    crate::bridge_settings::project_tmp_dir("claude-permissions")
 }
 
 fn requests_dir(state_dir: &Path) -> PathBuf {

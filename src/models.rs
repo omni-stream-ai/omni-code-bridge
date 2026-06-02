@@ -1,5 +1,70 @@
+use axum::{
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    Json,
+};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+/// API format for model providers
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ApiFormat {
+    /// OpenAI-compatible API (default for most providers)
+    #[serde(alias = "openai")]
+    OpenAiCompatible,
+    /// Anthropic Messages API (required for Claude Code)
+    #[serde(alias = "anthropic")]
+    AnthropicMessages,
+    /// Codex API (uses JSON-RPC protocol, internally calls OpenAI-compatible API)
+    #[serde(alias = "codex")]
+    Codex,
+}
+
+impl Default for ApiFormat {
+    fn default() -> Self {
+        Self::OpenAiCompatible
+    }
+}
+
+/// Configuration for a model provider (base_url + api_key + optional model)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelProviderConfig {
+    /// Unique identifier for this provider config
+    pub id: String,
+    /// Display name
+    pub name: String,
+    /// API base URL (e.g., "https://api.openai.com/v1")
+    pub base_url: String,
+    /// API key
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub api_key: String,
+    /// Default model for this provider (optional)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// API format (openai-compatible or anthropic-messages)
+    #[serde(default)]
+    pub format: ApiFormat,
+    /// Whether this provider is active
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    /// Priority (lower number = higher priority)
+    #[serde(default)]
+    pub priority: i32,
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+/// Resolved provider configuration for a specific agent execution
+#[derive(Debug, Clone)]
+pub struct ResolvedProviderConfig {
+    pub base_url: String,
+    pub api_key: String,
+    pub model: Option<String>,
+    pub format: ApiFormat,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -52,6 +117,9 @@ pub struct SessionSummary {
     pub last_message_preview: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_approval: Option<ApprovalRequest>,
+    /// Default provider for this session (references provider config id)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,6 +138,17 @@ pub struct CreateSessionInput {
     pub agent: AgentKind,
     #[serde(default)]
     pub brief_reply_mode: bool,
+    /// Default provider for this session (references provider config id)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateSessionInput {
+    /// Set or clear the session-level provider override.
+    /// `Some(id)` overrides, `None` clears (reverts to auto).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<Option<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,6 +180,9 @@ pub struct SendMessageInput {
     pub input_mode: InputMode,
     #[serde(default)]
     pub system_prompt: Option<String>,
+    /// Override provider for this message (references provider config id)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -208,6 +290,38 @@ pub enum SessionEvent {
 #[derive(Debug, Clone, Serialize)]
 pub struct ApiResponse<T> {
     pub data: T,
+}
+
+/// Unified JSON error response: `{"error": "message"}`
+#[derive(Debug)]
+pub struct ApiError {
+    pub status: StatusCode,
+    pub message: String,
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (
+            self.status,
+            Json(serde_json::json!({ "error": self.message })),
+        )
+            .into_response()
+    }
+}
+
+impl From<(StatusCode, String)> for ApiError {
+    fn from((status, message): (StatusCode, String)) -> Self {
+        Self { status, message }
+    }
+}
+
+impl From<StatusCode> for ApiError {
+    fn from(status: StatusCode) -> Self {
+        Self {
+            status,
+            message: status.canonical_reason().unwrap_or("error").to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
