@@ -378,6 +378,89 @@ mod tests {
         assert_eq!(state.finish_text().as_deref(), Some("hello world"));
     }
 
+    #[test]
+    fn context_migration_instructions_include_recent_history_without_current_turn() {
+        let current_input = ChatMessage {
+            id: "input-now".to_string(),
+            session_id: "session".to_string(),
+            role: MessageRole::User,
+            content: "最新问题".to_string(),
+            created_at: chrono::Utc::now(),
+        };
+        let pending_reply = ChatMessage {
+            id: "reply-now".to_string(),
+            session_id: "session".to_string(),
+            role: MessageRole::Assistant,
+            content: String::new(),
+            created_at: chrono::Utc::now(),
+        };
+        let messages = vec![
+            ChatMessage {
+                id: "old-user".to_string(),
+                session_id: "session".to_string(),
+                role: MessageRole::User,
+                content: "先看 provider 配置".to_string(),
+                created_at: chrono::Utc::now(),
+            },
+            ChatMessage {
+                id: "old-assistant".to_string(),
+                session_id: "session".to_string(),
+                role: MessageRole::Assistant,
+                content: "已确认请求体发的是 gpt-5.5".to_string(),
+                created_at: chrono::Utc::now(),
+            },
+            current_input.clone(),
+            pending_reply.clone(),
+        ];
+
+        let instructions =
+            build_context_migration_instructions(&messages, &current_input, &pending_reply)
+                .expect("history should be generated");
+
+        assert!(instructions.contains("先看 provider 配置"));
+        assert!(instructions.contains("已确认请求体发的是 gpt-5.5"));
+        assert!(!instructions.contains("最新问题"));
+    }
+
+    #[test]
+    fn context_migration_instructions_keep_recent_messages_when_history_is_long() {
+        let current_input = ChatMessage {
+            id: "input-now".to_string(),
+            session_id: "session".to_string(),
+            role: MessageRole::User,
+            content: "当前输入".to_string(),
+            created_at: chrono::Utc::now(),
+        };
+        let pending_reply = ChatMessage {
+            id: "reply-now".to_string(),
+            session_id: "session".to_string(),
+            role: MessageRole::Assistant,
+            content: String::new(),
+            created_at: chrono::Utc::now(),
+        };
+        let messages = (0..15)
+            .map(|index| ChatMessage {
+                id: format!("msg-{index}"),
+                session_id: "session".to_string(),
+                role: if index % 2 == 0 {
+                    MessageRole::User
+                } else {
+                    MessageRole::Assistant
+                },
+                content: format!("历史消息 {index}"),
+                created_at: chrono::Utc::now(),
+            })
+            .collect::<Vec<_>>();
+
+        let instructions =
+            build_context_migration_instructions(&messages, &current_input, &pending_reply)
+                .expect("history should be generated");
+
+        assert!(!instructions.contains("历史消息 0"));
+        assert!(!instructions.contains("历史消息 2"));
+        assert!(instructions.contains("历史消息 14"));
+    }
+
     #[tokio::test]
     async fn stub_provider_completes_when_called_directly() {
         let state = Arc::new(AppState::new().await);
@@ -812,31 +895,71 @@ fn spawn_codex_app_server_with_config(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
-    // Apply provider configuration via -c config overrides.
-    // We override both model_provider and model_providers.<name>.base_url
-    // so that codex finds the (only) provider in the replaced table.
+    // Apply provider configuration via -c config overrides while preserving the
+    // user's CODEX_HOME for MCP, trust, and other Codex settings.
+    let mut c_overrides: Vec<String> = Vec::new();
     if let Some(config) = provider_config {
         let name = codex_provider_name.unwrap_or("omni-bridge");
-        // Read the display name from config.toml (might differ from key)
-        let display_name = find_codex_provider_display_name(name).unwrap_or_else(|| name.to_string());
+        let display_name =
+            find_codex_provider_display_name(name).unwrap_or_else(|| name.to_string());
 
-        command.args([
-            "-c", &format!("model_provider={name}"),
-            "-c", &format!("model_providers.{name}.name={display_name}"),
-            "-c", &format!("model_providers.{name}.base_url={}", config.base_url),
-            "-c", &format!("model_providers.{name}.requires_openai_auth=false"),
-        ]);
+        let push_arg = |cmd: &mut Command, vec: &mut Vec<String>, kv: String| {
+            cmd.args(["-c", &kv]);
+            vec.push(kv);
+        };
+        let toml_string = |value: &str| serde_json::to_string(value).expect("string serializes");
+
+        push_arg(
+            &mut command,
+            &mut c_overrides,
+            format!("model_provider={}", toml_string(name)),
+        );
+        push_arg(
+            &mut command,
+            &mut c_overrides,
+            format!("model_providers.{name}.name={}", toml_string(&display_name)),
+        );
+        push_arg(
+            &mut command,
+            &mut c_overrides,
+            format!(
+                "model_providers.{name}.base_url={}",
+                toml_string(&config.base_url)
+            ),
+        );
+        push_arg(
+            &mut command,
+            &mut c_overrides,
+            format!("model_providers.{name}.requires_openai_auth=false"),
+        );
+        push_arg(
+            &mut command,
+            &mut c_overrides,
+            format!("model_providers.{name}.wire_api=\"responses\""),
+        );
         if !config.api_key.is_empty() {
-            command.args(["-c", &format!("model_providers.{name}.api_key={}", config.api_key)]);
+            let auth_env_var = "OMNI_CODEX_PROVIDER_KEY";
+            command.env(auth_env_var, &config.api_key);
+            push_arg(
+                &mut command,
+                &mut c_overrides,
+                format!("model_providers.{name}.env_key={}", toml_string(auth_env_var)),
+            );
         }
         if let Some(ref model) = config.model {
-            command.args(["-c", &format!("model={model}")]);
+            push_arg(
+                &mut command,
+                &mut c_overrides,
+                format!("model={}", toml_string(model)),
+            );
+            push_arg(
+                &mut command,
+                &mut c_overrides,
+                format!("model_providers.{name}.model={}", toml_string(model)),
+            );
         }
-        eprintln!(
-            "[codex] applying -c overrides: provider={name} base_url={}",
-            config.base_url
-        );
     }
+    eprintln!("[codex] full -c args: {c_overrides:#?}");
 
     command
         .spawn()
@@ -972,6 +1095,78 @@ fn turn_system_prompt<'a>(
         prompts.push(prompt.to_string());
     }
     (!prompts.is_empty()).then(|| prompts.join("\n\n"))
+}
+
+fn build_context_migration_instructions(
+    messages: &[ChatMessage],
+    current_input: &ChatMessage,
+    pending_reply: &ChatMessage,
+) -> Option<String> {
+    const MAX_MESSAGES: usize = 12;
+    const MAX_CHARS_PER_MESSAGE: usize = 600;
+    const MAX_TOTAL_CHARS: usize = 4000;
+
+    let mut selected = messages
+        .iter()
+        .filter(|message| message.id != current_input.id && message.id != pending_reply.id)
+        .filter_map(|message| {
+            let content = message.content.trim();
+            if content.is_empty() {
+                return None;
+            }
+            let role = match message.role {
+                crate::models::MessageRole::User => "用户",
+                crate::models::MessageRole::Assistant => "助手",
+                crate::models::MessageRole::System => "系统",
+            };
+            let truncated = truncate_chars(content, MAX_CHARS_PER_MESSAGE);
+            Some(format!("{role}: {truncated}"))
+        })
+        .collect::<Vec<_>>();
+
+    if selected.is_empty() {
+        return None;
+    }
+
+    if selected.len() > MAX_MESSAGES {
+        selected = selected.split_off(selected.len() - MAX_MESSAGES);
+    }
+
+    let mut body = String::new();
+    for line in selected {
+        let extra_len = if body.is_empty() {
+            line.chars().count()
+        } else {
+            line.chars().count() + 1
+        };
+        if body.chars().count() + extra_len > MAX_TOTAL_CHARS {
+            break;
+        }
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        body.push_str(&line);
+    }
+
+    if body.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "这是一次模型或提供方切换后的新线程。请把下面历史对话当作延续上下文，仅用于理解先前约束、决策和未完成事项，不要重复复述给用户。\n\n历史对话摘录：\n{body}"
+    ))
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    let mut result = String::new();
+    for (index, ch) in text.chars().enumerate() {
+        if index >= max_chars {
+            result.push_str("...");
+            break;
+        }
+        result.push(ch);
+    }
+    result
 }
 
 fn codex_binary_path() -> PathBuf {
@@ -1430,16 +1625,25 @@ async fn run_codex(
         .await
         .map(PathBuf::from)
         .map_err(anyhow::Error::msg)?;
-    // Resolve the codex provider name for this session, with fallback chain:
+    // Resolve the codex provider name for this session.
+    // When the bridge explicitly resolved a provider_id (message-level or session-level),
+    // use it directly as the codex provider name — the -c overrides will create the
+    // matching model_providers entry. This avoids mismatches where the fallback chain
+    // picks a different provider name than what the bridge actually configured.
+    //
+    // Fallback chain (when no explicit bridge provider_id):
     // 1. Stored in runtime state (from a previous thread/start by us)
     // 2. Codex session data file (model_provider in session_meta)
     // 3. Current config.toml's model_provider
     // 4. "omni-bridge" as last resort
-    let codex_provider_name = state
-        .codex_provider_name(&session.id)
-        .await
-        .or_else(|| read_codex_session_provider(&session.id))
-        .or_else(find_codex_provider_name);
+    let codex_provider_name = match provider_config.as_ref().and_then(|c| c.provider_id.clone()) {
+        Some(id) => Some(id),
+        None => state
+            .codex_provider_name(&session.id)
+            .await
+            .or_else(|| read_codex_session_provider(&session.id))
+            .or_else(find_codex_provider_name),
+    };
     let mut child = spawn_codex_app_server_with_config(
         &project_root,
         provider_config.as_ref(),
@@ -1464,6 +1668,7 @@ async fn run_codex(
         let mut reader = BufReader::new(stderr).lines();
         let mut output = String::new();
         while let Some(line) = reader.next_line().await? {
+            eprintln!("[codex:stderr] {line}");
             if !output.is_empty() {
                 output.push('\n');
             }
@@ -1514,8 +1719,49 @@ async fn run_codex(
     .await?;
     wait_for_json_rpc_response(&mut stdout_rx, &mut raw_stdout, next_request_id - 1).await?;
 
+    let current_model = provider_config.as_ref().and_then(|c| c.model.clone());
+    let stored_model = state.codex_model(&session.id).await;
     let existing_runtime_ref = state.provider_session_ref(&session.id).await;
-    let developer_instructions = turn_system_prompt(session, system_prompt);
+    let stored_provider_name = state.codex_provider_name(&session.id).await;
+    let can_resume_existing_thread = existing_runtime_ref.is_some()
+        && stored_provider_name == codex_provider_name
+        && stored_model == current_model;
+    let migration_instructions = if existing_runtime_ref.is_some() && !can_resume_existing_thread {
+        state
+            .list_messages(&session.id)
+            .await
+            .and_then(|messages| build_context_migration_instructions(&messages, input, reply))
+    } else {
+        None
+    };
+    let developer_instructions = {
+        let base = turn_system_prompt(session, system_prompt);
+        match (base, migration_instructions) {
+            (Some(base), Some(migration)) => Some(format!("{base}\n\n{migration}")),
+            (Some(base), None) => Some(base),
+            (None, Some(migration)) => Some(migration),
+            (None, None) => None,
+        }
+    };
+
+    if existing_runtime_ref.is_some() && !can_resume_existing_thread {
+        eprintln!(
+            "[codex] not resuming thread for session={}: provider/model changed old_provider={:?} new_provider={:?} old_model={:?} new_model={:?}",
+            session.id,
+            stored_provider_name,
+            codex_provider_name,
+            stored_model,
+            current_model,
+        );
+        state.set_provider_session_ref(&session.id, None).await;
+        state.set_codex_provider_name(&session.id, None).await;
+        state.set_codex_model(&session.id, None).await;
+    }
+    let existing_runtime_ref = if can_resume_existing_thread {
+        existing_runtime_ref
+    } else {
+        None
+    };
 
     // Try to resume existing thread; if it fails (e.g. provider mismatch), fall back to thread/start.
     let thread_response = if let Some(thread_id) = existing_runtime_ref.as_deref() {
@@ -1535,11 +1781,13 @@ async fn run_codex(
             Ok(resp) => {
                 eprintln!("[codex] thread/resume failed, falling back to thread/start: {}", resp);
                 state.set_codex_provider_name(&session.id, None).await;
+                state.set_codex_model(&session.id, None).await;
                 start_codex_thread(&mut stdin, &mut next_request_id, &mut stdout_rx, &mut raw_stdout, &state, &session, &developer_instructions).await?
             }
             Err(e) => {
                 eprintln!("[codex] thread/resume failed, falling back to thread/start: {e}");
                 state.set_codex_provider_name(&session.id, None).await;
+                state.set_codex_model(&session.id, None).await;
                 start_codex_thread(&mut stdin, &mut next_request_id, &mut stdout_rx, &mut raw_stdout, &state, &session, &developer_instructions).await?
             }
         }
@@ -1566,6 +1814,7 @@ async fn run_codex(
         let name = codex_provider_name
             .unwrap_or_else(|| "omni-bridge".to_string());
         state.set_codex_provider_name(&session.id, Some(name)).await;
+        state.set_codex_model(&session.id, current_model).await;
     }
     parsed.session_id = Some(thread_id.clone());
 
@@ -1598,6 +1847,7 @@ async fn run_codex(
                     break;
                 };
                 let line = line.map_err(anyhow::Error::msg)?;
+                eprintln!("[codex:stdout] {line}");
                 idle_sleep.as_mut().reset(tokio::time::Instant::now() + idle_deadline);
                 if !raw_stdout.is_empty() {
                     raw_stdout.push('\n');
@@ -1746,10 +1996,43 @@ async fn run_claude_code(
         .await
         .map(PathBuf::from)
         .map_err(anyhow::Error::msg)?;
+    let current_provider_id = provider_config.as_ref().and_then(|c| c.provider_id.clone());
+    let current_model = provider_config.as_ref().and_then(|c| c.model.clone());
+    let stored_provider_id = state.claude_provider_id(&session.id).await;
+    let stored_model = state.claude_model(&session.id).await;
     let existing_runtime_ref = state.provider_session_ref(&session.id).await;
-    let runtime_ref = existing_runtime_ref
-        .clone()
-        .unwrap_or_else(|| session.id.clone());
+    let can_resume_existing_session = existing_runtime_ref.is_some()
+        && stored_provider_id == current_provider_id
+        && stored_model == current_model;
+    let migration_instructions = if existing_runtime_ref.is_some() && !can_resume_existing_session
+    {
+        state
+            .list_messages(&session.id)
+            .await
+            .and_then(|messages| build_context_migration_instructions(&messages, input, reply))
+    } else {
+        None
+    };
+    if existing_runtime_ref.is_some() && !can_resume_existing_session {
+        eprintln!(
+            "[claude] not resuming session for session={}: provider/model changed old_provider={:?} new_provider={:?} old_model={:?} new_model={:?}",
+            session.id,
+            stored_provider_id,
+            current_provider_id,
+            stored_model,
+            current_model,
+        );
+        state.set_provider_session_ref(&session.id, None).await;
+        state.set_claude_provider_id(&session.id, None).await;
+        state.set_claude_model(&session.id, None).await;
+    }
+    let runtime_ref = if can_resume_existing_session {
+        existing_runtime_ref
+            .clone()
+            .unwrap_or_else(|| session.id.clone())
+    } else {
+        session.id.clone()
+    };
     state
         .set_provider_session_ref(&session.id, Some(runtime_ref.clone()))
         .await;
@@ -1807,10 +2090,19 @@ async fn run_claude_code(
         }
     }
 
-    if let Some(system_prompt) = turn_system_prompt(session, system_prompt) {
+    let combined_system_prompt = {
+        let base = turn_system_prompt(session, system_prompt);
+        match (base, migration_instructions) {
+            (Some(base), Some(migration)) => Some(format!("{base}\n\n{migration}")),
+            (Some(base), None) => Some(base),
+            (None, Some(migration)) => Some(migration),
+            (None, None) => None,
+        }
+    };
+    if let Some(system_prompt) = combined_system_prompt {
         command.arg("--append-system-prompt").arg(system_prompt);
     }
-    if existing_runtime_ref.is_some() {
+    if can_resume_existing_session {
         command.arg("-r").arg(&runtime_ref);
     } else {
         command.arg("--session-id").arg(&runtime_ref);
@@ -1824,6 +2116,10 @@ async fn run_claude_code(
         .kill_on_drop(true);
 
     let mut child = command.spawn().context("failed to spawn `claude`")?;
+    state
+        .set_claude_provider_id(&session.id, current_provider_id)
+        .await;
+    state.set_claude_model(&session.id, current_model).await;
     let stdout = child
         .stdout
         .take()
@@ -2560,12 +2856,21 @@ impl CodexAppServerStreamingState {
                     }
                 }
                 "error" => {
-                    let message = params
-                        .pointer("/error/message")
+                    let error = &params["error"];
+                    let message = error
+                        .get("message")
                         .and_then(Value::as_str)
-                        .unwrap_or("codex app-server error")
-                        .to_string();
-                    CodexAppServerEvent::TurnFailed(message)
+                        .unwrap_or("codex app-server error");
+                    let details = error
+                        .get("additionalDetails")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let full = if details.is_empty() {
+                        message.to_string()
+                    } else {
+                        format!("{message}: {details}")
+                    };
+                    CodexAppServerEvent::TurnFailed(full)
                 }
                 _ => CodexAppServerEvent::Status(format!(
                     "[debug:codex:method] unhandled method={method}"
@@ -3605,7 +3910,7 @@ fn opencode_session_summary(value: &Value) -> Option<SessionSummary> {
         title: title.clone(),
         agent: AgentKind::OpenCode,
         brief_reply_mode: false,
-        status: crate::models::SessionStatus::Waiting,
+        status: crate::models::SessionStatus::Idle,
         updated_at: opencode_time(value.pointer("/time/updated")),
         unread_count: 0,
         last_message_preview: Some(title),

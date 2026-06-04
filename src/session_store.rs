@@ -450,7 +450,7 @@ fn parse_session_summary_file(path: &Path) -> Option<ParsedSessionSummaryRecord>
             title: session_title,
             agent: AgentKind::Codex,
             brief_reply_mode: false,
-            status: SessionStatus::Waiting,
+            status: SessionStatus::Idle,
             updated_at,
             unread_count: 0,
             last_message_preview: last_preview,

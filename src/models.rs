@@ -64,6 +64,9 @@ pub struct ResolvedProviderConfig {
     pub api_key: String,
     pub model: Option<String>,
     pub format: ApiFormat,
+    /// The bridge provider ID that was explicitly specified (message-level or session-level).
+    /// None when auto-selected from the provider list by priority.
+    pub provider_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

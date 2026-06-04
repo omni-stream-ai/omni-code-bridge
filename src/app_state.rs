@@ -1,10 +1,12 @@
 use std::{
     collections::HashMap,
+    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use tokio::{
     sync::{Mutex, RwLock, broadcast, mpsc},
     task::AbortHandle,
@@ -36,11 +38,59 @@ struct SessionRuntimeState {
     /// The codex model_provider name used when creating the current thread.
     /// Stored so we can resume with the same provider (codex binds threads to providers).
     codex_provider_name: Option<String>,
+    /// The model used when creating the current Codex thread.
+    /// Stored so model changes do not accidentally resume an incompatible thread.
+    codex_model: Option<String>,
+    /// The provider ID used when creating the current Claude session.
+    claude_provider_id: Option<String>,
+    /// The model used when creating the current Claude session.
+    claude_model: Option<String>,
     pending_approval: Option<ApprovalRequest>,
     last_resolved_approval_request_id: Option<String>,
     approval_tx: Option<mpsc::UnboundedSender<ApprovalChoice>>,
     turn_abort: Option<AbortHandle>,
     turn_in_flight: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct PersistedSessionRuntimeState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider_session_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    codex_provider_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    codex_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    claude_provider_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    claude_model: Option<String>,
+}
+
+impl SessionRuntimeState {
+    fn from_persisted(value: PersistedSessionRuntimeState) -> Self {
+        Self {
+            provider_session_ref: value.provider_session_ref,
+            codex_provider_name: value.codex_provider_name,
+            codex_model: value.codex_model,
+            claude_provider_id: value.claude_provider_id,
+            claude_model: value.claude_model,
+            pending_approval: None,
+            last_resolved_approval_request_id: None,
+            approval_tx: None,
+            turn_abort: None,
+            turn_in_flight: false,
+        }
+    }
+
+    fn to_persisted(&self) -> PersistedSessionRuntimeState {
+        PersistedSessionRuntimeState {
+            provider_session_ref: self.provider_session_ref.clone(),
+            codex_provider_name: self.codex_provider_name.clone(),
+            codex_model: self.codex_model.clone(),
+            claude_provider_id: self.claude_provider_id.clone(),
+            claude_model: self.claude_model.clone(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -79,6 +129,7 @@ pub struct AppState {
     client_auth: ClientAuthStore,
     push: PushService,
     tts_stream_sessions: Mutex<HashMap<String, TtsStreamSession>>,
+    runtime_store_path: PathBuf,
 }
 
 impl AppState {
@@ -86,13 +137,20 @@ impl AppState {
 
     pub async fn new() -> Self {
         let (event_tx, _) = broadcast::channel(256);
+        let runtime_store_path = runtime_store_path();
+        let persisted_runtime = load_persisted_runtime(&runtime_store_path).await;
         Self {
             projects: RwLock::new(HashMap::new()),
             sessions: RwLock::new(HashMap::new()),
             messages: RwLock::new(HashMap::new()),
             devices: RwLock::new(load_device_registrations()),
             list_cache: Mutex::new(None),
-            runtime: Mutex::new(HashMap::new()),
+            runtime: Mutex::new(
+                persisted_runtime
+                    .into_iter()
+                    .map(|(session_id, value)| (session_id, SessionRuntimeState::from_persisted(value)))
+                    .collect(),
+            ),
             event_tx,
             providers: ProviderRegistry::new(),
             settings: BridgeSettingsStore::load().await,
@@ -100,6 +158,7 @@ impl AppState {
             client_auth: ClientAuthStore::load().await,
             push: PushService::new(),
             tts_stream_sessions: Mutex::new(HashMap::new()),
+            runtime_store_path,
         }
     }
 
@@ -341,6 +400,9 @@ impl AppState {
             SessionRuntimeState {
                 provider_session_ref: None,
                 codex_provider_name: None,
+                codex_model: None,
+                claude_provider_id: None,
+                claude_model: None,
                 pending_approval: None,
                 last_resolved_approval_request_id: None,
                 approval_tx: None,
@@ -517,27 +579,30 @@ impl AppState {
                     api_key: p.api_key.clone(),
                     model: p.model.clone(),
                     format: p.format,
+                    provider_id: None,
                 })
         };
 
-        // 1. Message-level provider_id
+        // 1. Message-level provider_id — direct lookup, no fallback
         if let Some(provider_id) = message_provider_id {
-            eprintln!("[provider] trying message-level provider_id={provider_id}");
+            eprintln!("[provider] looking up message-level provider_id={provider_id}");
             if let Some(config) = self.find_provider_by_id(provider_id, agent, &settings).await {
                 eprintln!("[provider] resolved via message-level: base_url={} model={:?} format={:?}", config.base_url, config.model, config.format);
                 return Some(config);
             }
-            eprintln!("[provider] message-level provider_id={provider_id} not found, falling through");
+            eprintln!("[provider] error: provider_id={provider_id} not found in settings");
+            return None;
         }
 
-        // 2. Session-level provider_id
+        // 2. Session-level provider_id — direct lookup, no fallback
         if let Some(provider_id) = &session.provider_id {
-            eprintln!("[provider] trying session-level provider_id={provider_id}");
+            eprintln!("[provider] looking up session-level provider_id={provider_id}");
             if let Some(config) = self.find_provider_by_id(provider_id, agent, &settings).await {
                 eprintln!("[provider] resolved via session-level: base_url={} model={:?} format={:?}", config.base_url, config.model, config.format);
                 return Some(config);
             }
-            eprintln!("[provider] session-level provider_id={provider_id} not found, falling through");
+            eprintln!("[provider] error: provider_id={provider_id} not found in settings");
+            return None;
         }
 
         // 3. Project-level providers
@@ -634,6 +699,7 @@ impl AppState {
             api_key: provider.api_key.clone(),
             model: provider.model.clone(),
             format: provider.format,
+            provider_id: Some(provider_id.to_string()),
         })
     }
 
@@ -1036,19 +1102,17 @@ impl AppState {
     }
 
     pub async fn set_provider_session_ref(&self, session_id: &str, session_ref: Option<String>) {
-        let mut runtime = self.runtime.lock().await;
-        let entry = runtime
-            .entry(session_id.to_string())
-            .or_insert_with(SessionRuntimeState::default);
-        entry.provider_session_ref = session_ref;
+        self.update_runtime_state(session_id, |entry| {
+            entry.provider_session_ref = session_ref;
+        })
+        .await;
     }
 
     pub async fn set_codex_provider_name(&self, session_id: &str, name: Option<String>) {
-        let mut runtime = self.runtime.lock().await;
-        let entry = runtime
-            .entry(session_id.to_string())
-            .or_insert_with(SessionRuntimeState::default);
-        entry.codex_provider_name = name;
+        self.update_runtime_state(session_id, |entry| {
+            entry.codex_provider_name = name;
+        })
+        .await;
     }
 
     pub async fn codex_provider_name(&self, session_id: &str) -> Option<String> {
@@ -1057,6 +1121,51 @@ impl AppState {
             .await
             .get(session_id)
             .and_then(|item| item.codex_provider_name.clone())
+    }
+
+    pub async fn set_codex_model(&self, session_id: &str, model: Option<String>) {
+        self.update_runtime_state(session_id, |entry| {
+            entry.codex_model = model;
+        })
+        .await;
+    }
+
+    pub async fn codex_model(&self, session_id: &str) -> Option<String> {
+        self.runtime
+            .lock()
+            .await
+            .get(session_id)
+            .and_then(|item| item.codex_model.clone())
+    }
+
+    pub async fn set_claude_provider_id(&self, session_id: &str, provider_id: Option<String>) {
+        self.update_runtime_state(session_id, |entry| {
+            entry.claude_provider_id = provider_id;
+        })
+        .await;
+    }
+
+    pub async fn claude_provider_id(&self, session_id: &str) -> Option<String> {
+        self.runtime
+            .lock()
+            .await
+            .get(session_id)
+            .and_then(|item| item.claude_provider_id.clone())
+    }
+
+    pub async fn set_claude_model(&self, session_id: &str, model: Option<String>) {
+        self.update_runtime_state(session_id, |entry| {
+            entry.claude_model = model;
+        })
+        .await;
+    }
+
+    pub async fn claude_model(&self, session_id: &str) -> Option<String> {
+        self.runtime
+            .lock()
+            .await
+            .get(session_id)
+            .and_then(|item| item.claude_model.clone())
     }
 
     pub async fn provider_session_ref(&self, session_id: &str) -> Option<String> {
@@ -1071,6 +1180,29 @@ impl AppState {
         let session = self.find_session(session_id).await?;
         let provider = self.provider_for_agent(session.agent)?;
         provider.default_runtime_ref(session_id).await
+    }
+
+    async fn update_runtime_state<F>(&self, session_id: &str, update: F)
+    where
+        F: FnOnce(&mut SessionRuntimeState),
+    {
+        let snapshot = {
+            let mut runtime = self.runtime.lock().await;
+            let entry = runtime
+                .entry(session_id.to_string())
+                .or_insert_with(SessionRuntimeState::default);
+            update(entry);
+            runtime
+                .iter()
+                .map(|(session_id, state)| (session_id.clone(), state.to_persisted()))
+                .collect::<HashMap<_, _>>()
+        };
+        if let Err(error) = write_persisted_runtime(&self.runtime_store_path, &snapshot).await {
+            eprintln!(
+                "failed to persist session runtime metadata at {}: {error}",
+                self.runtime_store_path.display()
+            );
+        }
     }
 
     pub async fn project_root_path_for_session(&self, session_id: &str) -> Result<String, String> {
@@ -1527,6 +1659,36 @@ impl AppState {
     ) -> Option<Arc<dyn crate::adapter::AgentProvider>> {
         self.providers.get(agent)
     }
+}
+
+async fn load_persisted_runtime(
+    path: &PathBuf,
+) -> HashMap<String, PersistedSessionRuntimeState> {
+    match tokio::fs::read_to_string(path).await {
+        Ok(body) => serde_json::from_str::<HashMap<String, PersistedSessionRuntimeState>>(&body)
+            .unwrap_or_default(),
+        Err(_) => HashMap::new(),
+    }
+}
+
+async fn write_persisted_runtime(
+    path: &PathBuf,
+    runtime: &HashMap<String, PersistedSessionRuntimeState>,
+) -> Result<(), std::io::Error> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let body = serde_json::to_string_pretty(runtime)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    tokio::fs::write(path, body).await
+}
+
+fn runtime_store_path() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".omni-code")
+        .join("session-runtime.json")
 }
 
 fn approval_choice_preview(choice: &ApprovalChoice) -> &'static str {
