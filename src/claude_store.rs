@@ -285,6 +285,7 @@ fn parse_session_summary_file(path: &Path) -> Option<ParsedSessionSummaryRecord>
             updated_at,
             unread_count: 0,
             last_message_preview: last_preview,
+            git_branch: None,
             pending_approval: None,
             provider_id: None,
         },

@@ -461,6 +461,26 @@ mod tests {
         assert!(instructions.contains("历史消息 14"));
     }
 
+    #[test]
+    fn codex_thread_action_resumes_when_provider_matches_even_if_model_changes() {
+        assert_eq!(
+            decide_codex_thread_action(Some("thread-1"), Some("provider-a"), Some("provider-a")),
+            CodexThreadDecision::Resume
+        );
+    }
+
+    #[test]
+    fn codex_thread_action_migrates_when_provider_changes() {
+        assert_eq!(
+            decide_codex_thread_action(Some("thread-1"), Some("provider-a"), Some("provider-b")),
+            CodexThreadDecision::StartWithMigration
+        );
+        assert_eq!(
+            decide_codex_thread_action(None, Some("provider-a"), Some("provider-a")),
+            CodexThreadDecision::StartFresh
+        );
+    }
+
     #[tokio::test]
     async fn stub_provider_completes_when_called_directly() {
         let state = Arc::new(AppState::new().await);
@@ -475,6 +495,7 @@ mod tests {
             updated_at: chrono::Utc::now(),
             unread_count: 0,
             last_message_preview: None,
+            git_branch: None,
             pending_approval: None,
             provider_id: None,
         };
@@ -674,7 +695,15 @@ impl AgentProvider for CodexProvider {
         reply: ChatMessage,
         provider_config: Option<ResolvedProviderConfig>,
     ) -> Result<()> {
-        run_codex(state, &session, &input, system_prompt.as_deref(), &reply, provider_config).await
+        run_codex(
+            state,
+            &session,
+            &input,
+            system_prompt.as_deref(),
+            &reply,
+            provider_config,
+        )
+        .await
     }
 
     async fn summarize_reply(
@@ -798,7 +827,15 @@ impl AgentProvider for ClaudeCodeProvider {
         reply: ChatMessage,
         provider_config: Option<ResolvedProviderConfig>,
     ) -> Result<()> {
-        run_claude_code(state, &session, &input, system_prompt.as_deref(), &reply, provider_config).await
+        run_claude_code(
+            state,
+            &session,
+            &input,
+            system_prompt.as_deref(),
+            &reply,
+            provider_config,
+        )
+        .await
     }
 
     async fn summarize_reply(
@@ -863,7 +900,15 @@ impl AgentProvider for OpenCodeProvider {
         reply: ChatMessage,
         provider_config: Option<ResolvedProviderConfig>,
     ) -> Result<()> {
-        run_opencode(state, &session, &input, system_prompt.as_deref(), &reply, provider_config).await
+        run_opencode(
+            state,
+            &session,
+            &input,
+            system_prompt.as_deref(),
+            &reply,
+            provider_config,
+        )
+        .await
     }
 
     async fn summarize_reply(
@@ -895,19 +940,32 @@ fn spawn_codex_app_server_with_config(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
+    let mut c_overrides: Vec<String> = Vec::new();
+    let push_arg = |cmd: &mut Command, vec: &mut Vec<String>, kv: String| {
+        cmd.args(["-c", &kv]);
+        vec.push(kv);
+    };
+    let toml_string = |value: &str| serde_json::to_string(value).expect("string serializes");
+
+    // Force manual approval routing for app-server clients. `approval_policy`
+    // alone is not enough when Codex config enables an automatic reviewer.
+    push_arg(
+        &mut command,
+        &mut c_overrides,
+        "approval_policy=\"on-request\"".to_string(),
+    );
+    push_arg(
+        &mut command,
+        &mut c_overrides,
+        "approvals_reviewer=\"user\"".to_string(),
+    );
+
     // Apply provider configuration via -c config overrides while preserving the
     // user's CODEX_HOME for MCP, trust, and other Codex settings.
-    let mut c_overrides: Vec<String> = Vec::new();
     if let Some(config) = provider_config {
         let name = codex_provider_name.unwrap_or("omni-bridge");
         let display_name =
             find_codex_provider_display_name(name).unwrap_or_else(|| name.to_string());
-
-        let push_arg = |cmd: &mut Command, vec: &mut Vec<String>, kv: String| {
-            cmd.args(["-c", &kv]);
-            vec.push(kv);
-        };
-        let toml_string = |value: &str| serde_json::to_string(value).expect("string serializes");
 
         push_arg(
             &mut command,
@@ -943,7 +1001,10 @@ fn spawn_codex_app_server_with_config(
             push_arg(
                 &mut command,
                 &mut c_overrides,
-                format!("model_providers.{name}.env_key={}", toml_string(auth_env_var)),
+                format!(
+                    "model_providers.{name}.env_key={}",
+                    toml_string(auth_env_var)
+                ),
             );
         }
         if let Some(ref model) = config.model {
@@ -1080,6 +1141,31 @@ fn brief_reply_developer_prompt(session: &SessionSummary) -> Option<&'static str
     )
 }
 
+fn log_codex_thread_response(session_id: &str, response: &Value) {
+    let thread_id = response
+        .pointer("/thread/id")
+        .or_else(|| response.pointer("/thread/threadId"))
+        .and_then(Value::as_str)
+        .unwrap_or("<missing>");
+    let approval_policy = response
+        .pointer("/thread/approvalPolicy")
+        .or_else(|| response.pointer("/thread/approval_policy"))
+        .or_else(|| response.pointer("/approvalPolicy"))
+        .or_else(|| response.pointer("/approval_policy"))
+        .and_then(Value::as_str)
+        .unwrap_or("<missing>");
+    let approvals_reviewer = response
+        .pointer("/thread/approvalsReviewer")
+        .or_else(|| response.pointer("/thread/approvals_reviewer"))
+        .or_else(|| response.pointer("/approvalsReviewer"))
+        .or_else(|| response.pointer("/approvals_reviewer"))
+        .and_then(Value::as_str)
+        .unwrap_or("<missing>");
+    eprintln!(
+        "[codex] thread response session={session_id} thread={thread_id} approvalPolicy={approval_policy} approvalsReviewer={approvals_reviewer}"
+    );
+}
+
 fn turn_system_prompt<'a>(
     session: &SessionSummary,
     system_prompt: Option<&'a str>,
@@ -1095,6 +1181,18 @@ fn turn_system_prompt<'a>(
         prompts.push(prompt.to_string());
     }
     (!prompts.is_empty()).then(|| prompts.join("\n\n"))
+}
+
+fn combine_developer_instructions(
+    base: Option<String>,
+    migration: Option<String>,
+) -> Option<String> {
+    match (base, migration) {
+        (Some(base), Some(migration)) => Some(format!("{base}\n\n{migration}")),
+        (Some(base), None) => Some(base),
+        (None, Some(migration)) => Some(migration),
+        (None, None) => None,
+    }
 }
 
 fn build_context_migration_instructions(
@@ -1155,6 +1253,29 @@ fn build_context_migration_instructions(
     Some(format!(
         "这是一次模型或提供方切换后的新线程。请把下面历史对话当作延续上下文，仅用于理解先前约束、决策和未完成事项，不要重复复述给用户。\n\n历史对话摘录：\n{body}"
     ))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexThreadDecision {
+    StartFresh,
+    Resume,
+    StartWithMigration,
+}
+
+fn decide_codex_thread_action(
+    existing_runtime_ref: Option<&str>,
+    stored_provider_name: Option<&str>,
+    current_provider_name: Option<&str>,
+) -> CodexThreadDecision {
+    if existing_runtime_ref.is_none() {
+        return CodexThreadDecision::StartFresh;
+    }
+
+    if stored_provider_name == current_provider_name {
+        CodexThreadDecision::Resume
+    } else {
+        CodexThreadDecision::StartWithMigration
+    }
 }
 
 fn truncate_chars(text: &str, max_chars: usize) -> String {
@@ -1229,9 +1350,8 @@ fn opencode_config_path() -> PathBuf {
 /// Returns the path to the temp config file.
 fn write_opencode_overlay_config(config: &ResolvedProviderConfig) -> Result<PathBuf> {
     let original_path = opencode_config_path();
-    let original = std::fs::read_to_string(&original_path).unwrap_or_else(|_| {
-        r#"{"provider":{}}"#.to_string()
-    });
+    let original = std::fs::read_to_string(&original_path)
+        .unwrap_or_else(|_| r#"{"provider":{}}"#.to_string());
     let modified = modify_opencode_config(&original, config);
     let overlay = crate::bridge_settings::project_tmp_dir("opencode-overlay");
     std::fs::create_dir_all(&overlay)?;
@@ -1324,7 +1444,10 @@ impl OpenCodeHttpClient {
             match write_opencode_overlay_config(config) {
                 Ok(path) => {
                     command.env("OPENCODE_CONFIG", &path);
-                    eprintln!("[opencode] using overlay config: base_url={}", config.base_url);
+                    eprintln!(
+                        "[opencode] using overlay config: base_url={}",
+                        config.base_url
+                    );
                 }
                 Err(err) => {
                     eprintln!("[opencode] warning: failed to create overlay config: {err}");
@@ -1723,10 +1846,12 @@ async fn run_codex(
     let stored_model = state.codex_model(&session.id).await;
     let existing_runtime_ref = state.provider_session_ref(&session.id).await;
     let stored_provider_name = state.codex_provider_name(&session.id).await;
-    let can_resume_existing_thread = existing_runtime_ref.is_some()
-        && stored_provider_name == codex_provider_name
-        && stored_model == current_model;
-    let migration_instructions = if existing_runtime_ref.is_some() && !can_resume_existing_thread {
+    let thread_decision = decide_codex_thread_action(
+        existing_runtime_ref.as_deref(),
+        stored_provider_name.as_deref(),
+        codex_provider_name.as_deref(),
+    );
+    let migration_instructions = if thread_decision == CodexThreadDecision::StartWithMigration {
         state
             .list_messages(&session.id)
             .await
@@ -1734,30 +1859,25 @@ async fn run_codex(
     } else {
         None
     };
-    let developer_instructions = {
-        let base = turn_system_prompt(session, system_prompt);
-        match (base, migration_instructions) {
-            (Some(base), Some(migration)) => Some(format!("{base}\n\n{migration}")),
-            (Some(base), None) => Some(base),
-            (None, Some(migration)) => Some(migration),
-            (None, None) => None,
-        }
-    };
+    let base_developer_instructions = turn_system_prompt(session, system_prompt);
+    let developer_instructions =
+        combine_developer_instructions(base_developer_instructions.clone(), migration_instructions);
 
-    if existing_runtime_ref.is_some() && !can_resume_existing_thread {
+    if thread_decision == CodexThreadDecision::StartWithMigration {
         eprintln!(
-            "[codex] not resuming thread for session={}: provider/model changed old_provider={:?} new_provider={:?} old_model={:?} new_model={:?}",
-            session.id,
-            stored_provider_name,
-            codex_provider_name,
-            stored_model,
-            current_model,
+            "[codex] not resuming thread for session={}: provider changed old_provider={:?} new_provider={:?} old_model={:?} new_model={:?}",
+            session.id, stored_provider_name, codex_provider_name, stored_model, current_model,
         );
         state.set_provider_session_ref(&session.id, None).await;
         state.set_codex_provider_name(&session.id, None).await;
         state.set_codex_model(&session.id, None).await;
+    } else if thread_decision == CodexThreadDecision::Resume && stored_model != current_model {
+        eprintln!(
+            "[codex] attempting thread/resume across model change for session={}: provider={:?} old_model={:?} new_model={:?}",
+            session.id, codex_provider_name, stored_model, current_model,
+        );
     }
-    let existing_runtime_ref = if can_resume_existing_thread {
+    let existing_runtime_ref = if thread_decision == CodexThreadDecision::Resume {
         existing_runtime_ref
     } else {
         None
@@ -1771,6 +1891,9 @@ async fn run_codex(
             "thread/resume",
             serde_json::json!({
                 "threadId": thread_id,
+                "approvalPolicy": "on-request",
+                "approvalsReviewer": "user",
+                "sandbox": "workspace-write",
                 "persistExtendedHistory": false,
                 "developerInstructions": developer_instructions,
             }),
@@ -1779,21 +1902,64 @@ async fn run_codex(
         match wait_for_json_rpc_response(&mut stdout_rx, &mut raw_stdout, resume_id).await {
             Ok(resp) if resp.get("error").is_none() => resp,
             Ok(resp) => {
-                eprintln!("[codex] thread/resume failed, falling back to thread/start: {}", resp);
+                eprintln!(
+                    "[codex] thread/resume failed, falling back to thread/start: {}",
+                    resp
+                );
                 state.set_codex_provider_name(&session.id, None).await;
                 state.set_codex_model(&session.id, None).await;
-                start_codex_thread(&mut stdin, &mut next_request_id, &mut stdout_rx, &mut raw_stdout, &state, &session, &developer_instructions).await?
+                let fallback_developer_instructions = combine_developer_instructions(
+                    base_developer_instructions.clone(),
+                    state.list_messages(&session.id).await.and_then(|messages| {
+                        build_context_migration_instructions(&messages, input, reply)
+                    }),
+                );
+                start_codex_thread(
+                    &mut stdin,
+                    &mut next_request_id,
+                    &mut stdout_rx,
+                    &mut raw_stdout,
+                    &state,
+                    &session,
+                    &fallback_developer_instructions,
+                )
+                .await?
             }
             Err(e) => {
                 eprintln!("[codex] thread/resume failed, falling back to thread/start: {e}");
                 state.set_codex_provider_name(&session.id, None).await;
                 state.set_codex_model(&session.id, None).await;
-                start_codex_thread(&mut stdin, &mut next_request_id, &mut stdout_rx, &mut raw_stdout, &state, &session, &developer_instructions).await?
+                let fallback_developer_instructions = combine_developer_instructions(
+                    base_developer_instructions.clone(),
+                    state.list_messages(&session.id).await.and_then(|messages| {
+                        build_context_migration_instructions(&messages, input, reply)
+                    }),
+                );
+                start_codex_thread(
+                    &mut stdin,
+                    &mut next_request_id,
+                    &mut stdout_rx,
+                    &mut raw_stdout,
+                    &state,
+                    &session,
+                    &fallback_developer_instructions,
+                )
+                .await?
             }
         }
     } else {
-        start_codex_thread(&mut stdin, &mut next_request_id, &mut stdout_rx, &mut raw_stdout, &state, &session, &developer_instructions).await?
+        start_codex_thread(
+            &mut stdin,
+            &mut next_request_id,
+            &mut stdout_rx,
+            &mut raw_stdout,
+            &state,
+            &session,
+            &developer_instructions,
+        )
+        .await?
     };
+    log_codex_thread_response(&session.id, &thread_response);
     let thread_id = thread_response
         .pointer("/thread/id")
         .and_then(Value::as_str)
@@ -1811,8 +1977,7 @@ async fn run_codex(
         .await;
     // Store the provider name so future resumes use the same provider
     if provider_config.is_some() {
-        let name = codex_provider_name
-            .unwrap_or_else(|| "omni-bridge".to_string());
+        let name = codex_provider_name.unwrap_or_else(|| "omni-bridge".to_string());
         state.set_codex_provider_name(&session.id, Some(name)).await;
         state.set_codex_model(&session.id, current_model).await;
     }
@@ -2004,8 +2169,7 @@ async fn run_claude_code(
     let can_resume_existing_session = existing_runtime_ref.is_some()
         && stored_provider_id == current_provider_id
         && stored_model == current_model;
-    let migration_instructions = if existing_runtime_ref.is_some() && !can_resume_existing_session
-    {
+    let migration_instructions = if existing_runtime_ref.is_some() && !can_resume_existing_session {
         state
             .list_messages(&session.id)
             .await
@@ -2016,11 +2180,7 @@ async fn run_claude_code(
     if existing_runtime_ref.is_some() && !can_resume_existing_session {
         eprintln!(
             "[claude] not resuming session for session={}: provider/model changed old_provider={:?} new_provider={:?} old_model={:?} new_model={:?}",
-            session.id,
-            stored_provider_id,
-            current_provider_id,
-            stored_model,
-            current_model,
+            session.id, stored_provider_id, current_provider_id, stored_model, current_model,
         );
         state.set_provider_session_ref(&session.id, None).await;
         state.set_claude_provider_id(&session.id, None).await;
@@ -2295,7 +2455,13 @@ async fn run_opencode(
     let system = turn_system_prompt(session, system_prompt);
     let model = provider_config.as_ref().and_then(|c| c.model.as_deref());
     client
-        .prompt_async(&opencode_session_id, &project_root, &input.content, system.as_deref(), model)
+        .prompt_async(
+            &opencode_session_id,
+            &project_root,
+            &input.content,
+            system.as_deref(),
+            model,
+        )
         .await
         .context("failed to send opencode prompt")?;
     let mut event_stream = client
@@ -2684,7 +2850,13 @@ async fn summarize_with_opencode(
         .await
         .context("failed to create opencode summary session")?;
     client
-        .prompt_async(&session_id, &project_root, &summary_prompt(content), None, None)
+        .prompt_async(
+            &session_id,
+            &project_root,
+            &summary_prompt(content),
+            None,
+            None,
+        )
         .await
         .context("failed to send opencode summary prompt")?;
     wait_for_opencode_session_idle(&mut client, &session_id, &project_root).await?;
@@ -3125,6 +3297,7 @@ async fn send_json_rpc_request(
         }),
     )
     .await?;
+    eprintln!("[codex:jsonrpc:send] id={request_id} method={method}");
     Ok(request_id)
 }
 
@@ -3144,7 +3317,9 @@ async fn send_json_rpc_response(
             "result": result,
         }),
     )
-    .await
+    .await?;
+    eprintln!("[codex:jsonrpc:send-response] id={request_id}");
+    Ok(())
 }
 
 async fn write_json_line(writer: &mut (impl AsyncWrite + Unpin), value: &Value) -> Result<()> {
@@ -3170,6 +3345,7 @@ async fn wait_for_json_rpc_response(
             raw_stdout.push('\n');
         }
         raw_stdout.push_str(&line);
+        eprintln!("[codex:jsonrpc:recv] {line}");
         let value: Value = serde_json::from_str(&line)
             .with_context(|| "codex app-server produced invalid JSON")?;
         if value.get("id").and_then(jsonrpc_id_to_string).as_deref()
@@ -3914,6 +4090,7 @@ fn opencode_session_summary(value: &Value) -> Option<SessionSummary> {
         updated_at: opencode_time(value.pointer("/time/updated")),
         unread_count: 0,
         last_message_preview: Some(title),
+        git_branch: None,
         pending_approval: None,
         provider_id: None,
     })
@@ -4359,15 +4536,23 @@ fn is_windows() -> bool {
 }
 
 async fn command_exists(name: &str) -> bool {
-    tokio::process::Command::new(if cfg!(target_os = "windows") { "where" } else { "which" })
-        .arg(name)
-        .output()
-        .await
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    tokio::process::Command::new(if cfg!(target_os = "windows") {
+        "where"
+    } else {
+        "which"
+    })
+    .arg(name)
+    .output()
+    .await
+    .map(|o| o.status.success())
+    .unwrap_or(false)
 }
 
-async fn try_install_with_npm(agent: AgentKind, npm_package: &str, binary_name: &str) -> Option<crate::models::AgentInstallResult> {
+async fn try_install_with_npm(
+    agent: AgentKind,
+    npm_package: &str,
+    binary_name: &str,
+) -> Option<crate::models::AgentInstallResult> {
     if !command_exists("npm").await {
         return None;
     }
@@ -4379,8 +4564,8 @@ async fn try_install_with_npm(agent: AgentKind, npm_package: &str, binary_name: 
 
     match result {
         Ok(output) if output.status.success() => {
-            let path = find_executable_in_path(binary_name)
-                .unwrap_or_else(|| PathBuf::from(binary_name));
+            let path =
+                find_executable_in_path(binary_name).unwrap_or_else(|| PathBuf::from(binary_name));
             Some(crate::models::AgentInstallResult {
                 agent,
                 success: true,
@@ -4392,7 +4577,11 @@ async fn try_install_with_npm(agent: AgentKind, npm_package: &str, binary_name: 
     }
 }
 
-async fn try_install_with_brew(agent: AgentKind, brew_package: &str, binary_name: &str) -> Option<crate::models::AgentInstallResult> {
+async fn try_install_with_brew(
+    agent: AgentKind,
+    brew_package: &str,
+    binary_name: &str,
+) -> Option<crate::models::AgentInstallResult> {
     if !is_macos() || !command_exists("brew").await {
         return None;
     }
@@ -4404,8 +4593,8 @@ async fn try_install_with_brew(agent: AgentKind, brew_package: &str, binary_name
 
     match result {
         Ok(output) if output.status.success() => {
-            let path = find_executable_in_path(binary_name)
-                .unwrap_or_else(|| PathBuf::from(binary_name));
+            let path =
+                find_executable_in_path(binary_name).unwrap_or_else(|| PathBuf::from(binary_name));
             Some(crate::models::AgentInstallResult {
                 agent,
                 success: true,
@@ -4438,12 +4627,16 @@ async fn try_install_with_script(
             .await
     };
 
-    let used_url = if is_windows() { windows_script_url.unwrap_or(unix_script_url) } else { unix_script_url };
+    let used_url = if is_windows() {
+        windows_script_url.unwrap_or(unix_script_url)
+    } else {
+        unix_script_url
+    };
 
     match result {
         Ok(output) if output.status.success() => {
-            let path = find_executable_in_path(binary_name)
-                .unwrap_or_else(|| PathBuf::from(binary_name));
+            let path =
+                find_executable_in_path(binary_name).unwrap_or_else(|| PathBuf::from(binary_name));
             Some(crate::models::AgentInstallResult {
                 agent,
                 success: true,
@@ -4457,39 +4650,51 @@ async fn try_install_with_script(
 
 pub fn manual_install_hint(agent: AgentKind) -> String {
     match agent {
-        AgentKind::Codex => {
-            "Please install manually:\n  \
+        AgentKind::Codex => "Please install manually:\n  \
              npm: npm install -g @openai/codex\n  \
              brew: brew install --cask codex\n  \
              script: curl -fsSL https://chatgpt.com/codex/install.sh | sh\n  \
              Windows: powershell -Command \"irm https://chatgpt.com/codex/install.ps1 | iex\""
-                .to_string()
-        }
-        AgentKind::ClaudeCode => {
-            "Please install manually:\n  \
+            .to_string(),
+        AgentKind::ClaudeCode => "Please install manually:\n  \
              script: curl -fsSL https://claude.ai/install.sh | bash\n  \
              brew: brew install --cask claude-code\n  \
              Windows: powershell -Command \"irm https://claude.ai/install.ps1 | iex\"\n  \
              npm (deprecated): npm install -g @anthropic-ai/claude-code"
-                .to_string()
-        }
-        AgentKind::OpenCode => {
-            "Please install manually:\n  \
+            .to_string(),
+        AgentKind::OpenCode => "Please install manually:\n  \
              npm: npm i -g opencode-ai@latest\n  \
              brew: brew install anomalyco/tap/opencode\n  \
              script: curl -fsSL https://opencode.ai/install | bash\n  \
              Windows: scoop install opencode"
-                .to_string()
-        }
+            .to_string(),
         AgentKind::Custom => "Custom agent does not support auto-install".to_string(),
     }
 }
 
 pub async fn install_agent(agent: AgentKind) -> crate::models::AgentInstallResult {
     let (binary_name, npm_package, brew_package, unix_script, windows_script) = match agent {
-        AgentKind::Codex => ("codex", "@openai/codex", "codex", "https://chatgpt.com/codex/install.sh", Some("https://chatgpt.com/codex/install.ps1")),
-        AgentKind::ClaudeCode => ("claude", "@anthropic-ai/claude-code", "claude-code", "https://claude.ai/install.sh", Some("https://claude.ai/install.ps1")),
-        AgentKind::OpenCode => ("opencode", "opencode-ai", "anomalyco/tap/opencode", "https://opencode.ai/install", None),
+        AgentKind::Codex => (
+            "codex",
+            "@openai/codex",
+            "codex",
+            "https://chatgpt.com/codex/install.sh",
+            Some("https://chatgpt.com/codex/install.ps1"),
+        ),
+        AgentKind::ClaudeCode => (
+            "claude",
+            "@anthropic-ai/claude-code",
+            "claude-code",
+            "https://claude.ai/install.sh",
+            Some("https://claude.ai/install.ps1"),
+        ),
+        AgentKind::OpenCode => (
+            "opencode",
+            "opencode-ai",
+            "anomalyco/tap/opencode",
+            "https://opencode.ai/install",
+            None,
+        ),
         AgentKind::Custom => {
             return crate::models::AgentInstallResult {
                 agent,
@@ -4506,7 +4711,9 @@ pub async fn install_agent(agent: AgentKind) -> crate::models::AgentInstallResul
     if let Some(result) = try_install_with_brew(agent, brew_package, binary_name).await {
         return result;
     }
-    if let Some(result) = try_install_with_script(agent, unix_script, windows_script, binary_name).await {
+    if let Some(result) =
+        try_install_with_script(agent, unix_script, windows_script, binary_name).await
+    {
         return result;
     }
 

@@ -4,7 +4,9 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-use crate::models::{ModelProviderConfig, SpeakerFilterSettings, SpeechProfileSelection, SpeechVoiceSelection};
+use crate::models::{
+    ModelProviderConfig, SpeakerFilterSettings, SpeechProfileSelection, SpeechVoiceSelection,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiApprovalSettings {
@@ -166,7 +168,10 @@ pub fn validate_model_providers(providers: &[ModelProviderConfig]) -> Result<(),
 
         // Validate base_url is not empty
         if provider.base_url.trim().is_empty() {
-            return Err(format!("provider {} base_url must not be empty", provider.id));
+            return Err(format!(
+                "provider {} base_url must not be empty",
+                provider.id
+            ));
         }
 
         // Validate base_url starts with http:// or https://

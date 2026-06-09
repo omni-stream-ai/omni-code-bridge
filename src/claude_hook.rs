@@ -159,10 +159,7 @@ pub async fn run_permission_hook(
         request_id: uuid::Uuid::new_v4().to_string(),
         kind: ApprovalKind::ExecCommand,
         command: Some(command.clone()),
-        reason: Some(format!(
-            "Claude requests {}",
-            tool_name.unwrap_or("Bash")
-        )),
+        reason: Some(format!("Claude requests {}", tool_name.unwrap_or("Bash"))),
         allow_accept_for_session: false,
         allow_cancel: true,
         resolvable: true,
@@ -323,7 +320,6 @@ impl ClaudePermissionRequest {
         }
     }
 }
-
 
 fn summarize_hook_status_event(
     hook_event_name: &str,

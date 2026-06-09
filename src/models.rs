@@ -1,7 +1,7 @@
 use axum::{
+    Json,
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -94,6 +94,7 @@ pub enum SessionStatus {
     Idle,
     Running,
     AwaitingApproval,
+    Interrupted,
     Waiting,
     Failed,
 }
@@ -118,6 +119,8 @@ pub struct SessionSummary {
     pub updated_at: DateTime<Utc>,
     pub unread_count: u32,
     pub last_message_preview: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_branch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_approval: Option<ApprovalRequest>,
     /// Default provider for this session (references provider config id)

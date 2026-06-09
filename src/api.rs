@@ -28,14 +28,14 @@ use crate::{
     asr,
     bridge_settings::{BridgeSettings, BridgeSettingsInput},
     models::{
-        AgentInstallInput, AgentKind, AgentSummary, ApiError, ApiResponse,
-        AppUpdateManifest, ApprovalDecisionInput, AudioSpeechStreamResponse,
-        ClientAuthRequestInput, CreateProjectInput, CreateSessionInput, OpenAiAudioSpeechRequest,
-        OpenAiErrorDetail, OpenAiErrorResponse, OpenAiModel, OpenAiModelList,
-        OpenAiTranscriptionResponse, OpenAiVerboseTranscriptionResponse,
-        OpenAiVerboseTranscriptionSegment, RegisterPushDeviceInput, ReplySummary, SendMessageInput,
-        SessionEvent, SpeakerFilterSettingsInput, SpeechModelDownloadInput, SpeechModelKind,
-        SpeechProfile, SpeechProfileSelectionInput, SpeechVoiceSelectionInput, SummarizeReplyInput,
+        AgentInstallInput, AgentKind, AgentSummary, ApiError, ApiResponse, AppUpdateManifest,
+        ApprovalDecisionInput, AudioSpeechStreamResponse, ClientAuthRequestInput,
+        CreateProjectInput, CreateSessionInput, OpenAiAudioSpeechRequest, OpenAiErrorDetail,
+        OpenAiErrorResponse, OpenAiModel, OpenAiModelList, OpenAiTranscriptionResponse,
+        OpenAiVerboseTranscriptionResponse, OpenAiVerboseTranscriptionSegment,
+        RegisterPushDeviceInput, ReplySummary, SendMessageInput, SessionEvent,
+        SpeakerFilterSettingsInput, SpeechModelDownloadInput, SpeechModelKind, SpeechProfile,
+        SpeechProfileSelectionInput, SpeechVoiceSelectionInput, SummarizeReplyInput,
         TriggerClientMessageInput, UpdateSessionInput,
     },
     realtime, speaker,
@@ -344,13 +344,10 @@ async fn list_project_sessions(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<ApiResponse<Vec<crate::models::SessionSummary>>>, ApiError> {
     authorize_request_status(&headers, &state).await?;
-    let sessions = state
-        .list_project_sessions(&id)
-        .await
-        .ok_or(ApiError {
-            status: StatusCode::NOT_FOUND,
-            message: "project not found".to_string(),
-        })?;
+    let sessions = state.list_project_sessions(&id).await.ok_or(ApiError {
+        status: StatusCode::NOT_FOUND,
+        message: "project not found".to_string(),
+    })?;
     Ok(Json(ApiResponse { data: sessions }))
 }
 
@@ -898,10 +895,14 @@ async fn get_speech_download(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize_request(&headers, &state).await?;
-    let task = state.speech().get_download(&task_id).await.ok_or(ApiError {
-        status: StatusCode::NOT_FOUND,
-        message: "speech download task not found".to_string(),
-    })?;
+    let task = state
+        .speech()
+        .get_download(&task_id)
+        .await
+        .ok_or(ApiError {
+            status: StatusCode::NOT_FOUND,
+            message: "speech download task not found".to_string(),
+        })?;
     Ok(Json(ApiResponse { data: task }))
 }
 
@@ -1463,13 +1464,10 @@ async fn list_messages(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<ApiResponse<Vec<crate::models::ChatMessage>>>, ApiError> {
     authorize_request_status(&headers, &state).await?;
-    let messages = state
-        .list_messages(&id)
-        .await
-        .ok_or(ApiError {
-            status: StatusCode::NOT_FOUND,
-            message: "session not found".to_string(),
-        })?;
+    let messages = state.list_messages(&id).await.ok_or(ApiError {
+        status: StatusCode::NOT_FOUND,
+        message: "session not found".to_string(),
+    })?;
     Ok(Json(ApiResponse { data: messages }))
 }
 
@@ -1480,13 +1478,14 @@ async fn send_message(
     Json(input): Json<SendMessageInput>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize_request(&headers, &state).await?;
-    let (user_message, pending_reply) = state
-        .send_message(&id, input)
-        .await
-        .map_err(|err| ApiError {
-            status: StatusCode::NOT_FOUND,
-            message: err,
-        })?;
+    let (user_message, pending_reply) =
+        state
+            .send_message(&id, input)
+            .await
+            .map_err(|err| ApiError {
+                status: StatusCode::NOT_FOUND,
+                message: err,
+            })?;
 
     Ok((
         StatusCode::CREATED,
@@ -1579,12 +1578,14 @@ fn agent_summary(kind: AgentKind) -> AgentSummary {
         AgentKind::Codex => "codex",
         AgentKind::ClaudeCode => "claude",
         AgentKind::OpenCode => "opencode",
-        AgentKind::Custom => return AgentSummary {
-            kind,
-            installed: false,
-            installed_path: None,
-            install_hint: "Custom agent does not support auto-install".to_string(),
-        },
+        AgentKind::Custom => {
+            return AgentSummary {
+                kind,
+                installed: false,
+                installed_path: None,
+                install_hint: "Custom agent does not support auto-install".to_string(),
+            };
+        }
     };
     let installed_path = adapter::find_executable_in_path(binary_name);
     AgentSummary {
@@ -1668,10 +1669,7 @@ async fn get_client_auth_request(
     Ok(Json(ApiResponse { data: record }))
 }
 
-async fn authorize_request(
-    headers: &HeaderMap,
-    state: &AppState,
-) -> Result<(), ApiError> {
+async fn authorize_request(headers: &HeaderMap, state: &AppState) -> Result<(), ApiError> {
     let client_id = read_client_id(headers)?;
     let runtime_allowed = state.is_runtime_client_id_allowed(client_id).await;
     if !runtime_allowed {

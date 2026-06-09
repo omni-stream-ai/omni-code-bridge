@@ -1,6 +1,8 @@
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    fs,
+    hash::{Hash, Hasher},
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -50,6 +52,7 @@ struct SessionRuntimeState {
     approval_tx: Option<mpsc::UnboundedSender<ApprovalChoice>>,
     turn_abort: Option<AbortHandle>,
     turn_in_flight: bool,
+    interrupted: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -64,21 +67,41 @@ struct PersistedSessionRuntimeState {
     claude_provider_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     claude_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_approval: Option<ApprovalRequest>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    interrupted: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl SessionRuntimeState {
     fn from_persisted(value: PersistedSessionRuntimeState) -> Self {
+        let pending_approval = value.pending_approval.map(|mut request| {
+            request.resolvable = false;
+            request.allow_accept_for_session = false;
+            request.reason = request.reason.or_else(|| {
+                Some(
+                    "审批请求已从持久化状态恢复，但原运行通道不可用，请重新发送消息继续。"
+                        .to_string(),
+                )
+            });
+            request
+        });
         Self {
             provider_session_ref: value.provider_session_ref,
             codex_provider_name: value.codex_provider_name,
             codex_model: value.codex_model,
             claude_provider_id: value.claude_provider_id,
             claude_model: value.claude_model,
-            pending_approval: None,
+            pending_approval,
             last_resolved_approval_request_id: None,
             approval_tx: None,
             turn_abort: None,
             turn_in_flight: false,
+            interrupted: value.interrupted,
         }
     }
 
@@ -89,6 +112,8 @@ impl SessionRuntimeState {
             codex_model: self.codex_model.clone(),
             claude_provider_id: self.claude_provider_id.clone(),
             claude_model: self.claude_model.clone(),
+            pending_approval: self.pending_approval.clone(),
+            interrupted: self.interrupted,
         }
     }
 }
@@ -96,6 +121,7 @@ impl SessionRuntimeState {
 #[derive(Clone)]
 struct AggregatedListCache {
     checked_at: Instant,
+    git_fingerprint: u64,
     projects: Vec<ProjectSummary>,
     sessions: Vec<SessionSummary>,
     project_sessions: HashMap<String, Vec<SessionSummary>>,
@@ -148,7 +174,9 @@ impl AppState {
             runtime: Mutex::new(
                 persisted_runtime
                     .into_iter()
-                    .map(|(session_id, value)| (session_id, SessionRuntimeState::from_persisted(value)))
+                    .map(|(session_id, value)| {
+                        (session_id, SessionRuntimeState::from_persisted(value))
+                    })
                     .collect(),
             ),
             event_tx,
@@ -327,11 +355,40 @@ impl AppState {
     ) -> Vec<SessionSummary> {
         let runtime = self.runtime.lock().await;
         for session in &mut sessions {
-            session.pending_approval = runtime
-                .get(&session.id)
-                .and_then(|entry| entry.pending_approval.clone());
+            Self::apply_runtime_overlay(session, runtime.get(&session.id));
         }
         sessions
+    }
+
+    async fn with_runtime_approval(&self, mut session: SessionSummary) -> SessionSummary {
+        let runtime = self.runtime.lock().await;
+        let session_id = session.id.clone();
+        Self::apply_runtime_overlay(&mut session, runtime.get(&session_id));
+        session
+    }
+
+    fn apply_runtime_overlay(session: &mut SessionSummary, runtime: Option<&SessionRuntimeState>) {
+        session.pending_approval = runtime.and_then(|entry| entry.pending_approval.clone());
+        if session.pending_approval.is_some() {
+            session.status = SessionStatus::AwaitingApproval;
+        } else if runtime.map(Self::is_recoverable_runtime).unwrap_or(false)
+            || (matches!(session.status, SessionStatus::Running)
+                && runtime.map(Self::is_detached_running).unwrap_or(false))
+        {
+            session.status = SessionStatus::Interrupted;
+        }
+    }
+
+    fn is_recoverable_runtime(entry: &SessionRuntimeState) -> bool {
+        entry.interrupted && !entry.turn_in_flight
+    }
+
+    fn is_detached_running(entry: &SessionRuntimeState) -> bool {
+        !entry.turn_in_flight
+            && entry.turn_abort.is_none()
+            && entry.approval_tx.is_none()
+            && entry.pending_approval.is_none()
+            && entry.provider_session_ref.is_some()
     }
 
     pub async fn list_messages(&self, session_id: &str) -> Option<Vec<ChatMessage>> {
@@ -383,6 +440,7 @@ impl AppState {
             updated_at: Utc::now(),
             unread_count: 0,
             last_message_preview: Some("新会话已创建".to_string()),
+            git_branch: None,
             pending_approval: None,
             provider_id: input.provider_id,
         };
@@ -408,6 +466,7 @@ impl AppState {
                 approval_tx: None,
                 turn_abort: None,
                 turn_in_flight: false,
+                interrupted: false,
             },
         );
         self.invalidate_list_cache().await;
@@ -483,6 +542,7 @@ impl AppState {
             updated_at: now,
             unread_count: 1,
             last_message_preview: Some(content.clone()),
+            git_branch: None,
             pending_approval: None,
             provider_id: None,
         };
@@ -568,26 +628,33 @@ impl AppState {
         };
 
         // Helper: find best provider from a list
-        let find_best_provider = |providers: &[ModelProviderConfig]| -> Option<ResolvedProviderConfig> {
-            providers
-                .iter()
-                .filter(|p| p.enabled)
-                .filter(|p| is_format_compatible(&p.format))
-                .min_by_key(|p| p.priority)
-                .map(|p| ResolvedProviderConfig {
-                    base_url: p.base_url.clone(),
-                    api_key: p.api_key.clone(),
-                    model: p.model.clone(),
-                    format: p.format,
-                    provider_id: None,
-                })
-        };
+        let find_best_provider =
+            |providers: &[ModelProviderConfig]| -> Option<ResolvedProviderConfig> {
+                providers
+                    .iter()
+                    .filter(|p| p.enabled)
+                    .filter(|p| is_format_compatible(&p.format))
+                    .min_by_key(|p| p.priority)
+                    .map(|p| ResolvedProviderConfig {
+                        base_url: p.base_url.clone(),
+                        api_key: p.api_key.clone(),
+                        model: p.model.clone(),
+                        format: p.format,
+                        provider_id: None,
+                    })
+            };
 
         // 1. Message-level provider_id — direct lookup, no fallback
         if let Some(provider_id) = message_provider_id {
             eprintln!("[provider] looking up message-level provider_id={provider_id}");
-            if let Some(config) = self.find_provider_by_id(provider_id, agent, &settings).await {
-                eprintln!("[provider] resolved via message-level: base_url={} model={:?} format={:?}", config.base_url, config.model, config.format);
+            if let Some(config) = self
+                .find_provider_by_id(provider_id, agent, &settings)
+                .await
+            {
+                eprintln!(
+                    "[provider] resolved via message-level: base_url={} model={:?} format={:?}",
+                    config.base_url, config.model, config.format
+                );
                 return Some(config);
             }
             eprintln!("[provider] error: provider_id={provider_id} not found in settings");
@@ -597,8 +664,14 @@ impl AppState {
         // 2. Session-level provider_id — direct lookup, no fallback
         if let Some(provider_id) = &session.provider_id {
             eprintln!("[provider] looking up session-level provider_id={provider_id}");
-            if let Some(config) = self.find_provider_by_id(provider_id, agent, &settings).await {
-                eprintln!("[provider] resolved via session-level: base_url={} model={:?} format={:?}", config.base_url, config.model, config.format);
+            if let Some(config) = self
+                .find_provider_by_id(provider_id, agent, &settings)
+                .await
+            {
+                eprintln!(
+                    "[provider] resolved via session-level: base_url={} model={:?} format={:?}",
+                    config.base_url, config.model, config.format
+                );
                 return Some(config);
             }
             eprintln!("[provider] error: provider_id={provider_id} not found in settings");
@@ -619,7 +692,10 @@ impl AppState {
         // 4. Global providers (sorted by priority)
         let config = find_best_provider(&settings.model_providers);
         if let Some(ref c) = config {
-            eprintln!("[provider] using global provider: base_url={} model={:?} format={:?}", c.base_url, c.model, c.format);
+            eprintln!(
+                "[provider] using global provider: base_url={} model={:?} format={:?}",
+                c.base_url, c.model, c.format
+            );
         }
         config
     }
@@ -672,7 +748,10 @@ impl AppState {
         agent: AgentKind,
         settings: &BridgeSettings,
     ) -> Option<ResolvedProviderConfig> {
-        let provider = settings.model_providers.iter().find(|p| p.id == provider_id)?;
+        let provider = settings
+            .model_providers
+            .iter()
+            .find(|p| p.id == provider_id)?;
 
         // Validate format compatibility
         let is_compatible = match agent {
@@ -708,15 +787,18 @@ impl AppState {
         session_id: &str,
         input: SendMessageInput,
     ) -> Result<(ChatMessage, ChatMessage), String> {
-        {
-            let mut runtime = self.runtime.lock().await;
-            let entry = runtime
-                .entry(session_id.to_string())
-                .or_insert_with(SessionRuntimeState::default);
+        let mut already_processing = false;
+        self.update_runtime_state(session_id, |entry| {
             if entry.turn_in_flight {
-                return Err("session is already processing a message".to_string());
+                already_processing = true;
+                return;
             }
             entry.turn_in_flight = true;
+            entry.interrupted = false;
+        })
+        .await;
+        if already_processing {
+            return Err("session is already processing a message".to_string());
         }
 
         let session_snapshot = self
@@ -864,15 +946,23 @@ impl AppState {
 
     pub async fn cancel_turn(&self, session_id: &str) -> Result<bool, String> {
         let abort_handle = {
-            let mut runtime = self.runtime.lock().await;
-            let entry = runtime
-                .get_mut(session_id)
-                .ok_or_else(|| format!("unknown session: {session_id}"))?;
-            let handle = entry.turn_abort.take();
-            let had_active_turn = entry.turn_in_flight || handle.is_some();
-            entry.turn_in_flight = false;
-            entry.approval_tx = None;
-            entry.pending_approval = None;
+            let mut handle = None;
+            let mut had_active_turn = false;
+            let found = self
+                .update_existing_runtime_state(session_id, |entry| {
+                    handle = entry.turn_abort.take();
+                    had_active_turn = entry.turn_in_flight || handle.is_some();
+                    entry.turn_in_flight = false;
+                    entry.approval_tx = None;
+                    entry.pending_approval = None;
+                    if had_active_turn {
+                        entry.interrupted = true;
+                    }
+                })
+                .await;
+            if !found {
+                return Err(format!("unknown session: {session_id}"));
+            }
             (handle, had_active_turn)
         };
 
@@ -885,14 +975,14 @@ impl AppState {
             let preview = self
                 .latest_assistant_preview(session_id)
                 .await
-                .or(Some("已停止本次回答".to_string()));
-            self.patch_session(session_id, SessionStatus::Idle, preview)
+                .or(Some("本次运行已中断，可继续发送消息恢复。".to_string()));
+            self.patch_session(session_id, SessionStatus::Interrupted, preview)
                 .await;
             let _ = self
                 .event_tx
                 .send(SessionEvent::SessionStatus(SessionStatusEvent {
                     session_id: session_id.to_string(),
-                    status: SessionStatus::Idle,
+                    status: SessionStatus::Interrupted,
                     error_message: None,
                 }));
         }
@@ -1059,6 +1149,7 @@ impl AppState {
 
         self.patch_session(session_id, SessionStatus::Idle, Some(content.clone()))
             .await;
+        self.clear_interrupted(session_id).await;
         self.clear_pending_approval(session_id).await;
         let _ = self
             .event_tx
@@ -1085,6 +1176,7 @@ impl AppState {
     pub async fn fail_session(&self, session_id: &str, message: String) {
         self.patch_session(session_id, SessionStatus::Failed, Some(message.clone()))
             .await;
+        self.clear_interrupted(session_id).await;
         self.clear_pending_approval(session_id).await;
         let _ = self
             .event_tx
@@ -1205,6 +1297,30 @@ impl AppState {
         }
     }
 
+    async fn update_existing_runtime_state<F>(&self, session_id: &str, update: F) -> bool
+    where
+        F: FnOnce(&mut SessionRuntimeState),
+    {
+        let snapshot = {
+            let mut runtime = self.runtime.lock().await;
+            let Some(entry) = runtime.get_mut(session_id) else {
+                return false;
+            };
+            update(entry);
+            runtime
+                .iter()
+                .map(|(session_id, state)| (session_id.clone(), state.to_persisted()))
+                .collect::<HashMap<_, _>>()
+        };
+        if let Err(error) = write_persisted_runtime(&self.runtime_store_path, &snapshot).await {
+            eprintln!(
+                "failed to persist session runtime metadata at {}: {error}",
+                self.runtime_store_path.display()
+            );
+        }
+        true
+    }
+
     pub async fn project_root_path_for_session(&self, session_id: &str) -> Result<String, String> {
         let session = self
             .find_session(session_id)
@@ -1237,11 +1353,11 @@ impl AppState {
     }
 
     pub async fn finish_turn(&self, session_id: &str) {
-        let mut runtime = self.runtime.lock().await;
-        if let Some(entry) = runtime.get_mut(session_id) {
+        self.update_runtime_state(session_id, |entry| {
             entry.turn_in_flight = false;
             entry.turn_abort = None;
-        }
+        })
+        .await;
     }
 
     pub async fn set_turn_abort(&self, session_id: &str, abort_handle: Option<AbortHandle>) {
@@ -1253,14 +1369,12 @@ impl AppState {
     }
 
     pub async fn raise_approval(&self, session_id: &str, request: ApprovalRequest) {
-        {
-            let mut runtime = self.runtime.lock().await;
-            let entry = runtime
-                .entry(session_id.to_string())
-                .or_insert_with(SessionRuntimeState::default);
+        self.update_runtime_state(session_id, |entry| {
             entry.pending_approval = Some(request.clone());
             entry.last_resolved_approval_request_id = None;
-        }
+            entry.interrupted = false;
+        })
+        .await;
         self.patch_session(
             session_id,
             SessionStatus::AwaitingApproval,
@@ -1310,13 +1424,12 @@ impl AppState {
             "[approval] resolved session={session_id} request={request_id} choice={choice:?}"
         );
         let preview = approval_choice_preview(&choice).to_string();
-        {
-            let mut runtime = self.runtime.lock().await;
-            if let Some(entry) = runtime.get_mut(session_id) {
-                entry.pending_approval = None;
-                entry.last_resolved_approval_request_id = Some(request_id.to_string());
-            }
-        }
+        self.update_runtime_state(session_id, |entry| {
+            entry.pending_approval = None;
+            entry.last_resolved_approval_request_id = Some(request_id.to_string());
+            entry.interrupted = false;
+        })
+        .await;
         self.patch_session(session_id, SessionStatus::Running, Some(preview.clone()))
             .await;
         self.emit_system_message(session_id, preview.clone()).await;
@@ -1337,10 +1450,17 @@ impl AppState {
     }
 
     async fn clear_pending_approval(&self, session_id: &str) {
-        let mut runtime = self.runtime.lock().await;
-        if let Some(entry) = runtime.get_mut(session_id) {
+        self.update_runtime_state(session_id, |entry| {
             entry.pending_approval = None;
-        }
+        })
+        .await;
+    }
+
+    async fn clear_interrupted(&self, session_id: &str) {
+        self.update_runtime_state(session_id, |entry| {
+            entry.interrupted = false;
+        })
+        .await;
     }
 
     async fn push_message(&self, message: ChatMessage) {
@@ -1479,14 +1599,16 @@ impl AppState {
     }
 
     async fn find_session(&self, session_id: &str) -> Option<SessionSummary> {
-        if let Some(session) = self.sessions.read().await.get(session_id).cloned() {
-            return Some(session);
-        }
-        self.ensure_list_cache()
-            .await
-            .sessions_by_id
-            .get(session_id)
-            .cloned()
+        let session = if let Some(session) = self.sessions.read().await.get(session_id).cloned() {
+            session
+        } else {
+            self.ensure_list_cache()
+                .await
+                .sessions_by_id
+                .get(session_id)
+                .cloned()?
+        };
+        Some(self.with_runtime_approval(session).await)
     }
 
     async fn invalidate_list_cache(&self) {
@@ -1498,6 +1620,7 @@ impl AppState {
             let cache = self.list_cache.lock().await;
             if let Some(existing) = cache.as_ref()
                 && existing.checked_at.elapsed() < Self::LIST_CACHE_TTL
+                && git_fingerprint_for_projects(&existing.projects) == existing.git_fingerprint
             {
                 return existing.clone();
             }
@@ -1521,6 +1644,18 @@ impl AppState {
             for (id, session) in sessions.iter() {
                 merged_sessions.insert(id.clone(), session.clone());
             }
+        }
+
+        let project_git_states = merged_projects
+            .iter()
+            .map(|(project_id, project)| {
+                (project_id.clone(), git_project_state(&project.root_path))
+            })
+            .collect::<HashMap<_, _>>();
+        for session in merged_sessions.values_mut() {
+            session.git_branch = project_git_states
+                .get(&session.project_id)
+                .and_then(|state| state.branch.clone());
         }
 
         let runtime_refs = {
@@ -1577,6 +1712,10 @@ impl AppState {
 
         let cache = AggregatedListCache {
             checked_at: Instant::now(),
+            git_fingerprint: project_git_states
+                .values()
+                .map(|state| state.fingerprint)
+                .fold(0, |acc, fingerprint| acc ^ fingerprint),
             projects_by_id: projects
                 .iter()
                 .cloned()
@@ -1631,6 +1770,7 @@ impl AppState {
         local_session.pending_approval = local_session
             .pending_approval
             .or(provider_session.pending_approval);
+        local_session.git_branch = local_session.git_branch.or(provider_session.git_branch);
         local_session
     }
 
@@ -1639,7 +1779,8 @@ impl AppState {
         provider_status: SessionStatus,
     ) -> SessionStatus {
         let rank = |status: &SessionStatus| match status {
-            SessionStatus::AwaitingApproval => 5,
+            SessionStatus::AwaitingApproval => 6,
+            SessionStatus::Interrupted => 5,
             SessionStatus::Running => 4,
             SessionStatus::Waiting => 3,
             SessionStatus::Failed => 2,
@@ -1661,9 +1802,83 @@ impl AppState {
     }
 }
 
-async fn load_persisted_runtime(
-    path: &PathBuf,
-) -> HashMap<String, PersistedSessionRuntimeState> {
+#[derive(Debug, Clone, Default)]
+struct GitProjectState {
+    branch: Option<String>,
+    fingerprint: u64,
+}
+
+fn git_fingerprint_for_projects(projects: &[ProjectSummary]) -> u64 {
+    projects
+        .iter()
+        .map(|project| git_project_state(&project.root_path).fingerprint)
+        .fold(0, |acc, fingerprint| acc ^ fingerprint)
+}
+
+fn git_project_state(root_path: &str) -> GitProjectState {
+    if root_path.contains("://") {
+        return GitProjectState::default();
+    }
+
+    let root = Path::new(root_path);
+    let Some(git_dir) = resolve_git_dir(root) else {
+        return GitProjectState::default();
+    };
+    let head_path = git_dir.join("HEAD");
+    let head = match fs::read_to_string(&head_path) {
+        Ok(value) => value.trim().to_string(),
+        Err(_) => return GitProjectState::default(),
+    };
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    root_path.hash(&mut hasher);
+    head.hash(&mut hasher);
+    file_fingerprint_for_cache(&head_path).hash(&mut hasher);
+
+    let branch = head
+        .strip_prefix("ref:")
+        .map(str::trim)
+        .and_then(|reference| {
+            file_fingerprint_for_cache(&git_dir.join(reference)).hash(&mut hasher);
+            reference
+                .strip_prefix("refs/heads/")
+                .map(ToString::to_string)
+        });
+
+    GitProjectState {
+        branch,
+        fingerprint: hasher.finish(),
+    }
+}
+
+fn resolve_git_dir(root: &Path) -> Option<PathBuf> {
+    let git_path = root.join(".git");
+    if git_path.is_dir() {
+        return Some(git_path);
+    }
+
+    let content = fs::read_to_string(&git_path).ok()?;
+    let path = content.trim().strip_prefix("gitdir:")?.trim();
+    let git_dir = PathBuf::from(path);
+    Some(if git_dir.is_absolute() {
+        git_dir
+    } else {
+        root.join(git_dir)
+    })
+}
+
+fn file_fingerprint_for_cache(path: &Path) -> Option<(u64, u128)> {
+    let metadata = fs::metadata(path).ok()?;
+    let modified = metadata
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis();
+    Some((metadata.len(), modified))
+}
+
+async fn load_persisted_runtime(path: &PathBuf) -> HashMap<String, PersistedSessionRuntimeState> {
     match tokio::fs::read_to_string(path).await {
         Ok(body) => serde_json::from_str::<HashMap<String, PersistedSessionRuntimeState>>(&body)
             .unwrap_or_default(),
@@ -1748,5 +1963,24 @@ mod tests {
             second.as_ref().map(|value| value.token.as_str()),
             Some(session.token.as_str())
         );
+    }
+
+    #[test]
+    fn git_project_state_tracks_branch_changes() {
+        let root =
+            std::env::temp_dir().join(format!("omni-code-bridge-git-state-{}", std::process::id()));
+        let git_dir = root.join(".git");
+        std::fs::create_dir_all(git_dir.join("refs/heads")).expect("create git refs");
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").expect("write head");
+        std::fs::write(git_dir.join("refs/heads/main"), "main-sha\n").expect("write main");
+
+        let main = git_project_state(root.to_str().expect("utf8 temp path"));
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/feature\n").expect("switch head");
+        std::fs::write(git_dir.join("refs/heads/feature"), "feature-sha\n").expect("write feature");
+        let feature = git_project_state(root.to_str().expect("utf8 temp path"));
+
+        assert_eq!(main.branch.as_deref(), Some("main"));
+        assert_eq!(feature.branch.as_deref(), Some("feature"));
+        assert_ne!(main.fingerprint, feature.fingerprint);
     }
 }
