@@ -1925,6 +1925,9 @@ fn parse_git_status_output(output: &str) -> Option<GitStatusState> {
     let mut staged = false;
     let mut unstaged = false;
     let mut untracked = false;
+    let mut staged_count = 0u32;
+    let mut unstaged_count = 0u32;
+    let mut untracked_count = 0u32;
     let mut ahead = None;
     let mut behind = None;
 
@@ -1936,6 +1939,7 @@ fn parse_git_status_output(output: &str) -> Option<GitStatusState> {
 
         if line.starts_with("??") {
             untracked = true;
+            untracked_count += 1;
             continue;
         }
 
@@ -1944,9 +1948,11 @@ fn parse_git_status_output(output: &str) -> Option<GitStatusState> {
         let worktree_status = chars.next().unwrap_or(' ');
         if index_status != ' ' {
             staged = true;
+            staged_count += 1;
         }
         if worktree_status != ' ' {
             unstaged = true;
+            unstaged_count += 1;
         }
     }
 
@@ -1965,6 +1971,10 @@ fn parse_git_status_output(output: &str) -> Option<GitStatusState> {
             staged,
             unstaged,
             untracked,
+            changed_count: staged_count + unstaged_count + untracked_count,
+            staged_count,
+            unstaged_count,
+            untracked_count,
             ahead,
             behind,
         },
@@ -2149,6 +2159,10 @@ mod tests {
         assert!(status.detail.staged);
         assert!(status.detail.unstaged);
         assert!(status.detail.untracked);
+        assert_eq!(status.detail.changed_count, 3);
+        assert_eq!(status.detail.staged_count, 1);
+        assert_eq!(status.detail.unstaged_count, 1);
+        assert_eq!(status.detail.untracked_count, 1);
         assert_eq!(status.detail.ahead, Some(2));
         assert_eq!(status.detail.behind, Some(1));
     }
@@ -2165,6 +2179,10 @@ mod tests {
         assert!(!status.detail.staged);
         assert!(!status.detail.unstaged);
         assert!(!status.detail.untracked);
+        assert_eq!(status.detail.changed_count, 0);
+        assert_eq!(status.detail.staged_count, 0);
+        assert_eq!(status.detail.unstaged_count, 0);
+        assert_eq!(status.detail.untracked_count, 0);
         assert_eq!(status.detail.ahead, None);
         assert_eq!(status.detail.behind, None);
     }

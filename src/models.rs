@@ -151,6 +151,10 @@ pub struct GitStatusDetail {
     pub staged: bool,
     pub unstaged: bool,
     pub untracked: bool,
+    pub changed_count: u32,
+    pub staged_count: u32,
+    pub unstaged_count: u32,
+    pub untracked_count: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ahead: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
