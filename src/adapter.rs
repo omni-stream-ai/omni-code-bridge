@@ -1398,15 +1398,18 @@ fn modify_opencode_config(original: &str, config: &ResolvedProviderConfig) -> St
 
     // Find provider to update: must match both base_url AND npm package
     // This prevents updating an OpenAI-compatible provider when we need Anthropic
-    let target_key = providers.iter().find(|(_, v)| {
-        let base_url_match = v
-            .get("options")
-            .and_then(|o| o.get("baseURL"))
-            .and_then(|u| u.as_str())
-            == Some(&config.base_url);
-        let npm_match = v.get("npm").and_then(|n| n.as_str()) == Some(npm);
-        base_url_match && npm_match
-    }).map(|(k, _)| k.clone());
+    let target_key = providers
+        .iter()
+        .find(|(_, v)| {
+            let base_url_match = v
+                .get("options")
+                .and_then(|o| o.get("baseURL"))
+                .and_then(|u| u.as_str())
+                == Some(&config.base_url);
+            let npm_match = v.get("npm").and_then(|n| n.as_str()) == Some(npm);
+            base_url_match && npm_match
+        })
+        .map(|(k, _)| k.clone());
 
     if let Some(key) = target_key {
         // Update existing provider with matching base_url and npm
@@ -1790,18 +1793,13 @@ async fn run_codex(
     // matching model_providers entry. This avoids mismatches where the fallback chain
     // picks a different provider name than what the bridge actually configured.
     //
-    // Fallback chain (when no explicit bridge provider_id):
-    // 1. Stored in runtime state (from a previous thread/start by us)
-    // 2. Codex session data file (model_provider in session_meta)
-    // 3. Current config.toml's model_provider
-    // 4. "omni-bridge" as last resort
+    // Fallback chain when the bridge did not inject a provider config:
+    // 1. Codex session data file (model_provider in session_meta)
+    // 2. Current config.toml's model_provider
+    // 3. No override
     let codex_provider_name = match provider_config.as_ref().and_then(|c| c.provider_id.clone()) {
         Some(id) => Some(id),
-        None => state
-            .codex_provider_name(&session.id)
-            .await
-            .or_else(|| read_codex_session_provider(&session.id))
-            .or_else(find_codex_provider_name),
+        None => read_codex_session_provider(&session.id).or_else(find_codex_provider_name),
     };
     let mut child = spawn_codex_app_server_with_config(
         &project_root,
@@ -2011,7 +2009,7 @@ async fn run_codex(
     state
         .set_provider_session_ref(&session.id, Some(thread_id.clone()))
         .await;
-    // Store the provider name so future resumes use the same provider
+    // Store the provider name only for bridge-managed provider sessions.
     if provider_config.is_some() {
         let name = codex_provider_name.unwrap_or_else(|| "omni-bridge".to_string());
         state.set_codex_provider_name(&session.id, Some(name)).await;
@@ -2286,11 +2284,20 @@ async fn run_claude_code(
         // ~/.claude/settings.json env (ANTHROPIC_AUTH_TOKEN, ANTHROPIC_BASE_URL, etc.)
         let mut env_overrides = serde_json::Map::new();
         if !config.api_key.is_empty() {
-            env_overrides.insert("ANTHROPIC_AUTH_TOKEN".to_string(), serde_json::json!(config.api_key));
-            env_overrides.insert("ANTHROPIC_API_KEY".to_string(), serde_json::json!(config.api_key));
+            env_overrides.insert(
+                "ANTHROPIC_AUTH_TOKEN".to_string(),
+                serde_json::json!(config.api_key),
+            );
+            env_overrides.insert(
+                "ANTHROPIC_API_KEY".to_string(),
+                serde_json::json!(config.api_key),
+            );
         }
         if !config.base_url.is_empty() {
-            env_overrides.insert("ANTHROPIC_BASE_URL".to_string(), serde_json::json!(config.base_url));
+            env_overrides.insert(
+                "ANTHROPIC_BASE_URL".to_string(),
+                serde_json::json!(config.base_url),
+            );
         }
         if !env_overrides.is_empty() {
             settings_value["env"] = serde_json::Value::Object(env_overrides);
@@ -2526,7 +2533,9 @@ async fn run_opencode(
     let system = turn_system_prompt(session, system_prompt);
     let model = provider_config.as_ref().and_then(|c| c.model.as_deref());
     // Use opencode_provider_name which matches what modify_opencode_config creates
-    let opencode_provider = provider_config.as_ref().and_then(|c| c.opencode_provider_name.as_deref());
+    let opencode_provider = provider_config
+        .as_ref()
+        .and_then(|c| c.opencode_provider_name.as_deref());
     client
         .prompt_async(
             &opencode_session_id,

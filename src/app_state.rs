@@ -22,7 +22,7 @@ use crate::{
     client_auth_store::ClientAuthStore,
     device_store::{load_device_registrations, save_device_registrations},
     models::{
-        AgentErrorEvent, AgentKind, ApiFormat, ApprovalChoice, ApprovalRequest,
+        AUTO_PROVIDER_ID, AgentErrorEvent, AgentKind, ApiFormat, ApprovalChoice, ApprovalRequest,
         ApprovalRequestEvent, ApprovalResolvedEvent, ChatMessage, ClientAuthRecord,
         ClientAuthRequestInput, ClientAuthStatus, CreateProjectInput, CreateSessionInput,
         GitStatusDetail, InputMode, MessageDeltaEvent, MessageRole, ModelProviderConfig,
@@ -632,6 +632,9 @@ impl AppState {
     ) -> Option<ResolvedProviderConfig> {
         let settings = self.bridge_settings().await;
         let agent = session.agent;
+        let requested_provider_id = message_provider_id
+            .clone()
+            .or_else(|| session.provider_id.clone());
 
         // Helper: check if a format is compatible with the agent
         let is_format_compatible = |format: &ApiFormat| match agent {
@@ -660,44 +663,41 @@ impl AppState {
                         format: p.format,
                         provider_id: None,
                         opencode_provider_name: match p.format {
-                            ApiFormat::AnthropicMessages => Some("omni-bridge-anthropic".to_string()),
+                            ApiFormat::AnthropicMessages => {
+                                Some("omni-bridge-anthropic".to_string())
+                            }
                             ApiFormat::Codex => Some("omni-bridge-codex".to_string()),
                             _ => Some("omni-bridge".to_string()),
                         },
                     })
             };
 
-        // 1. Message-level provider_id — direct lookup, no fallback
-        if let Some(provider_id) = message_provider_id {
-            eprintln!("[provider] looking up message-level provider_id={provider_id}");
-            if let Some(config) = self
-                .find_provider_by_id(provider_id, agent, &settings)
-                .await
-            {
-                eprintln!(
-                    "[provider] resolved via message-level: base_url={} model={:?} format={:?}",
-                    config.base_url, config.model, config.format
-                );
-                return Some(config);
+        // Message/session provider handling:
+        // - missing provider_id => do not resolve any bridge provider
+        // - "AUTO" => use priority-based auto-selection
+        // - explicit id => direct lookup, no fallback
+        if let Some(provider_id) = requested_provider_id {
+            if provider_id != AUTO_PROVIDER_ID {
+                eprintln!("[provider] looking up explicit provider_id={provider_id}");
+                if let Some(config) = self
+                    .find_provider_by_id(&provider_id, agent, &settings)
+                    .await
+                {
+                    eprintln!(
+                        "[provider] resolved explicit provider: base_url={} model={:?} format={:?}",
+                        config.base_url, config.model, config.format
+                    );
+                    return Some(config);
+                }
+                eprintln!("[provider] error: provider_id={provider_id} not found in settings");
+                return None;
             }
-            eprintln!("[provider] error: provider_id={provider_id} not found in settings");
-            return None;
-        }
-
-        // 2. Session-level provider_id — direct lookup, no fallback
-        if let Some(provider_id) = &session.provider_id {
-            eprintln!("[provider] looking up session-level provider_id={provider_id}");
-            if let Some(config) = self
-                .find_provider_by_id(provider_id, agent, &settings)
-                .await
-            {
-                eprintln!(
-                    "[provider] resolved via session-level: base_url={} model={:?} format={:?}",
-                    config.base_url, config.model, config.format
-                );
-                return Some(config);
-            }
-            eprintln!("[provider] error: provider_id={provider_id} not found in settings");
+            eprintln!("[provider] explicit AUTO provider requested");
+        } else {
+            eprintln!(
+                "[provider] no provider_id requested for session={}; skipping bridge provider resolution",
+                session.id
+            );
             return None;
         }
 
@@ -933,6 +933,11 @@ impl AppState {
                 "[provider] resolved provider for session={session_id}: base_url={} model={:?} format={:?}",
                 config.base_url, config.model, config.format
             );
+        } else {
+            self.set_codex_provider_name(session_id, None).await;
+            self.set_codex_model(session_id, None).await;
+            self.set_claude_provider_id(session_id, None).await;
+            self.set_claude_model(session_id, None).await;
         }
 
         let state = Arc::clone(self);
@@ -1689,7 +1694,10 @@ impl AppState {
 
         let local_session_ids = {
             let sessions = self.sessions.read().await;
-            sessions.keys().cloned().collect::<std::collections::HashSet<_>>()
+            sessions
+                .keys()
+                .cloned()
+                .collect::<std::collections::HashSet<_>>()
         };
         let runtime_refs = {
             let runtime = self.runtime.lock().await;
@@ -2096,7 +2104,10 @@ fn message_title(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{AgentKind, SessionSummary};
+    use crate::{
+        bridge_settings::{AiApprovalSettings, BridgeSettingsInput},
+        models::{AUTO_PROVIDER_ID, AgentKind, ApiFormat, ModelProviderConfig, SessionSummary},
+    };
     use chrono::Utc;
 
     #[tokio::test]
@@ -2194,8 +2205,7 @@ mod tests {
         let provider_session_id = "provider-session".to_string();
         let now = Utc::now();
 
-        let local_session_ids =
-            std::collections::HashSet::from([live_session_id.clone()]);
+        let local_session_ids = std::collections::HashSet::from([live_session_id.clone()]);
         let runtime_refs = std::collections::HashMap::from([
             (live_session_id.clone(), provider_session_id.clone()),
             (archived_session_id.clone(), provider_session_id.clone()),
@@ -2273,5 +2283,158 @@ mod tests {
         assert!(merged_sessions.contains_key(&live_session_id));
         assert!(merged_sessions.contains_key(&archived_session_id));
         assert!(!merged_sessions.contains_key(&provider_session_id));
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_config_skips_when_provider_id_missing() {
+        let state = AppState::new().await;
+        state
+            .update_bridge_settings(BridgeSettingsInput {
+                ai_approval: AiApprovalSettings::default(),
+                model_providers: Some(vec![ModelProviderConfig {
+                    id: "codex-primary".to_string(),
+                    name: "Codex Primary".to_string(),
+                    base_url: "https://example.test/v1".to_string(),
+                    api_key: "key".to_string(),
+                    model: Some("gpt-4.1".to_string()),
+                    format: ApiFormat::Codex,
+                    enabled: true,
+                    priority: 0,
+                }]),
+                speech_profiles: None,
+                speech_voices: None,
+                speaker_filter: None,
+            })
+            .await
+            .expect("settings update should succeed");
+
+        let session = SessionSummary {
+            id: "session-1".to_string(),
+            project_id: "project-1".to_string(),
+            title: "Session".to_string(),
+            agent: AgentKind::Codex,
+            brief_reply_mode: false,
+            status: SessionStatus::Idle,
+            updated_at: Utc::now(),
+            unread_count: 0,
+            last_message_preview: None,
+            pending_approval: None,
+            provider_id: None,
+        };
+
+        let resolved = state.resolve_provider_config(&session, &None).await;
+        assert!(resolved.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_config_auto_uses_priority_provider() {
+        let state = AppState::new().await;
+        state
+            .update_bridge_settings(BridgeSettingsInput {
+                ai_approval: AiApprovalSettings::default(),
+                model_providers: Some(vec![
+                    ModelProviderConfig {
+                        id: "codex-secondary".to_string(),
+                        name: "Codex Secondary".to_string(),
+                        base_url: "https://secondary.test/v1".to_string(),
+                        api_key: "key-2".to_string(),
+                        model: Some("gpt-4.1-mini".to_string()),
+                        format: ApiFormat::Codex,
+                        enabled: true,
+                        priority: 10,
+                    },
+                    ModelProviderConfig {
+                        id: "codex-primary".to_string(),
+                        name: "Codex Primary".to_string(),
+                        base_url: "https://primary.test/v1".to_string(),
+                        api_key: "key-1".to_string(),
+                        model: Some("gpt-4.1".to_string()),
+                        format: ApiFormat::Codex,
+                        enabled: true,
+                        priority: 0,
+                    },
+                ]),
+                speech_profiles: None,
+                speech_voices: None,
+                speaker_filter: None,
+            })
+            .await
+            .expect("settings update should succeed");
+
+        let session = SessionSummary {
+            id: "session-2".to_string(),
+            project_id: "project-1".to_string(),
+            title: "Session".to_string(),
+            agent: AgentKind::Codex,
+            brief_reply_mode: false,
+            status: SessionStatus::Idle,
+            updated_at: Utc::now(),
+            unread_count: 0,
+            last_message_preview: None,
+            pending_approval: None,
+            provider_id: Some(AUTO_PROVIDER_ID.to_string()),
+        };
+
+        let resolved = state.resolve_provider_config(&session, &None).await;
+        let resolved = resolved.expect("AUTO should resolve provider");
+        assert_eq!(resolved.base_url, "https://primary.test/v1");
+        assert_eq!(resolved.provider_id, None);
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_config_explicit_message_provider_overrides_auto() {
+        let state = AppState::new().await;
+        state
+            .update_bridge_settings(BridgeSettingsInput {
+                ai_approval: AiApprovalSettings::default(),
+                model_providers: Some(vec![
+                    ModelProviderConfig {
+                        id: "codex-primary".to_string(),
+                        name: "Codex Primary".to_string(),
+                        base_url: "https://primary.test/v1".to_string(),
+                        api_key: "key-1".to_string(),
+                        model: Some("gpt-4.1".to_string()),
+                        format: ApiFormat::Codex,
+                        enabled: true,
+                        priority: 0,
+                    },
+                    ModelProviderConfig {
+                        id: "codex-explicit".to_string(),
+                        name: "Codex Explicit".to_string(),
+                        base_url: "https://explicit.test/v1".to_string(),
+                        api_key: "key-explicit".to_string(),
+                        model: Some("gpt-4.1-explicit".to_string()),
+                        format: ApiFormat::Codex,
+                        enabled: true,
+                        priority: 20,
+                    },
+                ]),
+                speech_profiles: None,
+                speech_voices: None,
+                speaker_filter: None,
+            })
+            .await
+            .expect("settings update should succeed");
+
+        let session = SessionSummary {
+            id: "session-3".to_string(),
+            project_id: "project-1".to_string(),
+            title: "Session".to_string(),
+            agent: AgentKind::Codex,
+            brief_reply_mode: false,
+            status: SessionStatus::Idle,
+            updated_at: Utc::now(),
+            unread_count: 0,
+            last_message_preview: None,
+            pending_approval: None,
+            provider_id: Some(AUTO_PROVIDER_ID.to_string()),
+        };
+
+        let resolved = state
+            .resolve_provider_config(&session, &Some("codex-explicit".to_string()))
+            .await;
+        let resolved = resolved.expect("explicit provider should resolve");
+        assert_eq!(resolved.base_url, "https://explicit.test/v1");
+        assert_eq!(resolved.provider_id.as_deref(), Some("codex-explicit"));
     }
 }

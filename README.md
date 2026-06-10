@@ -73,6 +73,41 @@ Agent binary paths can be overridden with `ECHO_MATE_CODEX_BIN` and `ECHO_MATE_O
 | `POST /v1/audio/transcriptions` | OpenAI-compatible ASR |
 | `POST /v1/audio/speech` | OpenAI-compatible TTS |
 
+### Provider Selection
+
+Session creation (`POST /sessions`), session update (`PATCH /sessions/{id}`), and message send
+(`POST /sessions/{id}/messages`) all accept `provider_id`.
+
+- Omit `provider_id` to skip bridge-side provider resolution entirely
+- Set `provider_id` to `"AUTO"` to auto-select from project-level or global providers by priority
+- Set `provider_id` to a concrete provider config id to force that provider
+
+Examples:
+
+```json
+// No bridge provider resolution
+{
+  "provider_id": null
+}
+```
+
+```json
+// Explicit auto-selection
+{
+  "provider_id": "AUTO"
+}
+```
+
+```json
+// Explicit provider
+{
+  "provider_id": "openai-primary"
+}
+```
+
+For `PATCH /sessions/{id}`, omitting `provider_id` leaves the session unchanged, while
+`"provider_id": null` clears the stored session-level selection.
+
 ## Local Speech API
 
 The bridge can run local ASR and TTS through `sherpa-onnx` and exposes two API layers:

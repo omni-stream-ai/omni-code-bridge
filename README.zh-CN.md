@@ -73,6 +73,41 @@ Agent 二进制路径可以通过 `ECHO_MATE_CODEX_BIN` 和 `ECHO_MATE_OPENCODE_
 | `POST /v1/audio/transcriptions` | OpenAI 兼容 ASR |
 | `POST /v1/audio/speech` | OpenAI 兼容 TTS |
 
+### Provider 选择
+
+创建会话（`POST /sessions`）、更新会话（`PATCH /sessions/{id}`）和发送消息
+（`POST /sessions/{id}/messages`）都支持 `provider_id`。
+
+- 不传 `provider_id`：完全跳过 bridge 侧 provider 解析
+- `provider_id: "AUTO"`：按优先级从项目级或全局 provider 自动选择
+- `provider_id: "<具体 provider id>"`：强制使用指定 provider
+
+示例：
+
+```json
+// 不做 bridge provider 解析
+{
+  "provider_id": null
+}
+```
+
+```json
+// 显式自动选择
+{
+  "provider_id": "AUTO"
+}
+```
+
+```json
+// 显式指定 provider
+{
+  "provider_id": "openai-primary"
+}
+```
+
+对于 `PATCH /sessions/{id}`，请求体里省略 `provider_id` 表示不修改当前会话设置，
+而 `"provider_id": null` 表示清空已保存的会话级选择。
+
 ## 本地语音接口
 
 桥接服务现在可以通过 `sherpa-onnx` 跑本地 ASR 和 TTS，并提供两层 API：

@@ -6,6 +6,8 @@ use axum::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+pub const AUTO_PROVIDER_ID: &str = "AUTO";
+
 /// API format for model providers
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -177,15 +179,17 @@ pub struct CreateSessionInput {
     pub agent: AgentKind,
     #[serde(default)]
     pub brief_reply_mode: bool,
-    /// Default provider for this session (references provider config id)
+    /// Default provider for this session.
+    /// Omit to avoid bridge-side provider resolution; use "AUTO" to enable auto-selection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateSessionInput {
-    /// Set or clear the session-level provider override.
-    /// `Some(id)` overrides, `None` clears (reverts to auto).
+    /// Update the session-level provider selection.
+    /// `Some(id)` uses a specific provider, `Some("AUTO")` enables auto-selection,
+    /// and `None` clears provider resolution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<Option<String>>,
 }
@@ -223,7 +227,8 @@ pub struct SendMessageInput {
     pub input_mode: InputMode,
     #[serde(default)]
     pub system_prompt: Option<String>,
-    /// Override provider for this message (references provider config id)
+    /// Override provider for this message.
+    /// Omit to avoid bridge-side provider resolution; use "AUTO" to enable auto-selection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
 }
