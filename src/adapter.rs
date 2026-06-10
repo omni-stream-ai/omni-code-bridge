@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex},
@@ -423,6 +423,26 @@ mod tests {
     }
 
     #[test]
+    fn claude_runtime_ref_selection_respects_resume_and_model_switch() {
+        let session_id = "local-session";
+        let existing_runtime_ref = "claude-runtime";
+
+        assert_eq!(
+            select_claude_runtime_ref(session_id, None, false),
+            session_id
+        );
+        assert_eq!(
+            select_claude_runtime_ref(session_id, Some(existing_runtime_ref), true),
+            existing_runtime_ref
+        );
+
+        let migrated = select_claude_runtime_ref(session_id, Some(existing_runtime_ref), false);
+        assert_ne!(migrated, session_id);
+        assert_ne!(migrated, existing_runtime_ref);
+        assert!(uuid::Uuid::parse_str(&migrated).is_ok());
+    }
+
+    #[test]
     fn context_migration_instructions_keep_recent_messages_when_history_is_long() {
         let current_input = ChatMessage {
             id: "input-now".to_string(),
@@ -495,7 +515,6 @@ mod tests {
             updated_at: chrono::Utc::now(),
             unread_count: 0,
             last_message_preview: None,
-            git_branch: None,
             pending_approval: None,
             provider_id: None,
         };
@@ -1360,7 +1379,7 @@ fn write_opencode_overlay_config(config: &ResolvedProviderConfig) -> Result<Path
     Ok(path)
 }
 
-/// Modify opencode config: find a provider with matching base_url and update it,
+/// Modify opencode config: find a provider with matching base_url AND npm package, and update it,
 /// or create a new provider if none found.
 fn modify_opencode_config(original: &str, config: &ResolvedProviderConfig) -> String {
     let Ok(mut value) = serde_json::from_str::<serde_json::Value>(original) else {
@@ -1377,19 +1396,20 @@ fn modify_opencode_config(original: &str, config: &ResolvedProviderConfig) -> St
         _ => "@ai-sdk/openai-compatible",
     };
 
-    // Find provider to update: prefer one with matching base_url, otherwise first
-    let target_key = providers
-        .iter()
-        .find(|(_, v)| {
-            v.get("options")
-                .and_then(|o| o.get("baseURL"))
-                .and_then(|u| u.as_str())
-                == Some(&config.base_url)
-        })
-        .map(|(k, _)| k.clone())
-        .or_else(|| providers.keys().next().cloned());
+    // Find provider to update: must match both base_url AND npm package
+    // This prevents updating an OpenAI-compatible provider when we need Anthropic
+    let target_key = providers.iter().find(|(_, v)| {
+        let base_url_match = v
+            .get("options")
+            .and_then(|o| o.get("baseURL"))
+            .and_then(|u| u.as_str())
+            == Some(&config.base_url);
+        let npm_match = v.get("npm").and_then(|n| n.as_str()) == Some(npm);
+        base_url_match && npm_match
+    }).map(|(k, _)| k.clone());
 
     if let Some(key) = target_key {
+        // Update existing provider with matching base_url and npm
         if let Some(provider) = providers.get_mut(&key).and_then(|v| v.as_object_mut()) {
             let options = provider
                 .entry("options")
@@ -1403,12 +1423,18 @@ fn modify_opencode_config(original: &str, config: &ResolvedProviderConfig) -> St
             provider.insert("npm".to_string(), serde_json::json!(npm));
         }
     } else {
+        // Create new provider with a unique name based on npm package
+        let provider_name = match config.format {
+            crate::models::ApiFormat::AnthropicMessages => "omni-bridge-anthropic",
+            crate::models::ApiFormat::Codex => "omni-bridge-codex",
+            _ => "omni-bridge",
+        };
         let mut options = serde_json::json!({ "baseURL": config.base_url });
         if !config.api_key.is_empty() {
             options["apiKey"] = serde_json::json!(config.api_key);
         }
         providers.insert(
-            "omni-bridge".to_string(),
+            provider_name.to_string(),
             serde_json::json!({ "npm": npm, "options": options }),
         );
     }
@@ -1523,6 +1549,8 @@ impl OpenCodeHttpClient {
                     updated_at,
                     session_count: 1,
                     last_session_preview: preview,
+                    git_branch: None,
+                    git_status: None,
                 });
         }
         Ok(projects)
@@ -1590,6 +1618,7 @@ impl OpenCodeHttpClient {
         prompt: &str,
         system: Option<&str>,
         model: Option<&str>,
+        provider_id: Option<&str>,
     ) -> Result<()> {
         let mut body = serde_json::json!({
             "parts": [{
@@ -1601,7 +1630,14 @@ impl OpenCodeHttpClient {
             body["system"] = serde_json::Value::String(system.to_string());
         }
         if let Some(model) = model {
-            body["model"] = serde_json::Value::String(model.to_string());
+            // opencode expects model as an object with provider and model fields
+            // Use the provider_id if provided, otherwise default to "omni-bridge"
+            // Note: The provider name must match what modify_opencode_config creates
+            let provider = provider_id.unwrap_or("omni-bridge");
+            body["model"] = serde_json::json!({
+                "provider": provider,
+                "model": model,
+            });
         }
         self.post_json_with_query(
             &format!("/session/{}/prompt_async", url_path_escape(session_id)),
@@ -2002,6 +2038,7 @@ async fn run_codex(
     let idle_sleep = tokio::time::sleep(idle_deadline);
     tokio::pin!(idle_sleep);
     let mut pending_approval: Option<PendingApproval> = None;
+    let mut queued_approvals: VecDeque<PendingApproval> = VecDeque::new();
     let mut turn_finished = false;
     let mut last_rendered = String::new();
 
@@ -2052,16 +2089,36 @@ async fn run_codex(
                             )
                             .await?;
                         } else {
-                            pending_approval = Some(pending.clone());
-                            state.raise_approval(&session.id, pending.request).await;
+                            if pending_approval.is_some() {
+                                queued_approvals.push_back(pending);
+                            } else {
+                                state.raise_approval(&session.id, pending.request.clone()).await;
+                                pending_approval = Some(pending);
+                            }
                         }
                     }
                     CodexAppServerEvent::ApprovalResolved { request_id } => {
-                        if let Some(pending) = pending_approval.take() {
+                        let resolved_current = pending_approval
+                            .as_ref()
+                            .map(|pending| pending.request.request_id == request_id)
+                            .unwrap_or(false);
+                        if resolved_current {
+                            let pending = pending_approval
+                                .take()
+                                .context("approval state disappeared unexpectedly")?;
                             let choice = pending.last_choice.unwrap_or(ApprovalChoice::Accept);
                             state.resolve_approval(&session.id, &request_id, choice).await;
-                        } else {
+                            if let Some(next) = queued_approvals.pop_front() {
+                                state.raise_approval(&session.id, next.request.clone()).await;
+                                pending_approval = Some(next);
+                            }
+                        } else if pending_approval.is_none() {
                             state.resolve_approval(&session.id, &request_id, ApprovalChoice::Accept).await;
+                        } else {
+                            eprintln!(
+                                "[approval] ignoring resolved request for non-current approval session={} request={}",
+                                session.id, request_id
+                            );
                         }
                     }
                     CodexAppServerEvent::TurnCompleted => {
@@ -2186,13 +2243,11 @@ async fn run_claude_code(
         state.set_claude_provider_id(&session.id, None).await;
         state.set_claude_model(&session.id, None).await;
     }
-    let runtime_ref = if can_resume_existing_session {
-        existing_runtime_ref
-            .clone()
-            .unwrap_or_else(|| session.id.clone())
-    } else {
-        session.id.clone()
-    };
+    let runtime_ref = select_claude_runtime_ref(
+        &session.id,
+        existing_runtime_ref.as_deref(),
+        can_resume_existing_session,
+    );
     state
         .set_provider_session_ref(&session.id, Some(runtime_ref.clone()))
         .await;
@@ -2209,7 +2264,8 @@ async fn run_claude_code(
         "{hook_command} --project-root {}",
         shell_quote(project_root.display().to_string().as_str())
     );
-    let settings = serde_json::json!({
+    // Build settings, including env overrides to suppress global ~/.claude/settings.json env
+    let mut settings_value = serde_json::json!({
         "permissions": {
             "allow": ["Bash(*)", "WebSearch(*)", "WebFetch(*)"],
             "defaultMode": "acceptEdits"
@@ -2224,6 +2280,23 @@ async fn run_claude_code(
         }
     });
 
+    // Apply provider configuration
+    if let Some(ref config) = provider_config {
+        // Inject env overrides into settings so they take precedence over
+        // ~/.claude/settings.json env (ANTHROPIC_AUTH_TOKEN, ANTHROPIC_BASE_URL, etc.)
+        let mut env_overrides = serde_json::Map::new();
+        if !config.api_key.is_empty() {
+            env_overrides.insert("ANTHROPIC_AUTH_TOKEN".to_string(), serde_json::json!(config.api_key));
+            env_overrides.insert("ANTHROPIC_API_KEY".to_string(), serde_json::json!(config.api_key));
+        }
+        if !config.base_url.is_empty() {
+            env_overrides.insert("ANTHROPIC_BASE_URL".to_string(), serde_json::json!(config.base_url));
+        }
+        if !env_overrides.is_empty() {
+            settings_value["env"] = serde_json::Value::Object(env_overrides);
+        }
+    }
+
     let mut command = Command::new("claude");
     command
         .arg("-p")
@@ -2232,19 +2305,17 @@ async fn run_claude_code(
         .arg("stream-json")
         .arg("--include-partial-messages")
         .arg("--settings")
-        .arg(settings.to_string());
+        .arg(settings_value.to_string());
 
-    // Apply provider configuration
+    // Also set env vars directly on the process as a fallback
     if let Some(ref config) = provider_config {
-        // Set environment variables for API configuration
+        if !config.api_key.is_empty() {
+            command.env("ANTHROPIC_AUTH_TOKEN", &config.api_key);
+            command.env("ANTHROPIC_API_KEY", &config.api_key);
+        }
         if !config.base_url.is_empty() {
             command.env("ANTHROPIC_BASE_URL", &config.base_url);
         }
-        if !config.api_key.is_empty() {
-            command.env("ANTHROPIC_API_KEY", &config.api_key);
-        }
-        // Claude Code only supports anthropic-messages format
-        // Model can be set via --model flag
         if let Some(ref model) = config.model {
             command.arg("--model").arg(model);
         }
@@ -2454,6 +2525,8 @@ async fn run_opencode(
     state.set_approval_sender(&session.id, approval_tx).await;
     let system = turn_system_prompt(session, system_prompt);
     let model = provider_config.as_ref().and_then(|c| c.model.as_deref());
+    // Use opencode_provider_name which matches what modify_opencode_config creates
+    let opencode_provider = provider_config.as_ref().and_then(|c| c.opencode_provider_name.as_deref());
     client
         .prompt_async(
             &opencode_session_id,
@@ -2461,6 +2534,7 @@ async fn run_opencode(
             &input.content,
             system.as_deref(),
             model,
+            opencode_provider,
         )
         .await
         .context("failed to send opencode prompt")?;
@@ -2854,6 +2928,7 @@ async fn summarize_with_opencode(
             &session_id,
             &project_root,
             &summary_prompt(content),
+            None,
             None,
             None,
         )
@@ -4090,7 +4165,6 @@ fn opencode_session_summary(value: &Value) -> Option<SessionSummary> {
         updated_at: opencode_time(value.pointer("/time/updated")),
         unread_count: 0,
         last_message_preview: Some(title),
-        git_branch: None,
         pending_approval: None,
         provider_id: None,
     })
@@ -4154,6 +4228,22 @@ fn project_name_from_path(path: &str) -> String {
         .filter(|name| !name.is_empty())
         .unwrap_or(path)
         .to_string()
+}
+
+fn select_claude_runtime_ref(
+    session_id: &str,
+    existing_runtime_ref: Option<&str>,
+    can_resume_existing_session: bool,
+) -> String {
+    if can_resume_existing_session {
+        existing_runtime_ref
+            .map(ToString::to_string)
+            .unwrap_or_else(|| session_id.to_string())
+    } else if existing_runtime_ref.is_some() {
+        uuid::Uuid::new_v4().to_string()
+    } else {
+        session_id.to_string()
+    }
 }
 
 fn opencode_permission_to_approval(value: &Value) -> ApprovalRequest {

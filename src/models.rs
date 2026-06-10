@@ -67,6 +67,9 @@ pub struct ResolvedProviderConfig {
     /// The bridge provider ID that was explicitly specified (message-level or session-level).
     /// None when auto-selected from the provider list by priority.
     pub provider_id: Option<String>,
+    /// The opencode provider name to use in prompt_async (e.g., "omni-bridge", "omni-bridge-anthropic").
+    /// This is determined by the format and must match what modify_opencode_config creates.
+    pub opencode_provider_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -120,12 +123,38 @@ pub struct SessionSummary {
     pub unread_count: u32,
     pub last_message_preview: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub git_branch: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_approval: Option<ApprovalRequest>,
     /// Default provider for this session (references provider config id)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionDetail {
+    pub session: SessionSummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_status: Option<GitStatusDetail>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectGitStatus {
+    Clean,
+    Dirty,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitStatusDetail {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    pub dirty: bool,
+    pub staged: bool,
+    pub unstaged: bool,
+    pub untracked: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ahead: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub behind: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -165,6 +194,10 @@ pub struct ProjectSummary {
     pub updated_at: DateTime<Utc>,
     pub session_count: u32,
     pub last_session_preview: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_status: Option<ProjectGitStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

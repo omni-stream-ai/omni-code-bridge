@@ -3,6 +3,7 @@ use std::{
     fs,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
+    process::Command,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -24,10 +25,11 @@ use crate::{
         AgentErrorEvent, AgentKind, ApiFormat, ApprovalChoice, ApprovalRequest,
         ApprovalRequestEvent, ApprovalResolvedEvent, ChatMessage, ClientAuthRecord,
         ClientAuthRequestInput, ClientAuthStatus, CreateProjectInput, CreateSessionInput,
-        InputMode, MessageDeltaEvent, MessageRole, ModelProviderConfig, ProjectSummary,
-        PushDeviceRegistration, RegisterPushDeviceInput, ResolvedProviderConfig, SendMessageInput,
-        SessionEvent, SessionStatus, SessionStatusEvent, SessionSummary, SpeakerFilterSettings,
-        TriggerClientMessageInput, TriggerClientMessageResult,
+        GitStatusDetail, InputMode, MessageDeltaEvent, MessageRole, ModelProviderConfig,
+        ProjectGitStatus, ProjectSummary, PushDeviceRegistration, RegisterPushDeviceInput,
+        ResolvedProviderConfig, SendMessageInput, SessionDetail, SessionEvent, SessionStatus,
+        SessionStatusEvent, SessionSummary, SpeakerFilterSettings, TriggerClientMessageInput,
+        TriggerClientMessageResult,
     },
     push::PushService,
     session_store::project_id_for_path,
@@ -400,6 +402,20 @@ impl AppState {
         provider.list_messages(session_id).await
     }
 
+    pub async fn get_session(&self, session_id: &str) -> Option<SessionDetail> {
+        let session = self.find_session(session_id).await?;
+        let git_status = self
+            .find_project(&session.project_id)
+            .await
+            .and_then(|project| {
+                git_status_for_project(&project.root_path).map(|state| state.detail)
+            });
+        Some(SessionDetail {
+            session,
+            git_status,
+        })
+    }
+
     pub async fn create_project(&self, input: CreateProjectInput) -> ProjectSummary {
         let project = ProjectSummary {
             id: project_id_for_path(&input.root_path),
@@ -408,6 +424,8 @@ impl AppState {
             updated_at: Utc::now(),
             session_count: 0,
             last_session_preview: Some("项目已创建".to_string()),
+            git_branch: None,
+            git_status: None,
         };
 
         self.projects
@@ -440,7 +458,6 @@ impl AppState {
             updated_at: Utc::now(),
             unread_count: 0,
             last_message_preview: Some("新会话已创建".to_string()),
-            git_branch: None,
             pending_approval: None,
             provider_id: input.provider_id,
         };
@@ -511,6 +528,8 @@ impl AppState {
                     updated_at: now,
                     session_count: 0,
                     last_session_preview: None,
+                    git_branch: None,
+                    git_status: None,
                 });
             if let Some(name) = input
                 .project_name
@@ -542,7 +561,6 @@ impl AppState {
             updated_at: now,
             unread_count: 1,
             last_message_preview: Some(content.clone()),
-            git_branch: None,
             pending_approval: None,
             provider_id: None,
         };
@@ -641,6 +659,11 @@ impl AppState {
                         model: p.model.clone(),
                         format: p.format,
                         provider_id: None,
+                        opencode_provider_name: match p.format {
+                            ApiFormat::AnthropicMessages => Some("omni-bridge-anthropic".to_string()),
+                            ApiFormat::Codex => Some("omni-bridge-codex".to_string()),
+                            _ => Some("omni-bridge".to_string()),
+                        },
                     })
             };
 
@@ -779,6 +802,11 @@ impl AppState {
             model: provider.model.clone(),
             format: provider.format,
             provider_id: Some(provider_id.to_string()),
+            opencode_provider_name: match provider.format {
+                ApiFormat::AnthropicMessages => Some("omni-bridge-anthropic".to_string()),
+                ApiFormat::Codex => Some("omni-bridge-codex".to_string()),
+                _ => Some("omni-bridge".to_string()),
+            },
         })
     }
 
@@ -1652,12 +1680,17 @@ impl AppState {
                 (project_id.clone(), git_project_state(&project.root_path))
             })
             .collect::<HashMap<_, _>>();
-        for session in merged_sessions.values_mut() {
-            session.git_branch = project_git_states
-                .get(&session.project_id)
-                .and_then(|state| state.branch.clone());
+        for (project_id, project) in &mut merged_projects {
+            if let Some(state) = project_git_states.get(project_id) {
+                project.git_branch = state.branch.clone();
+                project.git_status = state.status.clone();
+            }
         }
 
+        let local_session_ids = {
+            let sessions = self.sessions.read().await;
+            sessions.keys().cloned().collect::<std::collections::HashSet<_>>()
+        };
         let runtime_refs = {
             let runtime = self.runtime.lock().await;
             runtime
@@ -1672,6 +1705,9 @@ impl AppState {
         };
         for (session_id, session_ref) in runtime_refs {
             if session_id == session_ref {
+                continue;
+            }
+            if !local_session_ids.contains(&session_id) {
                 continue;
             }
             let Some(local_session) = merged_sessions.get(&session_id).cloned() else {
@@ -1770,7 +1806,6 @@ impl AppState {
         local_session.pending_approval = local_session
             .pending_approval
             .or(provider_session.pending_approval);
-        local_session.git_branch = local_session.git_branch.or(provider_session.git_branch);
         local_session
     }
 
@@ -1805,7 +1840,15 @@ impl AppState {
 #[derive(Debug, Clone, Default)]
 struct GitProjectState {
     branch: Option<String>,
+    status: Option<ProjectGitStatus>,
     fingerprint: u64,
+}
+
+#[derive(Debug, Clone)]
+struct GitStatusState {
+    branch: Option<String>,
+    project_status: ProjectGitStatus,
+    detail: GitStatusDetail,
 }
 
 fn git_fingerprint_for_projects(projects: &[ProjectSummary]) -> u64 {
@@ -1835,7 +1878,11 @@ fn git_project_state(root_path: &str) -> GitProjectState {
     head.hash(&mut hasher);
     file_fingerprint_for_cache(&head_path).hash(&mut hasher);
 
-    let branch = head
+    file_fingerprint_for_cache(&git_dir.join("index")).hash(&mut hasher);
+    file_fingerprint_for_cache(&git_dir.join("packed-refs")).hash(&mut hasher);
+    file_fingerprint_for_cache(&git_dir.join("FETCH_HEAD")).hash(&mut hasher);
+
+    let branch_from_head = head
         .strip_prefix("ref:")
         .map(str::trim)
         .and_then(|reference| {
@@ -1844,10 +1891,112 @@ fn git_project_state(root_path: &str) -> GitProjectState {
                 .strip_prefix("refs/heads/")
                 .map(ToString::to_string)
         });
+    let status = git_status_for_project(root_path);
 
     GitProjectState {
-        branch,
+        branch: status
+            .as_ref()
+            .and_then(|state| state.branch.clone())
+            .or(branch_from_head),
+        status: status.map(|state| state.project_status),
         fingerprint: hasher.finish(),
+    }
+}
+
+fn git_status_for_project(root_path: &str) -> Option<GitStatusState> {
+    if root_path.contains("://") {
+        return None;
+    }
+
+    let output = Command::new("git")
+        .args(["status", "--porcelain=v1", "--branch"])
+        .current_dir(root_path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    parse_git_status_output(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_git_status_output(output: &str) -> Option<GitStatusState> {
+    let mut branch = None;
+    let mut staged = false;
+    let mut unstaged = false;
+    let mut untracked = false;
+    let mut ahead = None;
+    let mut behind = None;
+
+    for line in output.lines() {
+        if let Some(header) = line.strip_prefix("## ") {
+            parse_git_branch_header(header, &mut branch, &mut ahead, &mut behind);
+            continue;
+        }
+
+        if line.starts_with("??") {
+            untracked = true;
+            continue;
+        }
+
+        let mut chars = line.chars();
+        let index_status = chars.next().unwrap_or(' ');
+        let worktree_status = chars.next().unwrap_or(' ');
+        if index_status != ' ' {
+            staged = true;
+        }
+        if worktree_status != ' ' {
+            unstaged = true;
+        }
+    }
+
+    let dirty = staged || unstaged || untracked;
+    let detail_branch = branch.clone();
+    Some(GitStatusState {
+        branch,
+        project_status: if dirty {
+            ProjectGitStatus::Dirty
+        } else {
+            ProjectGitStatus::Clean
+        },
+        detail: GitStatusDetail {
+            branch: detail_branch,
+            dirty,
+            staged,
+            unstaged,
+            untracked,
+            ahead,
+            behind,
+        },
+    })
+}
+
+fn parse_git_branch_header(
+    header: &str,
+    branch: &mut Option<String>,
+    ahead: &mut Option<u32>,
+    behind: &mut Option<u32>,
+) {
+    let (name, tracking) = header
+        .split_once("...")
+        .map_or((header, None), |(name, rest)| (name, Some(rest)));
+    let name = name.trim();
+    if !name.is_empty() && name != "HEAD (no branch)" {
+        *branch = Some(name.to_string());
+    }
+
+    if let Some(tracking) = tracking
+        && let Some(start) = tracking.find('[')
+        && let Some(end) = tracking[start + 1..].find(']')
+    {
+        for item in tracking[start + 1..start + 1 + end].split(',') {
+            let item = item.trim();
+            if let Some(value) = item.strip_prefix("ahead ") {
+                *ahead = value.parse().ok();
+            } else if let Some(value) = item.strip_prefix("behind ") {
+                *behind = value.parse().ok();
+            }
+        }
     }
 }
 
@@ -1937,6 +2086,8 @@ fn message_title(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::{AgentKind, SessionSummary};
+    use chrono::Utc;
 
     #[tokio::test]
     async fn tts_stream_session_can_be_read_multiple_times_until_ttl() {
@@ -1982,5 +2133,127 @@ mod tests {
         assert_eq!(main.branch.as_deref(), Some("main"));
         assert_eq!(feature.branch.as_deref(), Some("feature"));
         assert_ne!(main.fingerprint, feature.fingerprint);
+    }
+
+    #[test]
+    fn parse_git_status_output_detects_dirty_detail() {
+        let status = parse_git_status_output(
+            "## feature...origin/feature [ahead 2, behind 1]\nM  staged.txt\n M unstaged.txt\n?? new.txt\n",
+        )
+        .expect("git status should parse");
+
+        assert_eq!(status.branch.as_deref(), Some("feature"));
+        assert_eq!(status.project_status, ProjectGitStatus::Dirty);
+        assert_eq!(status.detail.branch.as_deref(), Some("feature"));
+        assert!(status.detail.dirty);
+        assert!(status.detail.staged);
+        assert!(status.detail.unstaged);
+        assert!(status.detail.untracked);
+        assert_eq!(status.detail.ahead, Some(2));
+        assert_eq!(status.detail.behind, Some(1));
+    }
+
+    #[test]
+    fn parse_git_status_output_detects_clean_project() {
+        let status =
+            parse_git_status_output("## main...origin/main\n").expect("git status should parse");
+
+        assert_eq!(status.branch.as_deref(), Some("main"));
+        assert_eq!(status.project_status, ProjectGitStatus::Clean);
+        assert_eq!(status.detail.branch.as_deref(), Some("main"));
+        assert!(!status.detail.dirty);
+        assert!(!status.detail.staged);
+        assert!(!status.detail.unstaged);
+        assert!(!status.detail.untracked);
+        assert_eq!(status.detail.ahead, None);
+        assert_eq!(status.detail.behind, None);
+    }
+
+    #[test]
+    fn linked_session_merge_requires_live_local_session() {
+        let live_session_id = "live-local".to_string();
+        let archived_session_id = "archived-local".to_string();
+        let provider_session_id = "provider-session".to_string();
+        let now = Utc::now();
+
+        let local_session_ids =
+            std::collections::HashSet::from([live_session_id.clone()]);
+        let runtime_refs = std::collections::HashMap::from([
+            (live_session_id.clone(), provider_session_id.clone()),
+            (archived_session_id.clone(), provider_session_id.clone()),
+        ]);
+        let mut merged_sessions = std::collections::HashMap::from([
+            (
+                live_session_id.clone(),
+                SessionSummary {
+                    id: live_session_id.clone(),
+                    project_id: "project".to_string(),
+                    title: "local".to_string(),
+                    agent: AgentKind::Codex,
+                    brief_reply_mode: false,
+                    status: SessionStatus::Idle,
+                    updated_at: now,
+                    unread_count: 0,
+                    last_message_preview: Some("local".to_string()),
+                    pending_approval: None,
+                    provider_id: None,
+                },
+            ),
+            (
+                archived_session_id.clone(),
+                SessionSummary {
+                    id: archived_session_id.clone(),
+                    project_id: "project".to_string(),
+                    title: "archived".to_string(),
+                    agent: AgentKind::Codex,
+                    brief_reply_mode: false,
+                    status: SessionStatus::Idle,
+                    updated_at: now,
+                    unread_count: 0,
+                    last_message_preview: Some("archived".to_string()),
+                    pending_approval: None,
+                    provider_id: None,
+                },
+            ),
+            (
+                provider_session_id.clone(),
+                SessionSummary {
+                    id: provider_session_id.clone(),
+                    project_id: "project".to_string(),
+                    title: "provider".to_string(),
+                    agent: AgentKind::Codex,
+                    brief_reply_mode: false,
+                    status: SessionStatus::Running,
+                    updated_at: now,
+                    unread_count: 1,
+                    last_message_preview: Some("provider".to_string()),
+                    pending_approval: None,
+                    provider_id: None,
+                },
+            ),
+        ]);
+
+        for (session_id, session_ref) in runtime_refs {
+            if session_id == session_ref {
+                continue;
+            }
+            if !local_session_ids.contains(&session_id) {
+                continue;
+            }
+            let Some(local_session) = merged_sessions.get(&session_id).cloned() else {
+                continue;
+            };
+            let Some(provider_session) = merged_sessions.remove(&session_ref) else {
+                continue;
+            };
+            merged_sessions.insert(
+                session_id,
+                AppState::merge_linked_sessions(local_session, provider_session),
+            );
+        }
+
+        assert!(merged_sessions.contains_key(&live_session_id));
+        assert!(merged_sessions.contains_key(&archived_session_id));
+        assert!(!merged_sessions.contains_key(&provider_session_id));
     }
 }

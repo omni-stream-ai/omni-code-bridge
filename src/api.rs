@@ -16,9 +16,9 @@ use axum::{
         IntoResponse,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::{delete, get, patch, post},
+    routing::{delete, get, post},
 };
-use futures_util::stream::{Stream, StreamExt};
+use futures_util::stream::{self, Stream, StreamExt};
 use serde::Deserialize;
 use tokio_stream::wrappers::BroadcastStream;
 
@@ -97,7 +97,7 @@ pub fn router() -> Router<Arc<AppState>> {
             "/sessions/{id}/messages",
             get(list_messages).post(send_message),
         )
-        .route("/sessions/{id}", patch(update_session))
+        .route("/sessions/{id}", get(get_session).patch(update_session))
         .route("/sessions/{id}/summary", post(summarize_reply))
         .route("/agents", get(list_agents))
         .route("/agents/install", post(install_agent_handler))
@@ -349,6 +349,19 @@ async fn list_project_sessions(
         message: "project not found".to_string(),
     })?;
     Ok(Json(ApiResponse { data: sessions }))
+}
+
+async fn get_session(
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<ApiResponse<crate::models::SessionDetail>>, ApiError> {
+    authorize_request_status(&headers, &state).await?;
+    let session = state.get_session(&id).await.ok_or(ApiError {
+        status: StatusCode::NOT_FOUND,
+        message: "session not found".to_string(),
+    })?;
+    Ok(Json(ApiResponse { data: session }))
 }
 
 async fn transcribe_audio(
@@ -1617,31 +1630,43 @@ async fn session_events(
     State(state): State<Arc<AppState>>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
     authorize_request_status(&headers, &state).await?;
-    if state.list_messages(&id).await.is_none() {
-        return Err(ApiError {
-            status: StatusCode::NOT_FOUND,
-            message: "session not found".to_string(),
-        });
-    }
+    let detail = state.get_session(&id).await.ok_or(ApiError {
+        status: StatusCode::NOT_FOUND,
+        message: "session not found".to_string(),
+    })?;
 
-    let stream = BroadcastStream::new(state.subscribe()).filter_map(move |item| {
+    let initial_event = SessionEvent::SessionSnapshot(detail.session);
+    let initial_stream = stream::once(async move { sse_event_for_session_event(&initial_event) })
+        .filter_map(std::future::ready);
+
+    let broadcast_stream = BroadcastStream::new(state.subscribe()).filter_map(move |item| {
         let session_id = id.clone();
         async move {
             match item {
                 Ok(event) if event_belongs_to_session(&event, &session_id) => {
-                    let json = serde_json::to_string(&event).ok()?;
-                    Some(Ok(Event::default().event(event_name(&event)).data(json)))
+                    sse_event_for_session_event(&event)
                 }
                 _ => None,
             }
         }
     });
+    let stream = initial_stream.chain(broadcast_stream);
 
     Ok(Sse::new(stream).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(15))
             .text("keep-alive"),
     ))
+}
+
+fn sse_event_for_session_event(event: &SessionEvent) -> Option<Result<Event, Infallible>> {
+    let (name, json) = encode_session_event(event)?;
+    Some(Ok(Event::default().event(name).data(json)))
+}
+
+fn encode_session_event(event: &SessionEvent) -> Option<(&'static str, String)> {
+    let json = serde_json::to_string(event).ok()?;
+    Some((event_name(event), json))
 }
 
 async fn request_client_auth(
@@ -1925,10 +1950,11 @@ fn content_type_for_path(path: &StdPath) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        content_type_for_path, normalize_transcription_language,
+        content_type_for_path, encode_session_event, normalize_transcription_language,
         normalize_transcription_response_format, resolve_path_within_root, transcription_response,
         validate_speech_options, validate_transcription_options,
     };
+    use crate::models::{AgentKind, SessionEvent};
     use axum::{
         body::to_bytes,
         http::{StatusCode, header},
@@ -2049,6 +2075,29 @@ mod tests {
     #[test]
     fn speech_options_allow_numeric_voice_for_model_level_fallback() {
         assert!(validate_speech_options(None, "hello", Some("48"), None, None, None).is_ok());
+    }
+
+    #[test]
+    fn session_snapshot_can_be_encoded_as_sse_initial_event() {
+        let event = SessionEvent::SessionSnapshot(crate::models::SessionSummary {
+            id: "session-1".to_string(),
+            project_id: "project-1".to_string(),
+            title: "Existing session".to_string(),
+            agent: AgentKind::Codex,
+            brief_reply_mode: false,
+            status: crate::models::SessionStatus::Interrupted,
+            updated_at: chrono::Utc::now(),
+            unread_count: 0,
+            last_message_preview: Some("hello".to_string()),
+            pending_approval: None,
+            provider_id: None,
+        });
+
+        let (name, body) = encode_session_event(&event).expect("snapshot should encode");
+
+        assert_eq!(name, "session.snapshot");
+        assert!(body.contains("\"type\":\"session_snapshot\""));
+        assert!(body.contains("\"id\":\"session-1\""));
     }
 
     #[tokio::test]

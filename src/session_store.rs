@@ -443,6 +443,8 @@ fn parse_session_summary_file(path: &Path) -> Option<ParsedSessionSummaryRecord>
             updated_at,
             session_count: 1,
             last_session_preview: last_preview.clone(),
+            git_branch: None,
+            git_status: None,
         },
         session: SessionSummary {
             id: session_id,
@@ -454,7 +456,6 @@ fn parse_session_summary_file(path: &Path) -> Option<ParsedSessionSummaryRecord>
             updated_at,
             unread_count: 0,
             last_message_preview: last_preview,
-            git_branch: None,
             pending_approval: None,
             provider_id: None,
         },
