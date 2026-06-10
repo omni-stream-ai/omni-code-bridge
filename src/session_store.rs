@@ -369,6 +369,7 @@ fn parse_session_summary_file(path: &Path) -> Option<ParsedSessionSummaryRecord>
     let mut updated_at = None;
     let mut user_message_candidates = Vec::new();
     let mut last_preview = None;
+    let mut status = SessionStatus::Idle;
 
     for line in content.lines() {
         let value: Value = serde_json::from_str(line).ok()?;
@@ -398,6 +399,19 @@ fn parse_session_summary_file(path: &Path) -> Option<ParsedSessionSummaryRecord>
                         .and_then(Value::as_str)
                         .and_then(parse_timestamp)
                 });
+            }
+            "event_msg" if payload.get("type").and_then(Value::as_str) == Some("task_started") => {
+                status = SessionStatus::Running;
+            }
+            "event_msg"
+                if payload.get("type").and_then(Value::as_str) == Some("task_complete") =>
+            {
+                status = SessionStatus::Idle;
+            }
+            "event_msg"
+                if payload.get("type").and_then(Value::as_str) == Some("turn_aborted") =>
+            {
+                status = SessionStatus::Interrupted;
             }
             "event_msg" if payload.get("type").and_then(Value::as_str) == Some("user_message") => {
                 let text = payload
@@ -452,7 +466,7 @@ fn parse_session_summary_file(path: &Path) -> Option<ParsedSessionSummaryRecord>
             title: session_title,
             agent: AgentKind::Codex,
             brief_reply_mode: false,
-            status: SessionStatus::Idle,
+            status,
             updated_at,
             unread_count: 0,
             last_message_preview: last_preview,
@@ -705,6 +719,37 @@ mod tests {
         assert_eq!(record.session.last_message_preview.as_deref(), Some("done"));
         assert_eq!(record.project.name, "example-app");
         assert_eq!(record.project.session_count, 1);
+    }
+
+    #[test]
+    fn parse_session_summary_file_marks_unfinished_codex_task_as_running() {
+        let file = temp_jsonl_file(
+            "codex-running-summary",
+            &[
+                r#"{"timestamp":"2026-05-01T00:00:00Z","type":"session_meta","payload":{"id":"codex-running","cwd":"/tmp/example-app"}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"keep going"}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:02Z","type":"event_msg","payload":{"type":"task_started"}}"#,
+            ],
+        );
+
+        let record = parse_session_summary_file(&file).expect("summary should parse");
+        assert!(matches!(record.session.status, SessionStatus::Running));
+    }
+
+    #[test]
+    fn parse_session_summary_file_marks_aborted_codex_task_as_interrupted() {
+        let file = temp_jsonl_file(
+            "codex-interrupted-summary",
+            &[
+                r#"{"timestamp":"2026-05-01T00:00:00Z","type":"session_meta","payload":{"id":"codex-interrupted","cwd":"/tmp/example-app"}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"keep going"}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:02Z","type":"event_msg","payload":{"type":"task_started"}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:03Z","type":"event_msg","payload":{"type":"turn_aborted"}}"#,
+            ],
+        );
+
+        let record = parse_session_summary_file(&file).expect("summary should parse");
+        assert!(matches!(record.session.status, SessionStatus::Interrupted));
     }
 
     fn temp_jsonl_file(name: &str, lines: &[&str]) -> PathBuf {
