@@ -286,6 +286,17 @@ sh scripts/setup-git-hooks.sh
 
 首次克隆后，运行 `sh scripts/setup-git-hooks.sh` 以启用本地 `commit-msg` hook。
 
+### Session Trace
+
+查看本地 Codex 或 Claude transcript 中，某个会话最近几条发给 agent 的命令及其响应：
+
+```bash
+omni-code-bridge session-trace --session "<会话 id 或标题>"
+omni-code-bridge session-trace --session "<会话 id 或标题>" --limit 10
+```
+
+`--session` 支持会话 id、标题精确匹配，或标题模糊匹配。`--limit` 可选，默认是 `5`。
+
 ### 语音烟测脚本
 
 仓库里现在提供了一套本地端到端语音烟测脚本：

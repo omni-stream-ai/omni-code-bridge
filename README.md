@@ -286,6 +286,18 @@ sh scripts/setup-git-hooks.sh
 
 Run `sh scripts/setup-git-hooks.sh` once after cloning to enable the local `commit-msg` hook.
 
+### Session Trace
+
+Inspect the last few agent command/response pairs from a local Codex or Claude transcript:
+
+```bash
+omni-code-bridge session-trace --session "<session-id-or-title>"
+omni-code-bridge session-trace --session "<session-id-or-title>" --limit 10
+```
+
+`--session` accepts a session id, an exact title, or a partial title. `--limit` is optional and
+defaults to `5`.
+
 ### Speech Smoke Test
 
 For local validation there is an end-to-end smoke test script:

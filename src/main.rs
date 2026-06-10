@@ -13,6 +13,7 @@ mod models;
 mod push;
 mod realtime;
 mod session_store;
+mod session_trace;
 mod speaker;
 mod speech;
 mod tts;
@@ -54,6 +55,15 @@ enum Command {
     /// Manage client authorization
     #[command(subcommand)]
     ClientAuth(ClientAuthCommand),
+    /// Show recent agent command/response trace for a session
+    SessionTrace {
+        /// Session id, exact title, or partial title
+        #[arg(long)]
+        session: String,
+        /// Number of recent command/response pairs to show
+        #[arg(long, default_value_t = 5)]
+        limit: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -93,6 +103,9 @@ async fn run() -> Result<()> {
             project_root,
         }) => claude_hook::run_permission_hook(state_dir, session_id, run_id, project_root).await,
         Some(Command::ClientAuth(sub)) => handle_client_auth(sub).await,
+        Some(Command::SessionTrace { session, limit }) => {
+            session_trace::print_session_trace(&session, limit)
+        }
         Some(Command::Serve { port }) => serve(port).await,
         None => serve(8787).await,
     }
