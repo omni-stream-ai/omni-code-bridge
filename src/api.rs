@@ -28,9 +28,11 @@ use crate::{
     asr,
     bridge_settings::{BridgeSettings, BridgeSettingsInput},
     models::{
-        AgentInstallInput, AgentKind, AgentSummary, ApiError, ApiResponse, AppUpdateManifest,
+        AgentCommandForwarding, AgentCommandSummary, AgentCommandsSummary, AgentInstallInput,
+        AgentKind, AgentSummary, ApiError, ApiResponse, AppUpdateManifest,
         ApprovalDecisionInput, AudioSpeechStreamResponse, ClientAuthRequestInput,
-        CreateProjectInput, CreateSessionInput, OpenAiAudioSpeechRequest, OpenAiErrorDetail,
+        CreateProjectInput, CreateSessionInput, FileCompletionItem, FileCompletionQuery,
+        OpenAiAudioSpeechRequest, OpenAiErrorDetail,
         OpenAiErrorResponse, OpenAiModel, OpenAiModelList, OpenAiTranscriptionResponse,
         OpenAiVerboseTranscriptionResponse, OpenAiVerboseTranscriptionSegment,
         RegisterPushDeviceInput, ReplySummary, SendMessageInput, SessionEvent,
@@ -49,6 +51,7 @@ pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/health", get(health))
         .route("/files", get(get_file_by_path))
+        .route("/files/completions", get(list_file_completions))
         .route("/app-update/manifest", get(app_update_manifest))
         .route("/app-update/apk", get(download_app_update_apk))
         .route("/client-auth/requests", post(request_client_auth))
@@ -100,6 +103,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/sessions/{id}", get(get_session).patch(update_session))
         .route("/sessions/{id}/summary", post(summarize_reply))
         .route("/agents", get(list_agents))
+        .route("/agents/commands", get(list_agent_commands))
         .route("/agents/install", post(install_agent_handler))
         .route(
             "/sessions/{id}/approvals/{request_id}",
@@ -251,6 +255,17 @@ async fn get_file_by_path(
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
 
     Ok((StatusCode::OK, headers, Body::from(bytes)))
+}
+
+async fn list_file_completions(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<FileCompletionQuery>,
+) -> Result<Json<ApiResponse<Vec<FileCompletionItem>>>, ApiError> {
+    authorize_request(&headers, &state).await?;
+    let root = resolve_completion_root(&state, &query).await?;
+    let items = list_completion_items(&root, &query)?;
+    Ok(Json(ApiResponse { data: items }))
 }
 
 async fn get_settings(headers: HeaderMap, State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -1574,6 +1589,21 @@ async fn list_agents(headers: HeaderMap, State(state): State<Arc<AppState>>) -> 
     Json(ApiResponse { data: agents }).into_response()
 }
 
+async fn list_agent_commands(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    if let Err(error) = authorize_request(&headers, &state).await {
+        return error.into_response();
+    }
+    let commands = vec![
+        agent_commands_summary(AgentKind::Codex),
+        agent_commands_summary(AgentKind::ClaudeCode),
+        agent_commands_summary(AgentKind::OpenCode),
+    ];
+    Json(ApiResponse { data: commands }).into_response()
+}
+
 async fn install_agent_handler(
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
@@ -1587,26 +1617,143 @@ async fn install_agent_handler(
 }
 
 fn agent_summary(kind: AgentKind) -> AgentSummary {
-    let binary_name = match kind {
-        AgentKind::Codex => "codex",
-        AgentKind::ClaudeCode => "claude",
-        AgentKind::OpenCode => "opencode",
-        AgentKind::Custom => {
-            return AgentSummary {
-                kind,
-                installed: false,
-                installed_path: None,
-                install_hint: "Custom agent does not support auto-install".to_string(),
-            };
-        }
-    };
+    let (id, label, aliases, selectable, default_selected, compatible_formats, binary_name) =
+        agent_descriptor(kind);
+    if matches!(kind, AgentKind::Custom) {
+        return AgentSummary {
+            kind,
+            id: id.to_string(),
+            label: label.to_string(),
+            aliases: aliases.into_iter().map(ToString::to_string).collect(),
+            selectable,
+            default_selected,
+            compatible_formats,
+            installed: false,
+            installed_path: None,
+            install_hint: "Custom agent does not support auto-install".to_string(),
+        };
+    }
     let installed_path = adapter::find_executable_in_path(binary_name);
     AgentSummary {
         kind,
+        id: id.to_string(),
+        label: label.to_string(),
+        aliases: aliases.into_iter().map(ToString::to_string).collect(),
+        selectable,
+        default_selected,
+        compatible_formats,
         installed: installed_path.is_some(),
         installed_path: installed_path.map(|p| p.display().to_string()),
         install_hint: adapter::manual_install_hint(kind),
     }
+}
+
+fn agent_descriptor(
+    kind: AgentKind,
+) -> (
+    &'static str,
+    &'static str,
+    Vec<&'static str>,
+    bool,
+    bool,
+    Vec<crate::models::ApiFormat>,
+    &'static str,
+) {
+    match kind {
+        AgentKind::Codex => (
+            "codex",
+            "Codex",
+            vec!["codex"],
+            true,
+            true,
+            vec![crate::models::ApiFormat::Codex],
+            "codex",
+        ),
+        AgentKind::ClaudeCode => (
+            "claude_code",
+            "Claude Code",
+            vec!["claude_code", "claudecode"],
+            true,
+            false,
+            vec![crate::models::ApiFormat::AnthropicMessages],
+            "claude",
+        ),
+        AgentKind::OpenCode => (
+            "open_code",
+            "OpenCode",
+            vec!["open_code"],
+            true,
+            false,
+            vec![
+                crate::models::ApiFormat::OpenAiCompatible,
+                crate::models::ApiFormat::AnthropicMessages,
+                crate::models::ApiFormat::Codex,
+            ],
+            "opencode",
+        ),
+        AgentKind::Custom => (
+            "custom",
+            "Agent",
+            Vec::new(),
+            false,
+            false,
+            vec![crate::models::ApiFormat::OpenAiCompatible],
+            "",
+        ),
+    }
+}
+
+fn agent_commands_summary(kind: AgentKind) -> AgentCommandsSummary {
+    let commands = match kind {
+        AgentKind::Codex => vec![
+            AgentCommandSummary {
+                name: "/compact".to_string(),
+                args_hint: None,
+                description: "Compact current thread context".to_string(),
+                forwarding: AgentCommandForwarding::Native,
+            },
+            AgentCommandSummary {
+                name: "/review".to_string(),
+                args_hint: Some("[instructions]".to_string()),
+                description: "Review uncommitted changes or run a custom review".to_string(),
+                forwarding: AgentCommandForwarding::Native,
+            },
+            AgentCommandSummary {
+                name: "/rename".to_string(),
+                args_hint: Some("<title>".to_string()),
+                description: "Rename current session".to_string(),
+                forwarding: AgentCommandForwarding::Native,
+            },
+            AgentCommandSummary {
+                name: "/goal".to_string(),
+                args_hint: Some("<objective>".to_string()),
+                description: "Set the current thread goal".to_string(),
+                forwarding: AgentCommandForwarding::Native,
+            },
+            AgentCommandSummary {
+                name: "/clear-goal".to_string(),
+                args_hint: None,
+                description: "Clear the current thread goal".to_string(),
+                forwarding: AgentCommandForwarding::Native,
+            },
+        ],
+        AgentKind::ClaudeCode => vec![
+            AgentCommandSummary {
+                name: "/clear".to_string(),
+                args_hint: None,
+                description: "Clear the current Claude session context".to_string(),
+                forwarding: AgentCommandForwarding::Wrapped,
+            },
+            AgentCommandSummary {
+                name: "/skill-creator".to_string(),
+                args_hint: Some("<task>".to_string()),
+                description: "Invoke the Claude skill creator slash command".to_string(),
+                forwarding: AgentCommandForwarding::Wrapped,
+            },
+        ],
+        AgentKind::OpenCode | AgentKind::Custom => Vec::new(),
+    };
+    AgentCommandsSummary { kind, commands }
 }
 
 async fn resolve_approval(
@@ -1846,6 +1993,207 @@ async fn resolve_authorized_file_path(
         .into())
 }
 
+async fn resolve_completion_root(
+    state: &AppState,
+    query: &FileCompletionQuery,
+) -> Result<PathBuf, ApiError> {
+    let project_id = query
+        .project_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let session_id = query
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    if project_id.is_some() && session_id.is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "project_id and session_id cannot be used together".to_string(),
+        )
+            .into());
+    }
+
+    if let Some(session_id) = session_id {
+        let project_root = state
+            .project_root_path_for_session(session_id)
+            .await
+            .map_err(|error| (StatusCode::NOT_FOUND, error))?;
+        return canonicalize_local_directory(&project_root).map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("session {session_id} is not backed by a local project directory"),
+            )
+                .into()
+        });
+    }
+
+    if let Some(project_id) = project_id {
+        let project = state
+            .list_projects()
+            .await
+            .into_iter()
+            .find(|project| project.id == project_id)
+            .ok_or(ApiError {
+                status: StatusCode::NOT_FOUND,
+                message: format!("unknown project: {project_id}"),
+            })?;
+        return canonicalize_local_directory(&project.root_path).map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("project {project_id} is not backed by a local directory"),
+            )
+                .into()
+        });
+    }
+
+    Err((
+        StatusCode::BAD_REQUEST,
+        "file completion requires project_id or session_id".to_string(),
+    )
+        .into())
+}
+
+fn list_completion_items(
+    root: &StdPath,
+    query: &FileCompletionQuery,
+) -> Result<Vec<FileCompletionItem>, ApiError> {
+    let prefix = query.prefix.trim();
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let normalized_prefix = normalize_completion_prefix(prefix)?;
+    let (search_dir, file_prefix) = completion_search_scope(root, &normalized_prefix)?;
+
+    let entries = std::fs::read_dir(&search_dir).map_err(map_completion_dir_error)?;
+    let mut items = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let file_name = entry.file_name();
+            let file_name = file_name.to_str()?;
+            if !file_name.starts_with(file_prefix) {
+                return None;
+            }
+            let path = entry.path();
+            let is_dir = path.is_dir();
+            let relative = path.strip_prefix(root).ok()?.to_string_lossy().replace('\\', "/");
+            let path = if is_dir {
+                format!("{relative}/")
+            } else {
+                relative
+            };
+            Some(FileCompletionItem { path, is_dir })
+        })
+        .collect::<Vec<_>>();
+
+    items.sort_by(|a, b| a.path.cmp(&b.path));
+    items.truncate(limit);
+    Ok(items)
+}
+
+fn normalize_completion_prefix(prefix: &str) -> Result<String, ApiError> {
+    let prefix = prefix.trim();
+    if prefix.is_empty() {
+        return Ok(String::new());
+    }
+    if prefix.starts_with('/') {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "absolute prefix is not supported for file completion".to_string(),
+        )
+            .into());
+    }
+
+    let mut normalized = String::new();
+    for component in StdPath::new(prefix).components() {
+        match component {
+            std::path::Component::Normal(segment) => {
+                if !normalized.is_empty() {
+                    normalized.push('/');
+                }
+                normalized.push_str(&segment.to_string_lossy());
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "prefix cannot traverse outside the project root".to_string(),
+                )
+                    .into())
+            }
+            _ => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "invalid prefix for file completion".to_string(),
+                )
+                    .into())
+            }
+        }
+    }
+
+    if prefix.ends_with('/') && !normalized.is_empty() {
+        normalized.push('/');
+    }
+    Ok(normalized)
+}
+
+fn completion_search_scope<'a>(
+    root: &'a StdPath,
+    prefix: &'a str,
+) -> Result<(PathBuf, &'a str), ApiError> {
+    let (dir_part, file_prefix) = match prefix.rsplit_once('/') {
+        Some((dir, tail)) => (dir, tail),
+        None => ("", prefix),
+    };
+    let search_dir = if dir_part.is_empty() {
+        root.to_path_buf()
+    } else {
+        resolve_directory_within_root(root, StdPath::new(dir_part))
+            .map_err(map_completion_dir_error)?
+    };
+    Ok((search_dir, file_prefix))
+}
+
+fn resolve_directory_within_root(root: &StdPath, requested_path: &StdPath) -> io::Result<PathBuf> {
+    let candidate = root.join(requested_path);
+    let candidate = std::fs::canonicalize(candidate)?;
+    if !candidate.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path is not a directory",
+        ));
+    }
+    if candidate.starts_with(root) {
+        return Ok(candidate);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "path is outside allowed project roots",
+    ))
+}
+
+fn map_completion_dir_error(error: io::Error) -> ApiError {
+    let (status, message) = match error.kind() {
+        io::ErrorKind::NotFound => (
+            StatusCode::NOT_FOUND,
+            "completion directory not found".to_string(),
+        ),
+        io::ErrorKind::PermissionDenied => (
+            StatusCode::FORBIDDEN,
+            "completion path is outside allowed project roots".to_string(),
+        ),
+        io::ErrorKind::InvalidInput => (
+            StatusCode::BAD_REQUEST,
+            "completion path does not point to a directory".to_string(),
+        ),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to enumerate files: {error}"),
+        ),
+    };
+    ApiError { status, message }
+}
+
 fn canonicalize_local_directory(path: impl AsRef<StdPath>) -> io::Result<PathBuf> {
     let path = std::fs::canonicalize(path)?;
     if !path.is_dir() {
@@ -1950,11 +2298,13 @@ fn content_type_for_path(path: &StdPath) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        content_type_for_path, encode_session_event, normalize_transcription_language,
-        normalize_transcription_response_format, resolve_path_within_root, transcription_response,
-        validate_speech_options, validate_transcription_options,
+        agent_commands_summary, agent_summary, completion_search_scope, content_type_for_path,
+        encode_session_event, list_completion_items, normalize_completion_prefix,
+        normalize_transcription_language, normalize_transcription_response_format,
+        resolve_path_within_root, transcription_response, validate_speech_options,
+        validate_transcription_options,
     };
-    use crate::models::{AgentKind, SessionEvent};
+    use crate::models::{AgentKind, FileCompletionQuery, SessionEvent};
     use axum::{
         body::to_bytes,
         http::{StatusCode, header},
@@ -1997,6 +2347,97 @@ mod tests {
 
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
         fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn file_completion_normalizes_relative_prefix() {
+        assert_eq!(
+            normalize_completion_prefix(" src/api").unwrap(),
+            "src/api"
+        );
+        assert_eq!(
+            normalize_completion_prefix("./src/api.rs").unwrap(),
+            "src/api.rs"
+        );
+        assert_eq!(normalize_completion_prefix("src/").unwrap(), "src/");
+    }
+
+    #[test]
+    fn file_completion_rejects_absolute_and_parent_prefixes() {
+        let absolute = normalize_completion_prefix("/tmp").unwrap_err();
+        assert_eq!(absolute.status, StatusCode::BAD_REQUEST);
+
+        let parent = normalize_completion_prefix("../secret").unwrap_err();
+        assert_eq!(parent.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn file_completion_search_scope_uses_prefix_parent_directory() {
+        let root = test_dir("file-api-completion-scope");
+        let src = root.join("src");
+        fs::create_dir_all(&src).unwrap();
+
+        let canonical_root = fs::canonicalize(&root).unwrap();
+        let (search_dir, file_prefix) =
+            completion_search_scope(&canonical_root, "src/ap").unwrap();
+
+        assert_eq!(search_dir, fs::canonicalize(src).unwrap());
+        assert_eq!(file_prefix, "ap");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn file_completion_lists_matching_files_and_directories() {
+        let root = test_dir("file-api-completion-list");
+        let src = root.join("src");
+        let docs = root.join("docs");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&docs).unwrap();
+        fs::write(src.join("api.rs"), "").unwrap();
+        fs::write(src.join("app.rs"), "").unwrap();
+        fs::write(src.join("main.rs"), "").unwrap();
+
+        let canonical_root = fs::canonicalize(&root).unwrap();
+        let items = list_completion_items(
+            &canonical_root,
+            &FileCompletionQuery {
+                prefix: "src/ap".to_string(),
+                project_id: None,
+                session_id: None,
+                limit: Some(10),
+            },
+        )
+        .unwrap();
+
+        let paths = items.iter().map(|item| item.path.as_str()).collect::<Vec<_>>();
+        assert_eq!(paths, vec!["src/api.rs", "src/app.rs"]);
+        assert!(items.iter().all(|item| !item.is_dir));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn file_completion_appends_slash_for_directories() {
+        let root = test_dir("file-api-completion-dir");
+        let src = root.join("src");
+        fs::create_dir_all(src.join("api")).unwrap();
+        fs::write(src.join("app.rs"), "").unwrap();
+
+        let canonical_root = fs::canonicalize(&root).unwrap();
+        let items = list_completion_items(
+            &canonical_root,
+            &FileCompletionQuery {
+                prefix: "src/ap".to_string(),
+                project_id: None,
+                session_id: None,
+                limit: Some(10),
+            },
+        )
+        .unwrap();
+
+        let paths = items.iter().map(|item| item.path.as_str()).collect::<Vec<_>>();
+        assert_eq!(paths, vec!["src/api/", "src/app.rs"]);
+        assert!(items.iter().any(|item| item.is_dir && item.path == "src/api/"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2098,6 +2539,35 @@ mod tests {
         assert_eq!(name, "session.snapshot");
         assert!(body.contains("\"type\":\"session_snapshot\""));
         assert!(body.contains("\"id\":\"session-1\""));
+    }
+
+    #[test]
+    fn agent_commands_summary_exposes_supported_slash_commands() {
+        let codex = agent_commands_summary(AgentKind::Codex);
+        assert!(codex.commands.iter().any(|command| command.name == "/compact"));
+        assert!(codex.commands.iter().any(|command| command.name == "/goal"));
+
+        let claude = agent_commands_summary(AgentKind::ClaudeCode);
+        assert!(claude.commands.iter().any(|command| command.name == "/clear"));
+
+        let opencode = agent_commands_summary(AgentKind::OpenCode);
+        assert!(opencode.commands.is_empty());
+    }
+
+    #[test]
+    fn agent_summary_exposes_descriptor_metadata() {
+        let codex = agent_summary(AgentKind::Codex);
+        assert_eq!(codex.id, "codex");
+        assert_eq!(codex.label, "Codex");
+        assert!(codex.default_selected);
+        assert_eq!(codex.compatible_formats.len(), 1);
+
+        let claude = agent_summary(AgentKind::ClaudeCode);
+        assert!(claude.aliases.contains(&"claudecode".to_string()));
+        assert!(!claude.default_selected);
+
+        let custom = agent_summary(AgentKind::Custom);
+        assert!(!custom.selectable);
     }
 
     #[tokio::test]

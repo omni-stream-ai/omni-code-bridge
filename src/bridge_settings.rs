@@ -81,8 +81,7 @@ impl Default for BridgeSettings {
 }
 
 impl BridgeSettingsStore {
-    pub async fn load() -> Self {
-        let path = settings_path();
+    pub async fn load_from_path(path: PathBuf) -> Self {
         let settings = match tokio::fs::read_to_string(&path).await {
             Ok(body) => match serde_json::from_str::<BridgeSettings>(&body) {
                 Ok(settings) => settings,

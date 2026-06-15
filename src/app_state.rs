@@ -164,8 +164,13 @@ impl AppState {
     const LIST_CACHE_TTL: Duration = Duration::from_secs(5);
 
     pub async fn new() -> Self {
-        let (event_tx, _) = broadcast::channel(256);
+        let settings_path = crate::bridge_settings::settings_path();
         let runtime_store_path = runtime_store_path();
+        Self::new_with_paths(settings_path, runtime_store_path).await
+    }
+
+    async fn new_with_paths(settings_path: PathBuf, runtime_store_path: PathBuf) -> Self {
+        let (event_tx, _) = broadcast::channel(256);
         let persisted_runtime = load_persisted_runtime(&runtime_store_path).await;
         Self {
             projects: RwLock::new(HashMap::new()),
@@ -183,7 +188,7 @@ impl AppState {
             ),
             event_tx,
             providers: ProviderRegistry::new(),
-            settings: BridgeSettingsStore::load().await,
+            settings: BridgeSettingsStore::load_from_path(settings_path).await,
             speech: Arc::new(SpeechService::load().await),
             client_auth: ClientAuthStore::load().await,
             push: PushService::new(),
@@ -1590,6 +1595,39 @@ impl AppState {
         Ok(summary)
     }
 
+    pub async fn update_session_title(
+        &self,
+        session_id: &str,
+        title: String,
+    ) -> Result<SessionSummary, String> {
+        let title = title.trim().to_string();
+        if title.is_empty() {
+            return Err("session title cannot be empty".to_string());
+        }
+
+        let mut sessions = self.sessions.write().await;
+        let mut session = sessions.remove(session_id);
+        drop(sessions);
+        if session.is_none() {
+            session = self.find_session(session_id).await;
+        }
+        let mut current = session.ok_or_else(|| format!("unknown session: {session_id}"))?;
+        current.title = title;
+        current.updated_at = Utc::now();
+        let project_id = current.project_id.clone();
+        let summary = current.clone();
+        self.sessions
+            .write()
+            .await
+            .insert(current.id.clone(), current);
+        self.invalidate_list_cache().await;
+        self.refresh_project_summary(&project_id).await;
+        let _ = self
+            .event_tx
+            .send(SessionEvent::SessionSnapshot(summary.clone()));
+        Ok(summary)
+    }
+
     async fn refresh_project_summary(&self, project_id: &str) {
         let cache = self.ensure_list_cache().await;
         let sessions = cache
@@ -2109,10 +2147,25 @@ mod tests {
         models::{AUTO_PROVIDER_ID, AgentKind, ApiFormat, ModelProviderConfig, SessionSummary},
     };
     use chrono::Utc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_path(prefix: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("omni-code-bridge-{prefix}-{unique}.json"))
+    }
+
+    async fn test_state(prefix: &str) -> AppState {
+        let settings_path = test_path(&format!("{prefix}-settings"));
+        let runtime_path = test_path(&format!("{prefix}-runtime"));
+        AppState::new_with_paths(settings_path, runtime_path).await
+    }
 
     #[tokio::test]
     async fn tts_stream_session_can_be_read_multiple_times_until_ttl() {
-        let state = AppState::new().await;
+        let state = test_state("tts-stream-session").await;
         let session = state
             .create_tts_stream_session(
                 "model".to_string(),
@@ -2287,7 +2340,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_provider_config_skips_when_provider_id_missing() {
-        let state = AppState::new().await;
+        let state = test_state("provider-config-missing").await;
         state
             .update_bridge_settings(BridgeSettingsInput {
                 ai_approval: AiApprovalSettings::default(),
@@ -2328,7 +2381,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_provider_config_auto_uses_priority_provider() {
-        let state = AppState::new().await;
+        let state = test_state("provider-config-auto").await;
         state
             .update_bridge_settings(BridgeSettingsInput {
                 ai_approval: AiApprovalSettings::default(),
@@ -2383,7 +2436,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_provider_config_explicit_message_provider_overrides_auto() {
-        let state = AppState::new().await;
+        let state = test_state("provider-config-explicit").await;
         state
             .update_bridge_settings(BridgeSettingsInput {
                 ai_approval: AiApprovalSettings::default(),

@@ -501,6 +501,76 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parse_slash_command_extracts_name_and_args() {
+        let command = parse_slash_command("/model gpt-5").expect("should parse");
+        assert_eq!(command.name, "model");
+        assert_eq!(command.args, "gpt-5");
+
+        let no_args = parse_slash_command("  /clear  ").expect("should parse");
+        assert_eq!(no_args.name, "clear");
+        assert_eq!(no_args.args, "");
+    }
+
+    #[test]
+    fn parse_slash_command_rejects_plain_text() {
+        assert!(parse_slash_command("hello").is_none());
+        assert!(parse_slash_command("/").is_none());
+        assert!(parse_slash_command("//bad").is_none());
+    }
+
+    #[test]
+    fn claude_prompt_input_wraps_slash_commands() {
+        assert_eq!(
+            claude_prompt_input("/clear"),
+            "<command-name>/clear</command-name>\n<command-message>clear</command-message>\n<command-args></command-args>"
+        );
+        assert_eq!(
+            claude_prompt_input("/skill-creator 写一个 <skill>"),
+            "<command-name>/skill-creator</command-name>\n<command-message>skill-creator</command-message>\n<command-args>写一个 &lt;skill&gt;</command-args>"
+        );
+    }
+
+    #[test]
+    fn claude_prompt_input_keeps_plain_text_unchanged() {
+        assert_eq!(claude_prompt_input("fix this bug"), "fix this bug");
+    }
+
+    #[test]
+    fn classify_codex_slash_command_maps_supported_commands() {
+        assert_eq!(
+            classify_codex_slash_command("/compact"),
+            Some(CodexSlashAction::Compact)
+        );
+        assert_eq!(
+            classify_codex_slash_command("/review"),
+            Some(CodexSlashAction::ReviewUncommittedChanges)
+        );
+        assert_eq!(
+            classify_codex_slash_command("/review check auth flow"),
+            Some(CodexSlashAction::ReviewCustom {
+                instructions: "check auth flow"
+            })
+        );
+        assert_eq!(
+            classify_codex_slash_command("/rename New Session"),
+            Some(CodexSlashAction::Rename {
+                title: "New Session"
+            })
+        );
+        assert_eq!(
+            classify_codex_slash_command("/goal finish bridge slash forwarding"),
+            Some(CodexSlashAction::GoalSet {
+                objective: "finish bridge slash forwarding"
+            })
+        );
+        assert_eq!(
+            classify_codex_slash_command("/clear-goal"),
+            Some(CodexSlashAction::GoalClear)
+        );
+        assert_eq!(classify_codex_slash_command("/model gpt-5"), None);
+    }
+
     #[tokio::test]
     async fn stub_provider_completes_when_called_directly() {
         let state = Arc::new(AppState::new().await);
@@ -873,6 +943,59 @@ impl OpenCodeProvider {
     fn new() -> Self {
         Self
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SlashCommand<'a> {
+    name: &'a str,
+    args: &'a str,
+}
+
+fn parse_slash_command(input: &str) -> Option<SlashCommand<'_>> {
+    let trimmed = input.trim();
+    if !trimmed.starts_with('/') || trimmed.len() <= 1 {
+        return None;
+    }
+
+    let without_slash = &trimmed[1..];
+    let command_end = without_slash
+        .find(char::is_whitespace)
+        .unwrap_or(without_slash.len());
+    let name = without_slash[..command_end].trim();
+    if name.is_empty() || name.contains('/') {
+        return None;
+    }
+
+    let args = without_slash[command_end..].trim();
+    Some(SlashCommand { name, args })
+}
+
+fn escape_command_wrapper_text(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn claude_prompt_input(text: &str) -> String {
+    let Some(command) = parse_slash_command(text) else {
+        return text.to_string();
+    };
+
+    format!(
+        "<command-name>/{}</command-name>\n<command-message>{}</command-message>\n<command-args>{}</command-args>",
+        escape_command_wrapper_text(command.name),
+        escape_command_wrapper_text(command.name),
+        escape_command_wrapper_text(command.args),
+    )
 }
 
 #[async_trait]
@@ -2017,20 +2140,106 @@ async fn run_codex(
     }
     parsed.session_id = Some(thread_id.clone());
 
-    let turn_request_id = send_json_rpc_request(
+    if let Some(response_text) = handle_codex_immediate_slash_command(
+        &state,
+        session,
         &mut stdin,
         &mut next_request_id,
-        "turn/start",
-        serde_json::json!({
-            "threadId": thread_id,
-            "input": [{
-                "type": "text",
-                "text": input.content,
-                "text_elements": [],
-            }],
-        }),
+        &mut stdout_rx,
+        &mut raw_stdout,
+        &thread_id,
+        input,
     )
-    .await?;
+    .await?
+    {
+        let mut last_rendered = String::new();
+        push_incremental_text(
+            &state,
+            &session.id,
+            &reply.id,
+            &mut last_rendered,
+            &response_text,
+        )
+        .await;
+        stderr_task.abort();
+        state
+            .finish_assistant_message(&session.id, &reply.id)
+            .await
+            .map_err(anyhow::Error::msg)?;
+        return Ok(());
+    }
+
+    let (turn_request_id, slash_status_message) =
+        match classify_codex_slash_command(&input.content) {
+            Some(CodexSlashAction::Compact) => (
+                send_json_rpc_request(
+                    &mut stdin,
+                    &mut next_request_id,
+                    "thread/compact/start",
+                    serde_json::json!({
+                        "threadId": thread_id,
+                    }),
+                )
+                .await?,
+                Some("[codex] running /compact".to_string()),
+            ),
+            Some(CodexSlashAction::ReviewUncommittedChanges) => (
+                send_json_rpc_request(
+                    &mut stdin,
+                    &mut next_request_id,
+                    "review/start",
+                    serde_json::json!({
+                        "threadId": thread_id,
+                        "target": {
+                            "type": "uncommittedChanges"
+                        },
+                        "delivery": "inline",
+                    }),
+                )
+                .await?,
+                Some("[codex] running /review".to_string()),
+            ),
+            Some(CodexSlashAction::ReviewCustom { instructions }) => (
+                send_json_rpc_request(
+                    &mut stdin,
+                    &mut next_request_id,
+                    "review/start",
+                    serde_json::json!({
+                        "threadId": thread_id,
+                        "target": {
+                            "type": "custom",
+                            "instructions": instructions,
+                        },
+                        "delivery": "inline",
+                    }),
+                )
+                .await?,
+                Some(format!("[codex] running /review {}", instructions)),
+            ),
+            Some(CodexSlashAction::Rename { .. })
+            | Some(CodexSlashAction::GoalSet { .. })
+            | Some(CodexSlashAction::GoalClear) => unreachable!("handled above"),
+            None => (
+                send_json_rpc_request(
+                    &mut stdin,
+                    &mut next_request_id,
+                    "turn/start",
+                    serde_json::json!({
+                        "threadId": thread_id,
+                        "input": [{
+                            "type": "text",
+                            "text": input.content,
+                            "text_elements": [],
+                        }],
+                    }),
+                )
+                .await?,
+                None,
+            ),
+        };
+    if let Some(status_message) = slash_status_message {
+        state.emit_system_message(&session.id, status_message).await;
+    }
 
     let idle_deadline = Duration::from_secs(15);
     let idle_sleep = tokio::time::sleep(idle_deadline);
@@ -2063,7 +2272,7 @@ async fn run_codex(
                         let message = error
                             .get("message")
                             .and_then(Value::as_str)
-                            .unwrap_or("codex turn/start failed");
+                            .unwrap_or("codex request failed");
                         bail!("{message}");
                     }
                     continue;
@@ -2199,6 +2408,73 @@ async fn run_codex(
         .await
         .map_err(anyhow::Error::msg)?;
     Ok(())
+}
+
+async fn handle_codex_immediate_slash_command(
+    state: &AppState,
+    session: &SessionSummary,
+    stdin: &mut (impl AsyncWrite + Unpin),
+    next_request_id: &mut u64,
+    stdout_rx: &mut mpsc::UnboundedReceiver<Result<String, String>>,
+    raw_stdout: &mut String,
+    thread_id: &str,
+    input: &ChatMessage,
+) -> Result<Option<String>> {
+    let Some(command) = classify_codex_slash_command(&input.content) else {
+        return Ok(None);
+    };
+
+    let (method, params, response_text, updated_title) = match command {
+        CodexSlashAction::Rename { title } => (
+            "thread/name/set",
+            serde_json::json!({
+                "threadId": thread_id,
+                "name": title,
+            }),
+            format!("Session renamed to: {title}"),
+            Some(title.to_string()),
+        ),
+        CodexSlashAction::GoalSet { objective } => (
+            "thread/goal/set",
+            serde_json::json!({
+                "threadId": thread_id,
+                "objective": objective,
+                "status": "active",
+            }),
+            format!("Goal set: {objective}"),
+            None,
+        ),
+        CodexSlashAction::GoalClear => (
+            "thread/goal/clear",
+            serde_json::json!({
+                "threadId": thread_id,
+            }),
+            "Goal cleared.".to_string(),
+            None,
+        ),
+        CodexSlashAction::Compact
+        | CodexSlashAction::ReviewUncommittedChanges
+        | CodexSlashAction::ReviewCustom { .. } => return Ok(None),
+    };
+
+    let request_id =
+        send_json_rpc_request(stdin, next_request_id, method, params).await?;
+    let response = wait_for_json_rpc_response(stdout_rx, raw_stdout, request_id).await?;
+    if let Some(error) = response.get("error") {
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("codex request failed");
+        bail!("{message}");
+    }
+
+    if let Some(title) = updated_title {
+        state
+            .update_session_title(&session.id, title)
+            .await
+            .map_err(anyhow::Error::msg)?;
+    }
+    Ok(Some(response_text))
 }
 
 async fn run_claude_code(
@@ -2346,7 +2622,7 @@ async fn run_claude_code(
         command.arg("--session-id").arg(&runtime_ref);
     }
     command
-        .arg(&input.content)
+        .arg(claude_prompt_input(&input.content))
         .current_dir(&project_root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -3010,6 +3286,35 @@ enum CodexAppServerEvent {
 struct PendingApproval {
     request: ApprovalRequest,
     last_choice: Option<ApprovalChoice>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CodexSlashAction<'a> {
+    Compact,
+    ReviewUncommittedChanges,
+    ReviewCustom { instructions: &'a str },
+    Rename { title: &'a str },
+    GoalSet { objective: &'a str },
+    GoalClear,
+}
+
+fn classify_codex_slash_command(input: &str) -> Option<CodexSlashAction<'_>> {
+    let command = parse_slash_command(input)?;
+    match command.name {
+        "compact" if command.args.is_empty() => Some(CodexSlashAction::Compact),
+        "review" if command.args.is_empty() => Some(CodexSlashAction::ReviewUncommittedChanges),
+        "review" => Some(CodexSlashAction::ReviewCustom {
+            instructions: command.args,
+        }),
+        "rename" if !command.args.is_empty() => Some(CodexSlashAction::Rename {
+            title: command.args,
+        }),
+        "goal" if !command.args.is_empty() => Some(CodexSlashAction::GoalSet {
+            objective: command.args,
+        }),
+        "clear-goal" if command.args.is_empty() => Some(CodexSlashAction::GoalClear),
+        _ => None,
+    }
 }
 
 impl CodexAppServerStreamingState {

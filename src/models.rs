@@ -340,6 +340,23 @@ pub struct ApiResponse<T> {
     pub data: T,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileCompletionQuery {
+    pub prefix: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileCompletionItem {
+    pub path: String,
+    pub is_dir: bool,
+}
+
 /// Unified JSON error response: `{"error": "message"}`
 #[derive(Debug)]
 pub struct ApiError {
@@ -727,8 +744,37 @@ pub struct AgentInstallInput {
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentSummary {
     pub kind: AgentKind,
+    pub id: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+    pub selectable: bool,
+    pub default_selected: bool,
+    pub compatible_formats: Vec<ApiFormat>,
     pub installed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub installed_path: Option<String>,
     pub install_hint: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentCommandForwarding {
+    Native,
+    Wrapped,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentCommandSummary {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args_hint: Option<String>,
+    pub description: String,
+    pub forwarding: AgentCommandForwarding,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentCommandsSummary {
+    pub kind: AgentKind,
+    pub commands: Vec<AgentCommandSummary>,
 }
