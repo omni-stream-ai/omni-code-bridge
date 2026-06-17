@@ -1080,6 +1080,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "base64",
  "bzip2 0.6.1",
  "chrono",
  "clap",

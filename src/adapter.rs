@@ -304,6 +304,123 @@ mod tests {
     }
 
     #[test]
+    fn codex_streaming_state_maps_tool_process_status_events() {
+        let mut state = CodexAppServerStreamingState::default();
+
+        match state.ingest_value(&serde_json::json!({
+            "method": "thread/name/updated",
+            "params": {
+                "threadId": "thread-1",
+                "threadName": "Investigate provider switching"
+            }
+        })) {
+            CodexAppServerEvent::Status(status) => {
+                assert_eq!(status, "[thread] renamed: Investigate provider switching")
+            }
+            _ => panic!("expected thread rename status"),
+        }
+
+        match state.ingest_value(&serde_json::json!({
+            "method": "item/commandExecution/outputDelta",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "cmd-1",
+                "delta": "running tests"
+            }
+        })) {
+            CodexAppServerEvent::Status(status) => {
+                assert_eq!(status, "[command:output] running tests")
+            }
+            _ => panic!("expected command output status"),
+        }
+
+        match state.ingest_value(&serde_json::json!({
+            "method": "command/exec/outputDelta",
+            "params": {
+                "processId": "proc-1",
+                "stream": "stdout",
+                "deltaBase64": "b2sK",
+                "capReached": false
+            }
+        })) {
+            CodexAppServerEvent::Status(status) => assert_eq!(status, "[exec]:stdout ok"),
+            _ => panic!("expected exec output status"),
+        }
+
+        match state.ingest_value(&serde_json::json!({
+            "method": "process/exited",
+            "params": {
+                "processHandle": "proc-1",
+                "exitCode": 0,
+                "stdout": "done",
+                "stderr": "",
+                "stdoutCapReached": false,
+                "stderrCapReached": false
+            }
+        })) {
+            CodexAppServerEvent::Status(status) => {
+                assert_eq!(status, "[process] exit 0 | stdout: done")
+            }
+            _ => panic!("expected process exit status"),
+        }
+
+        match state.ingest_value(&serde_json::json!({
+            "method": "warning",
+            "params": {
+                "threadId": "thread-1",
+                "message": "network unavailable"
+            }
+        })) {
+            CodexAppServerEvent::Status(status) => {
+                assert_eq!(status, "[warning] network unavailable")
+            }
+            _ => panic!("expected warning status"),
+        }
+
+        match state.ingest_value(&serde_json::json!({
+            "method": "fs/changed",
+            "params": {
+                "watchId": "watch-1",
+                "changedPaths": ["/tmp/a.txt", "/tmp/b.txt"]
+            }
+        })) {
+            CodexAppServerEvent::Status(status) => {
+                assert_eq!(status, "[fs] changed /tmp/a.txt, /tmp/b.txt")
+            }
+            _ => panic!("expected fs status"),
+        }
+
+        match state.ingest_value(&serde_json::json!({
+            "method": "thread/realtime/transcript/done",
+            "params": {
+                "threadId": "thread-1",
+                "role": "user",
+                "text": "hello realtime"
+            }
+        })) {
+            CodexAppServerEvent::Status(status) => {
+                assert_eq!(status, "[realtime:user:done] hello realtime")
+            }
+            _ => panic!("expected realtime transcript status"),
+        }
+
+        match state.ingest_value(&serde_json::json!({
+            "method": "account/login/completed",
+            "params": {
+                "loginId": "login-1",
+                "success": false,
+                "error": "denied"
+            }
+        })) {
+            CodexAppServerEvent::Status(status) => {
+                assert_eq!(status, "[account] login failed: denied")
+            }
+            _ => panic!("expected account login status"),
+        }
+    }
+
+    #[test]
     fn codex_approval_result_serializes_file_change_decisions() {
         assert_eq!(
             approval_result_json(&ApprovalChoice::Accept, &ApprovalKind::FileChange),
@@ -349,6 +466,17 @@ mod tests {
 
         let rendered = state
             .ingest_line(
+                r#"{"type":"stream_event","event":{"type":"message_start","message":{"model":"claude-sonnet-4"}}}"#,
+            )
+            .expect("valid message start");
+        assert_eq!(rendered, None);
+        assert_eq!(
+            state.current_status(),
+            Some("[claude] message started: claude-sonnet-4")
+        );
+
+        let rendered = state
+            .ingest_line(
                 r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}"#,
             )
             .expect("valid content block start");
@@ -376,6 +504,28 @@ mod tests {
             .expect("valid content block stop");
         assert_eq!(rendered.as_deref(), Some("hello world"));
         assert_eq!(state.finish_text().as_deref(), Some("hello world"));
+
+        let rendered = state
+            .ingest_line(
+                r#"{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","name":"Bash","input":{"command":"cargo test"}}}}"#,
+            )
+            .expect("valid tool block start");
+        assert_eq!(rendered, None);
+        assert_eq!(
+            state.current_status(),
+            Some("[claude:Bash] started: cargo test")
+        );
+
+        let rendered = state
+            .ingest_line(
+                r#"{"type":"stream_event","event":{"type":"unknown_new_event","value":true}}"#,
+            )
+            .expect("valid unknown stream event");
+        assert_eq!(rendered, None);
+        assert_eq!(
+            state.current_status(),
+            Some("[debug:claude:event] unhandled type=unknown_new_event")
+        );
     }
 
     #[test]
@@ -435,11 +585,10 @@ mod tests {
             select_claude_runtime_ref(session_id, Some(existing_runtime_ref), true),
             existing_runtime_ref
         );
-
-        let migrated = select_claude_runtime_ref(session_id, Some(existing_runtime_ref), false);
-        assert_ne!(migrated, session_id);
-        assert_ne!(migrated, existing_runtime_ref);
-        assert!(uuid::Uuid::parse_str(&migrated).is_ok());
+        assert_eq!(
+            select_claude_runtime_ref(session_id, Some(existing_runtime_ref), false),
+            existing_runtime_ref
+        );
     }
 
     #[test]
@@ -664,6 +813,41 @@ mod tests {
             OpenCodeStreamEvent::Error(message) => assert!(message.contains("rate limited")),
             _ => panic!("expected error event"),
         }
+
+        assert_eq!(
+            render_opencode_event_status(
+                "message.part.updated",
+                &serde_json::json!({
+                    "part": {
+                        "type": "tool",
+                        "tool": "bash",
+                        "state": {
+                            "status": "running",
+                            "input": { "command": "cargo check" }
+                        }
+                    }
+                })
+            )
+            .as_deref(),
+            Some("[opencode:bash:running] cargo check")
+        );
+
+        assert_eq!(
+            render_opencode_event_status(
+                "permission.asked",
+                &serde_json::json!({
+                    "permission": "bash",
+                    "metadata": { "command": "git status" }
+                })
+            )
+            .as_deref(),
+            Some("[opencode:permission:asked] bash: git status")
+        );
+
+        assert_eq!(
+            render_opencode_event_status("unknown.event", &serde_json::json!({})).as_deref(),
+            Some("[debug:opencode:event] unhandled type=unknown.event")
+        );
     }
 }
 
@@ -1271,6 +1455,55 @@ async fn start_codex_thread(
             "sandbox": "workspace-write",
             "persistExtendedHistory": false,
             "developerInstructions": developer_instructions,
+        }),
+    )
+    .await?;
+    wait_for_json_rpc_response(stdout_rx, raw_stdout, request_id).await
+}
+
+async fn fork_codex_thread(
+    stdin: &mut (impl tokio::io::AsyncWrite + Unpin),
+    next_request_id: &mut u64,
+    stdout_rx: &mut mpsc::UnboundedReceiver<std::result::Result<String, String>>,
+    raw_stdout: &mut String,
+    source_thread_id: &str,
+    cwd: &Path,
+    model_provider: Option<&str>,
+    model: Option<&str>,
+    developer_instructions: &Option<String>,
+) -> Result<serde_json::Value> {
+    let request_id = send_json_rpc_request(
+        stdin,
+        next_request_id,
+        "thread/fork",
+        serde_json::json!({
+            "threadId": source_thread_id,
+            "cwd": cwd.display().to_string(),
+            "approvalPolicy": "on-request",
+            "approvalsReviewer": "user",
+            "sandbox": "workspace-write",
+            "modelProvider": model_provider,
+            "model": model,
+            "developerInstructions": developer_instructions,
+        }),
+    )
+    .await?;
+    wait_for_json_rpc_response(stdout_rx, raw_stdout, request_id).await
+}
+
+async fn archive_codex_thread(
+    stdin: &mut (impl tokio::io::AsyncWrite + Unpin),
+    next_request_id: &mut u64,
+    stdout_rx: &mut mpsc::UnboundedReceiver<std::result::Result<String, String>>,
+    raw_stdout: &mut String,
+    thread_id: &str,
+) -> Result<serde_json::Value> {
+    let request_id = send_json_rpc_request(
+        stdin,
+        next_request_id,
+        "thread/archive",
+        serde_json::json!({
+            "threadId": thread_id,
         }),
     )
     .await?;
@@ -2008,26 +2241,14 @@ async fn run_codex(
         stored_provider_name.as_deref(),
         codex_provider_name.as_deref(),
     );
-    let migration_instructions = if thread_decision == CodexThreadDecision::StartWithMigration {
-        state
-            .list_messages(&session.id)
-            .await
-            .and_then(|messages| build_context_migration_instructions(&messages, input, reply))
-    } else {
-        None
-    };
     let base_developer_instructions = turn_system_prompt(session, system_prompt);
-    let developer_instructions =
-        combine_developer_instructions(base_developer_instructions.clone(), migration_instructions);
+    let developer_instructions = base_developer_instructions.clone();
 
     if thread_decision == CodexThreadDecision::StartWithMigration {
         eprintln!(
-            "[codex] not resuming thread for session={}: provider changed old_provider={:?} new_provider={:?} old_model={:?} new_model={:?}",
+            "[codex] forking thread for session={}: provider changed old_provider={:?} new_provider={:?} old_model={:?} new_model={:?}",
             session.id, stored_provider_name, codex_provider_name, stored_model, current_model,
         );
-        state.set_provider_session_ref(&session.id, None).await;
-        state.set_codex_provider_name(&session.id, None).await;
-        state.set_codex_model(&session.id, None).await;
     } else if thread_decision == CodexThreadDecision::Resume && stored_model != current_model {
         eprintln!(
             "[codex] attempting thread/resume across model change for session={}: provider={:?} old_model={:?} new_model={:?}",
@@ -2040,8 +2261,66 @@ async fn run_codex(
         None
     };
 
-    // Try to resume existing thread; if it fails (e.g. provider mismatch), fall back to thread/start.
-    let thread_response = if let Some(thread_id) = existing_runtime_ref.as_deref() {
+    let thread_response = if thread_decision == CodexThreadDecision::StartWithMigration {
+        let source_thread_id = existing_runtime_ref
+            .as_deref()
+            .context("missing source thread for codex fork")?;
+        match fork_codex_thread(
+            &mut stdin,
+            &mut next_request_id,
+            &mut stdout_rx,
+            &mut raw_stdout,
+            source_thread_id,
+            &project_root,
+            codex_provider_name.as_deref(),
+            current_model.as_deref(),
+            &developer_instructions,
+        )
+        .await
+        {
+            Ok(resp) => {
+                if let Err(error) = archive_codex_thread(
+                    &mut stdin,
+                    &mut next_request_id,
+                    &mut stdout_rx,
+                    &mut raw_stdout,
+                    source_thread_id,
+                )
+                .await
+                {
+                    eprintln!(
+                        "[codex] failed to archive source thread after fork session={} source_thread={}: {error}",
+                        session.id, source_thread_id,
+                    );
+                }
+                resp
+            }
+            Err(error) => {
+                eprintln!(
+                    "[codex] thread/fork failed, falling back to thread/start with migrated context: {error}"
+                );
+                state.set_provider_session_ref(&session.id, None).await;
+                state.set_codex_provider_name(&session.id, None).await;
+                state.set_codex_model(&session.id, None).await;
+                let fallback_developer_instructions = combine_developer_instructions(
+                    base_developer_instructions.clone(),
+                    state.list_messages(&session.id).await.and_then(|messages| {
+                        build_context_migration_instructions(&messages, input, reply)
+                    }),
+                );
+                start_codex_thread(
+                    &mut stdin,
+                    &mut next_request_id,
+                    &mut stdout_rx,
+                    &mut raw_stdout,
+                    &state,
+                    &session,
+                    &fallback_developer_instructions,
+                )
+                .await?
+            }
+        }
+    } else if let Some(thread_id) = existing_runtime_ref.as_deref() {
         let resume_id = send_json_rpc_request(
             &mut stdin,
             &mut next_request_id,
@@ -2169,74 +2448,74 @@ async fn run_codex(
         return Ok(());
     }
 
-    let (turn_request_id, slash_status_message) =
-        match classify_codex_slash_command(&input.content) {
-            Some(CodexSlashAction::Compact) => (
-                send_json_rpc_request(
-                    &mut stdin,
-                    &mut next_request_id,
-                    "thread/compact/start",
-                    serde_json::json!({
-                        "threadId": thread_id,
-                    }),
-                )
-                .await?,
-                Some("[codex] running /compact".to_string()),
-            ),
-            Some(CodexSlashAction::ReviewUncommittedChanges) => (
-                send_json_rpc_request(
-                    &mut stdin,
-                    &mut next_request_id,
-                    "review/start",
-                    serde_json::json!({
-                        "threadId": thread_id,
-                        "target": {
-                            "type": "uncommittedChanges"
-                        },
-                        "delivery": "inline",
-                    }),
-                )
-                .await?,
-                Some("[codex] running /review".to_string()),
-            ),
-            Some(CodexSlashAction::ReviewCustom { instructions }) => (
-                send_json_rpc_request(
-                    &mut stdin,
-                    &mut next_request_id,
-                    "review/start",
-                    serde_json::json!({
-                        "threadId": thread_id,
-                        "target": {
-                            "type": "custom",
-                            "instructions": instructions,
-                        },
-                        "delivery": "inline",
-                    }),
-                )
-                .await?,
-                Some(format!("[codex] running /review {}", instructions)),
-            ),
-            Some(CodexSlashAction::Rename { .. })
-            | Some(CodexSlashAction::GoalSet { .. })
-            | Some(CodexSlashAction::GoalClear) => unreachable!("handled above"),
-            None => (
-                send_json_rpc_request(
-                    &mut stdin,
-                    &mut next_request_id,
-                    "turn/start",
-                    serde_json::json!({
-                        "threadId": thread_id,
-                        "input": [{
-                            "type": "text",
-                            "text": input.content,
-                            "text_elements": [],
-                        }],
-                    }),
-                )
-                .await?,
-                None,
-            ),
-        };
+    let (turn_request_id, slash_status_message) = match classify_codex_slash_command(&input.content)
+    {
+        Some(CodexSlashAction::Compact) => (
+            send_json_rpc_request(
+                &mut stdin,
+                &mut next_request_id,
+                "thread/compact/start",
+                serde_json::json!({
+                    "threadId": thread_id,
+                }),
+            )
+            .await?,
+            Some("[codex] running /compact".to_string()),
+        ),
+        Some(CodexSlashAction::ReviewUncommittedChanges) => (
+            send_json_rpc_request(
+                &mut stdin,
+                &mut next_request_id,
+                "review/start",
+                serde_json::json!({
+                    "threadId": thread_id,
+                    "target": {
+                        "type": "uncommittedChanges"
+                    },
+                    "delivery": "inline",
+                }),
+            )
+            .await?,
+            Some("[codex] running /review".to_string()),
+        ),
+        Some(CodexSlashAction::ReviewCustom { instructions }) => (
+            send_json_rpc_request(
+                &mut stdin,
+                &mut next_request_id,
+                "review/start",
+                serde_json::json!({
+                    "threadId": thread_id,
+                    "target": {
+                        "type": "custom",
+                        "instructions": instructions,
+                    },
+                    "delivery": "inline",
+                }),
+            )
+            .await?,
+            Some(format!("[codex] running /review {}", instructions)),
+        ),
+        Some(CodexSlashAction::Rename { .. })
+        | Some(CodexSlashAction::GoalSet { .. })
+        | Some(CodexSlashAction::GoalClear) => unreachable!("handled above"),
+        None => (
+            send_json_rpc_request(
+                &mut stdin,
+                &mut next_request_id,
+                "turn/start",
+                serde_json::json!({
+                    "threadId": thread_id,
+                    "input": [{
+                        "type": "text",
+                        "text": input.content,
+                        "text_elements": [],
+                    }],
+                }),
+            )
+            .await?,
+            None,
+        ),
+    };
     if let Some(status_message) = slash_status_message {
         state.emit_system_message(&session.id, status_message).await;
     }
@@ -2457,8 +2736,7 @@ async fn handle_codex_immediate_slash_command(
         | CodexSlashAction::ReviewCustom { .. } => return Ok(None),
     };
 
-    let request_id =
-        send_json_rpc_request(stdin, next_request_id, method, params).await?;
+    let request_id = send_json_rpc_request(stdin, next_request_id, method, params).await?;
     let response = wait_for_json_rpc_response(stdout_rx, raw_stdout, request_id).await?;
     if let Some(error) = response.get("error") {
         let message = error
@@ -2500,22 +2778,13 @@ async fn run_claude_code(
     let can_resume_existing_session = existing_runtime_ref.is_some()
         && stored_provider_id == current_provider_id
         && stored_model == current_model;
-    let migration_instructions = if existing_runtime_ref.is_some() && !can_resume_existing_session {
-        state
-            .list_messages(&session.id)
-            .await
-            .and_then(|messages| build_context_migration_instructions(&messages, input, reply))
-    } else {
-        None
-    };
-    if existing_runtime_ref.is_some() && !can_resume_existing_session {
+    let should_fork_existing_session =
+        existing_runtime_ref.is_some() && !can_resume_existing_session;
+    if should_fork_existing_session {
         eprintln!(
-            "[claude] not resuming session for session={}: provider/model changed old_provider={:?} new_provider={:?} old_model={:?} new_model={:?}",
+            "[claude] forking session for session={}: provider/model changed old_provider={:?} new_provider={:?} old_model={:?} new_model={:?}",
             session.id, stored_provider_id, current_provider_id, stored_model, current_model,
         );
-        state.set_provider_session_ref(&session.id, None).await;
-        state.set_claude_provider_id(&session.id, None).await;
-        state.set_claude_model(&session.id, None).await;
     }
     let runtime_ref = select_claude_runtime_ref(
         &session.id,
@@ -2606,17 +2875,14 @@ async fn run_claude_code(
 
     let combined_system_prompt = {
         let base = turn_system_prompt(session, system_prompt);
-        match (base, migration_instructions) {
-            (Some(base), Some(migration)) => Some(format!("{base}\n\n{migration}")),
-            (Some(base), None) => Some(base),
-            (None, Some(migration)) => Some(migration),
-            (None, None) => None,
-        }
+        base
     };
     if let Some(system_prompt) = combined_system_prompt {
         command.arg("--append-system-prompt").arg(system_prompt);
     }
-    if can_resume_existing_session {
+    if should_fork_existing_session {
+        command.arg("-r").arg(&runtime_ref).arg("--fork-session");
+    } else if can_resume_existing_session {
         command.arg("-r").arg(&runtime_ref);
     } else {
         command.arg("--session-id").arg(&runtime_ref);
@@ -2766,6 +3032,14 @@ async fn run_claude_code(
         bail!("claude response did not include assistant text");
     }
 
+    if let Some(runtime_session_id) = parsed.session_id.clone() {
+        if runtime_session_id != runtime_ref {
+            state
+                .set_provider_session_ref(&session.id, Some(runtime_session_id))
+                .await;
+        }
+    }
+
     state
         .finish_assistant_message(&session.id, &reply.id)
         .await
@@ -2859,11 +3133,6 @@ async fn run_opencode(
                             push_incremental_text(&state, &session.id, &reply.id, &mut last_rendered, &full_text).await;
                         }
                     }
-                    "message.part.updated" => {
-                        if let Some(status) = render_opencode_part_status(properties.get("part").unwrap_or(&Value::Null)) {
-                            state.emit_system_message(&session.id, status).await;
-                        }
-                    }
                     "permission.asked" => {
                         let request = opencode_permission_to_approval(properties);
                         if let Some(choice) = auto_approve_opencode_request(&request, &project_root).await? {
@@ -2891,14 +3160,11 @@ async fn run_opencode(
                         bail!("{}", render_opencode_error(properties));
                     }
                     "session.idle" => break,
-                    "session.status" => {
-                        if let Some(status) = properties.pointer("/status/type").and_then(Value::as_str)
-                            && status != "idle"
-                        {
-                            state.emit_system_message(&session.id, format!("[opencode] {status}")).await;
+                    _ => {
+                        if let Some(status) = render_opencode_event_status(event_type, properties) {
+                            state.emit_system_message(&session.id, status).await;
                         }
                     }
-                    _ => {}
                 }
             }
             Some(choice) = approval_rx.recv(), if pending_approval.is_some() => {
@@ -3343,22 +3609,6 @@ impl CodexAppServerStreamingState {
                     }
                     CodexAppServerEvent::None
                 }
-                "mcpServer/startupStatus/updated" => render_codex_startup_status(params)
-                    .map(CodexAppServerEvent::Status)
-                    .unwrap_or(CodexAppServerEvent::None),
-                "thread/status/changed" => render_codex_thread_status(params)
-                    .map(CodexAppServerEvent::Status)
-                    .unwrap_or(CodexAppServerEvent::None),
-                "turn/started" => CodexAppServerEvent::Status("[turn] started".to_string()),
-                "turn/plan/updated" => render_codex_plan_update(params)
-                    .map(CodexAppServerEvent::Status)
-                    .unwrap_or(CodexAppServerEvent::None),
-                "item/fileChange/outputDelta" => render_codex_file_change_delta(params)
-                    .map(CodexAppServerEvent::Status)
-                    .unwrap_or(CodexAppServerEvent::None),
-                "turn/diff/updated" => render_codex_turn_diff(params)
-                    .map(CodexAppServerEvent::Status)
-                    .unwrap_or(CodexAppServerEvent::None),
                 "thread/tokenUsage/updated" | "account/rateLimits/updated" => {
                     CodexAppServerEvent::None
                 }
@@ -3433,9 +3683,13 @@ impl CodexAppServerStreamingState {
                     };
                     CodexAppServerEvent::TurnFailed(full)
                 }
-                _ => CodexAppServerEvent::Status(format!(
-                    "[debug:codex:method] unhandled method={method}"
-                )),
+                _ => render_codex_status_notification(method, params)
+                    .map(CodexAppServerEvent::Status)
+                    .unwrap_or_else(|| {
+                        CodexAppServerEvent::Status(format!(
+                            "[debug:codex:method] unhandled method={method}"
+                        ))
+                    }),
             };
         }
 
@@ -4000,6 +4254,385 @@ fn render_codex_turn_diff(params: &Value) -> Option<String> {
     }
 }
 
+fn render_codex_status_notification(method: &str, params: &Value) -> Option<String> {
+    match method {
+        "mcpServer/startupStatus/updated" => render_codex_startup_status(params),
+        "thread/status/changed" => render_codex_thread_status(params),
+        "turn/started" => Some("[turn] started".to_string()),
+        "turn/plan/updated" => render_codex_plan_update(params),
+        "item/fileChange/outputDelta" | "item/fileChange/patchUpdated" => {
+            render_codex_file_change_delta(params)
+        }
+        "turn/diff/updated" => render_codex_turn_diff(params),
+        "thread/archived" => render_codex_thread_lifecycle(params, "archived"),
+        "thread/deleted" => render_codex_thread_lifecycle(params, "deleted"),
+        "thread/unarchived" => render_codex_thread_lifecycle(params, "unarchived"),
+        "thread/closed" => render_codex_thread_lifecycle(params, "closed"),
+        "skills/changed" => Some("[skills] changed".to_string()),
+        "thread/name/updated" => render_codex_thread_name(params),
+        "thread/goal/updated" => render_codex_thread_goal(params, "updated"),
+        "thread/goal/cleared" => Some("[goal] cleared".to_string()),
+        "thread/settings/updated" => Some("[thread] settings updated".to_string()),
+        "thread/compacted" => Some("[context] compacted".to_string()),
+        "hook/started" => Some("[hook] started".to_string()),
+        "hook/completed" => Some("[hook] completed".to_string()),
+        "item/reasoning/textDelta" | "item/reasoning/summaryTextDelta" => {
+            render_codex_delta_status(params, "[reasoning]", "delta")
+        }
+        "item/reasoning/summaryPartAdded" => Some("[reasoning] summary updated".to_string()),
+        "item/plan/delta" => render_codex_delta_status(params, "[plan]", "delta"),
+        "command/exec/outputDelta" => render_codex_base64_output_status(params, "[exec]"),
+        "process/outputDelta" => render_codex_base64_output_status(params, "[process]"),
+        "process/exited" => render_codex_process_exit(params),
+        "item/commandExecution/outputDelta" => {
+            render_codex_delta_status(params, "[command:output]", "delta")
+        }
+        "item/commandExecution/terminalInteraction" => {
+            Some("[command] terminal interaction".to_string())
+        }
+        "item/autoApprovalReview/started" => Some("[approval] auto review started".to_string()),
+        "item/autoApprovalReview/completed" => Some("[approval] auto review completed".to_string()),
+        "rawResponseItem/completed" => None,
+        "mcpServer/oauthLogin/completed" => Some("[mcp] oauth login completed".to_string()),
+        "account/updated" => render_codex_account_updated(params),
+        "app/list/updated" => render_codex_app_list_updated(params),
+        "remoteControl/status/changed" => render_codex_remote_control_status(params),
+        "externalAgentConfig/import/completed" => {
+            Some("[external-agent] config import completed".to_string())
+        }
+        "fs/changed" => render_codex_fs_changed(params),
+        "item/mcpToolCall/progress" => render_codex_mcp_tool_progress(params),
+        "model/rerouted" => render_codex_model_reroute(params),
+        "model/verification" => render_codex_model_verification(params),
+        "turn/moderationMetadata" => Some("[moderation] metadata updated".to_string()),
+        "warning" | "guardianWarning" | "deprecationNotice" | "configWarning" => {
+            render_codex_notice(params, method)
+        }
+        "fuzzyFileSearch/sessionUpdated" => render_codex_fuzzy_search(params, "updated"),
+        "fuzzyFileSearch/sessionCompleted" => render_codex_fuzzy_search(params, "completed"),
+        "thread/realtime/started" => Some("[realtime] started".to_string()),
+        "thread/realtime/itemAdded" => render_codex_realtime_item(params),
+        "thread/realtime/transcript/delta" => render_codex_realtime_transcript(params, "delta"),
+        "thread/realtime/transcript/done" => render_codex_realtime_transcript(params, "done"),
+        "thread/realtime/outputAudio/delta" => Some("[realtime] output audio".to_string()),
+        "thread/realtime/sdp" => Some("[realtime] sdp received".to_string()),
+        "thread/realtime/error" => render_codex_notice(params, "warning")
+            .map(|message| message.replacen("[warning]", "[realtime:error]", 1)),
+        "thread/realtime/closed" => render_codex_realtime_closed(params),
+        "windows/worldWritableWarning" => render_codex_windows_world_writable(params),
+        "windowsSandbox/setupCompleted" => render_codex_windows_sandbox(params),
+        "account/login/completed" => render_codex_account_login(params),
+        _ => None,
+    }
+}
+
+fn render_codex_thread_lifecycle(params: &Value, action: &str) -> Option<String> {
+    let thread_id = params
+        .get("threadId")
+        .or_else(|| params.pointer("/thread/id"))
+        .and_then(Value::as_str)
+        .map(|text| truncate_tool_text(text, 16));
+    Some(match thread_id {
+        Some(thread_id) if !thread_id.is_empty() => format!("[thread] {action}: {thread_id}"),
+        _ => format!("[thread] {action}"),
+    })
+}
+
+fn render_codex_thread_name(params: &Value) -> Option<String> {
+    let name = params
+        .get("threadName")
+        .or_else(|| params.pointer("/thread/name"))
+        .and_then(Value::as_str)
+        .map(|text| truncate_tool_text(text, 80))
+        .filter(|text| !text.is_empty())?;
+    Some(format!("[thread] renamed: {name}"))
+}
+
+fn render_codex_thread_goal(params: &Value, action: &str) -> Option<String> {
+    let goal = params
+        .pointer("/goal/text")
+        .or_else(|| params.pointer("/goal/title"))
+        .or_else(|| params.get("goal"))
+        .and_then(extract_text_from_json)
+        .map(|text| truncate_tool_text(&text, 100))
+        .filter(|text| !text.is_empty())?;
+    Some(format!("[goal] {action}: {goal}"))
+}
+
+fn render_codex_delta_status(params: &Value, label: &str, key: &str) -> Option<String> {
+    let text = params
+        .get(key)
+        .and_then(Value::as_str)
+        .or_else(|| params.get("text").and_then(Value::as_str))
+        .or_else(|| params.get("message").and_then(Value::as_str))
+        .map(|text| truncate_tool_text(text, 120))
+        .filter(|text| !text.is_empty())?;
+    Some(format!("{label} {text}"))
+}
+
+fn render_codex_base64_output_status(params: &Value, label: &str) -> Option<String> {
+    use base64::Engine;
+
+    let stream = params
+        .get("stream")
+        .and_then(Value::as_str)
+        .unwrap_or("output");
+    let encoded = params.get("deltaBase64").and_then(Value::as_str)?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .map(|text| truncate_tool_text(&text, 120))
+        .filter(|text| !text.is_empty())?;
+    Some(format!("{label}:{stream} {decoded}"))
+}
+
+fn render_codex_process_exit(params: &Value) -> Option<String> {
+    let exit_code = params.get("exitCode").and_then(Value::as_i64)?;
+    let mut segments = vec![format!("exit {exit_code}")];
+    for key in ["stdout", "stderr"] {
+        if let Some(text) = params
+            .get(key)
+            .and_then(Value::as_str)
+            .map(|text| truncate_tool_text(text, 80))
+            .filter(|text| !text.is_empty())
+        {
+            segments.push(format!("{key}: {text}"));
+        }
+    }
+    Some(format!("[process] {}", segments.join(" | ")))
+}
+
+fn render_codex_mcp_tool_progress(params: &Value) -> Option<String> {
+    params
+        .get("message")
+        .and_then(Value::as_str)
+        .map(|text| truncate_tool_text(text, 120))
+        .filter(|text| !text.is_empty())
+        .map(|message| format!("[mcp:tool] {message}"))
+}
+
+fn render_codex_account_updated(params: &Value) -> Option<String> {
+    let auth = params
+        .get("authMode")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let plan = params.get("planType").and_then(Value::as_str);
+    Some(match plan {
+        Some(plan) => format!("[account] updated auth={auth} plan={plan}"),
+        None => format!("[account] updated auth={auth}"),
+    })
+}
+
+fn render_codex_app_list_updated(params: &Value) -> Option<String> {
+    let count = params
+        .get("data")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    Some(format!("[apps] list updated ({count})"))
+}
+
+fn render_codex_remote_control_status(params: &Value) -> Option<String> {
+    let status = params
+        .get("status")
+        .and_then(extract_text_from_json)
+        .unwrap_or_else(|| "updated".to_string());
+    let server = params
+        .get("serverName")
+        .and_then(Value::as_str)
+        .map(|text| truncate_tool_text(text, 60));
+    Some(match server {
+        Some(server) if !server.is_empty() => format!("[remote-control] {status}: {server}"),
+        _ => format!("[remote-control] {status}"),
+    })
+}
+
+fn render_codex_fs_changed(params: &Value) -> Option<String> {
+    let paths = params
+        .get("changedPaths")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Some(if paths.is_empty() {
+        "[fs] changed".to_string()
+    } else {
+        format!("[fs] changed {}", format_file_preview(&paths))
+    })
+}
+
+fn render_codex_model_reroute(params: &Value) -> Option<String> {
+    let from = params
+        .get("fromModel")
+        .and_then(Value::as_str)
+        .unwrap_or("model");
+    let to = params
+        .get("toModel")
+        .and_then(Value::as_str)
+        .unwrap_or("model");
+    let reason = params
+        .get("reason")
+        .and_then(extract_text_from_json)
+        .map(|text| truncate_tool_text(&text, 80))
+        .filter(|text| !text.is_empty());
+    Some(match reason {
+        Some(reason) => format!("[model] rerouted {from} -> {to}: {reason}"),
+        None => format!("[model] rerouted {from} -> {to}"),
+    })
+}
+
+fn render_codex_model_verification(params: &Value) -> Option<String> {
+    let count = params
+        .get("verifications")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    Some(if count == 0 {
+        "[model] verification updated".to_string()
+    } else {
+        format!("[model] verification updated ({count})")
+    })
+}
+
+fn render_codex_notice(params: &Value, method: &str) -> Option<String> {
+    let label = match method {
+        "guardianWarning" => "[guardian]",
+        "deprecationNotice" => "[deprecation]",
+        "configWarning" => "[config]",
+        _ => "[warning]",
+    };
+    let text = params
+        .get("message")
+        .or_else(|| params.get("summary"))
+        .or_else(|| params.get("details"))
+        .and_then(Value::as_str)
+        .map(|text| truncate_tool_text(text, 160))
+        .filter(|text| !text.is_empty())?;
+    Some(format!("{label} {text}"))
+}
+
+fn render_codex_fuzzy_search(params: &Value, action: &str) -> Option<String> {
+    let query = params
+        .get("query")
+        .or_else(|| params.get("pattern"))
+        .and_then(Value::as_str)
+        .map(|text| truncate_tool_text(text, 80));
+    Some(match query {
+        Some(query) if !query.is_empty() => format!("[file-search] {action}: {query}"),
+        _ => format!("[file-search] {action}"),
+    })
+}
+
+fn render_codex_realtime_item(params: &Value) -> Option<String> {
+    let item_type = params
+        .pointer("/item/type")
+        .and_then(Value::as_str)
+        .unwrap_or("item");
+    Some(format!("[realtime] item added: {item_type}"))
+}
+
+fn render_codex_realtime_transcript(params: &Value, phase: &str) -> Option<String> {
+    let role = params
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or("audio");
+    let text = params
+        .get(if phase == "done" { "text" } else { "delta" })
+        .and_then(Value::as_str)
+        .map(|text| truncate_tool_text(text, 120))
+        .filter(|text| !text.is_empty())?;
+    Some(format!("[realtime:{role}:{phase}] {text}"))
+}
+
+fn render_codex_realtime_closed(params: &Value) -> Option<String> {
+    let reason = params
+        .get("reason")
+        .and_then(Value::as_str)
+        .map(|text| truncate_tool_text(text, 80))
+        .filter(|text| !text.is_empty());
+    Some(match reason {
+        Some(reason) => format!("[realtime] closed: {reason}"),
+        None => "[realtime] closed".to_string(),
+    })
+}
+
+fn render_codex_windows_world_writable(params: &Value) -> Option<String> {
+    let extra = params
+        .get("extraCount")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let paths = params
+        .get("samplePaths")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let failed_scan = params
+        .get("failedScan")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if failed_scan {
+        return Some("[windows] world-writable path scan failed".to_string());
+    }
+    Some(if paths.is_empty() {
+        format!("[windows] world-writable paths detected (+{extra})")
+    } else {
+        format!(
+            "[windows] world-writable paths: {} (+{extra})",
+            format_file_preview(&paths)
+        )
+    })
+}
+
+fn render_codex_windows_sandbox(params: &Value) -> Option<String> {
+    let mode = params
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or("setup");
+    let success = params
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let error = params
+        .get("error")
+        .and_then(Value::as_str)
+        .map(|text| truncate_tool_text(text, 100))
+        .filter(|text| !text.is_empty());
+    Some(match (success, error) {
+        (true, _) => format!("[windows-sandbox] {mode} ready"),
+        (false, Some(error)) => format!("[windows-sandbox] {mode} failed: {error}"),
+        (false, None) => format!("[windows-sandbox] {mode} failed"),
+    })
+}
+
+fn render_codex_account_login(params: &Value) -> Option<String> {
+    let success = params
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let error = params
+        .get("error")
+        .and_then(Value::as_str)
+        .map(|text| truncate_tool_text(text, 100))
+        .filter(|text| !text.is_empty());
+    Some(match (success, error) {
+        (true, _) => "[account] login completed".to_string(),
+        (false, Some(error)) => format!("[account] login failed: {error}"),
+        (false, None) => "[account] login failed".to_string(),
+    })
+}
+
 fn render_generic_item_summary(item_type: &str, item: &Value, method: &str) -> Option<String> {
     let normalized = item_type.trim();
     if normalized.is_empty() {
@@ -4163,6 +4796,7 @@ struct ClaudeStreamingState {
     latest_status: Option<String>,
     partial_text: Option<String>,
     stream_text: String,
+    session_id: Option<String>,
 }
 
 impl ClaudeStreamingState {
@@ -4188,6 +4822,13 @@ impl ClaudeStreamingState {
                 Ok(self.ingest_stream_event(map.get("event").or_else(|| map.get("stream_event"))))
             }
             "system" => {
+                if self.session_id.is_none() {
+                    self.session_id = map
+                        .get("session_id")
+                        .or_else(|| map.get("sessionId"))
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string);
+                }
                 self.latest_status = map
                     .get("subtype")
                     .and_then(Value::as_str)
@@ -4231,15 +4872,18 @@ impl ClaudeStreamingState {
     }
 
     fn ingest_stream_event(&mut self, event: Option<&Value>) -> Option<String> {
-        let Some(event) = event.and_then(Value::as_object) else {
+        let Some(event_value) = event else {
+            return None;
+        };
+        let Some(event) = event_value.as_object() else {
             return None;
         };
 
-        match event
+        let event_type = event
             .get("type")
             .and_then(Value::as_str)
-            .unwrap_or_default()
-        {
+            .unwrap_or_default();
+        match event_type {
             "content_block_start" => {
                 if let Some(text) = event
                     .get("content_block")
@@ -4251,6 +4895,7 @@ impl ClaudeStreamingState {
                     self.latest_status = None;
                     return self.render_assistant_text();
                 }
+                self.latest_status = render_claude_stream_event_status(event_type, event_value);
                 None
             }
             "content_block_delta" => {
@@ -4280,10 +4925,14 @@ impl ClaudeStreamingState {
                 self.render_assistant_text()
             }
             "message_start" | "message_delta" => {
-                self.latest_status = None;
+                self.latest_status = render_claude_stream_event_status(event_type, event_value);
                 None
             }
-            _ => None,
+            _ => {
+                self.latest_status = render_claude_stream_event_status(event_type, event_value)
+                    .or_else(|| Some(format!("[debug:claude:event] unhandled type={event_type}")));
+                None
+            }
         }
     }
 
@@ -4328,6 +4977,103 @@ impl ClaudeStreamingState {
         let text = blocks.join("\n\n---\n\n").trim().to_string();
         if text.is_empty() { None } else { Some(text) }
     }
+}
+
+fn render_claude_stream_event_status(event_type: &str, event: &Value) -> Option<String> {
+    match event_type {
+        "message_start" => {
+            let model = event
+                .pointer("/message/model")
+                .or_else(|| event.get("model"))
+                .and_then(Value::as_str)
+                .map(|text| truncate_tool_text(text, 80));
+            Some(match model {
+                Some(model) if !model.is_empty() => format!("[claude] message started: {model}"),
+                _ => "[claude] message started".to_string(),
+            })
+        }
+        "message_delta" => {
+            let stop_reason = event
+                .pointer("/delta/stop_reason")
+                .or_else(|| event.get("stop_reason"))
+                .and_then(Value::as_str)
+                .map(|text| truncate_tool_text(text, 80));
+            Some(match stop_reason {
+                Some(reason) if !reason.is_empty() => format!("[claude] stop reason: {reason}"),
+                _ => "[claude] message updated".to_string(),
+            })
+        }
+        "content_block_start" => render_claude_content_block_status(
+            event
+                .get("content_block")
+                .or_else(|| event.get("block"))
+                .unwrap_or(&Value::Null),
+            "started",
+        ),
+        "content_block_delta" => render_claude_delta_status(event),
+        "content_block_stop" => Some("[claude] content block completed".to_string()),
+        "message_stop" => Some("[claude] message completed".to_string()),
+        "ping" => Some("[claude] ping".to_string()),
+        "error" => render_claude_error_status(event),
+        _ => None,
+    }
+}
+
+fn render_claude_content_block_status(block: &Value, phase: &str) -> Option<String> {
+    let block_type = block
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("content");
+    match block_type {
+        "tool_use" => {
+            let tool = block.get("name").and_then(Value::as_str).unwrap_or("tool");
+            let command = block
+                .get("input")
+                .and_then(extract_command_like_text)
+                .map(|text| truncate_tool_text(&text, 120));
+            Some(match command.filter(|text| !text.is_empty()) {
+                Some(command) => format!("[claude:{tool}] {phase}: {command}"),
+                None => format!("[claude:{tool}] {phase}"),
+            })
+        }
+        "thinking" | "redacted_thinking" => Some(format!("[claude] thinking {phase}")),
+        "text" => None,
+        other => Some(format!("[claude:{other}] {phase}")),
+    }
+}
+
+fn render_claude_delta_status(event: &Value) -> Option<String> {
+    let delta = event.get("delta").unwrap_or(&Value::Null);
+    let delta_type = delta.get("type").and_then(Value::as_str).unwrap_or("delta");
+    match delta_type {
+        "text_delta" => None,
+        "thinking_delta" => delta
+            .get("thinking")
+            .or_else(|| delta.get("text"))
+            .and_then(Value::as_str)
+            .map(|text| truncate_tool_text(text, 120))
+            .filter(|text| !text.is_empty())
+            .map(|text| format!("[claude:thinking] {text}")),
+        "signature_delta" => Some("[claude:thinking] signature updated".to_string()),
+        "input_json_delta" => delta
+            .get("partial_json")
+            .and_then(Value::as_str)
+            .map(|text| truncate_tool_text(text, 120))
+            .filter(|text| !text.is_empty())
+            .map(|text| format!("[claude:tool-input] {text}")),
+        other => Some(format!("[claude:{other}] delta")),
+    }
+}
+
+fn render_claude_error_status(event: &Value) -> Option<String> {
+    let text = event
+        .pointer("/error/message")
+        .or_else(|| event.pointer("/error/type"))
+        .or_else(|| event.get("message"))
+        .and_then(Value::as_str)
+        .map(|text| truncate_tool_text(text, 160))
+        .filter(|text| !text.is_empty())?;
+    Some(format!("[claude:error] {text}"))
 }
 
 #[cfg(test)]
@@ -4385,7 +5131,7 @@ impl OpenCodeStreamingState {
                 self.latest_status = None;
                 Ok(OpenCodeStreamEvent::None)
             }
-            "tool_use" | "tool-use" => render_opencode_tool_status(&value)
+            "tool_use" | "tool-use" => render_opencode_tool_use_status(&value)
                 .map(OpenCodeStreamEvent::Status)
                 .map(Ok)
                 .unwrap_or(Ok(OpenCodeStreamEvent::None)),
@@ -4418,29 +5164,31 @@ impl OpenCodeStreamingState {
 }
 
 #[cfg(test)]
-fn render_opencode_tool_status(value: &Value) -> Option<String> {
+fn render_opencode_tool_use_status(value: &Value) -> Option<String> {
     let part = value.get("part").unwrap_or(value);
-    let tool = part
-        .get("tool")
-        .or_else(|| part.get("name"))
-        .or_else(|| value.get("tool"))
-        .and_then(Value::as_str)
-        .unwrap_or("tool");
-    let status = part
-        .get("status")
-        .or_else(|| value.get("status"))
-        .and_then(Value::as_str)
-        .unwrap_or("running");
-    let command = part
-        .pointer("/input/command")
-        .or_else(|| part.pointer("/args/command"))
-        .or_else(|| part.get("command"))
-        .and_then(Value::as_str)
-        .map(|text| truncate_tool_text(text, 120));
-    Some(match command.filter(|text| !text.is_empty()) {
-        Some(command) => format!("[opencode:{tool}:{status}] {command}"),
-        None => format!("[opencode:{tool}:{status}]"),
-    })
+    let mut normalized = part.clone();
+    if normalized.get("type").is_none() {
+        normalized["type"] = Value::String("tool".to_string());
+    }
+    if normalized.pointer("/state/status").is_none() {
+        let status = part
+            .get("status")
+            .or_else(|| value.get("status"))
+            .cloned()
+            .unwrap_or_else(|| Value::String("running".to_string()));
+        normalized["state"]["status"] = status;
+    }
+    if normalized.pointer("/state/input").is_none() {
+        if let Some(input) = part.get("input").or_else(|| part.get("args")) {
+            normalized["state"]["input"] = input.clone();
+        }
+    }
+    if normalized.get("tool").is_none() {
+        if let Some(tool) = part.get("name").or_else(|| value.get("tool")) {
+            normalized["tool"] = tool.clone();
+        }
+    }
+    render_opencode_part_status(&normalized)
 }
 
 fn render_opencode_error(value: &Value) -> String {
@@ -4554,7 +5302,9 @@ fn select_claude_runtime_ref(
             .map(ToString::to_string)
             .unwrap_or_else(|| session_id.to_string())
     } else if existing_runtime_ref.is_some() {
-        uuid::Uuid::new_v4().to_string()
+        existing_runtime_ref
+            .map(ToString::to_string)
+            .unwrap_or_else(|| session_id.to_string())
     } else {
         session_id.to_string()
     }
@@ -4636,6 +5386,98 @@ fn render_opencode_part_status(part: &Value) -> Option<String> {
         "patch" => render_opencode_patch_status(part),
         _ => None,
     }
+}
+
+fn render_opencode_event_status(event_type: &str, properties: &Value) -> Option<String> {
+    match event_type {
+        "message.part.updated" => {
+            render_opencode_part_status(properties.get("part").unwrap_or(&Value::Null))
+        }
+        "message.updated" => render_opencode_message_status(properties),
+        "message.removed" => Some("[opencode] message removed".to_string()),
+        "message.part.delta" => None,
+        "permission.asked" => render_opencode_permission_status(properties, "asked"),
+        "permission.replied" => render_opencode_permission_status(properties, "replied"),
+        "session.status" => {
+            let status = properties
+                .pointer("/status/type")
+                .or_else(|| properties.get("status"))
+                .and_then(extract_text_from_json)
+                .map(|text| truncate_tool_text(&text, 80))
+                .filter(|text| !text.is_empty())?;
+            (status != "idle").then(|| format!("[opencode] {status}"))
+        }
+        "session.updated" => Some("[opencode] session updated".to_string()),
+        "session.deleted" => Some("[opencode] session deleted".to_string()),
+        "session.error" => Some(format!(
+            "[opencode:error] {}",
+            render_opencode_error(properties)
+        )),
+        "session.idle" => None,
+        "storage.write" => properties
+            .get("key")
+            .and_then(Value::as_str)
+            .map(|key| format!("[opencode:storage] write {}", truncate_tool_text(key, 80)))
+            .or_else(|| Some("[opencode:storage] write".to_string())),
+        "file.edited" | "file.watcher.updated" => {
+            render_opencode_file_event_status(event_type, properties)
+        }
+        other if other.is_empty() => None,
+        other => Some(format!("[debug:opencode:event] unhandled type={other}")),
+    }
+}
+
+fn render_opencode_message_status(properties: &Value) -> Option<String> {
+    let role = properties
+        .pointer("/info/role")
+        .or_else(|| properties.pointer("/message/info/role"))
+        .or_else(|| properties.get("role"))
+        .and_then(Value::as_str)
+        .unwrap_or("message");
+    let status = properties
+        .pointer("/info/status")
+        .or_else(|| properties.pointer("/message/info/status"))
+        .or_else(|| properties.get("status"))
+        .and_then(extract_text_from_json)
+        .map(|text| truncate_tool_text(&text, 80));
+    Some(match status {
+        Some(status) if !status.is_empty() => format!("[opencode:{role}] {status}"),
+        _ => format!("[opencode:{role}] updated"),
+    })
+}
+
+fn render_opencode_permission_status(properties: &Value, phase: &str) -> Option<String> {
+    let permission = properties
+        .get("permission")
+        .and_then(Value::as_str)
+        .unwrap_or("permission");
+    let command = properties
+        .pointer("/metadata/command")
+        .or_else(|| properties.pointer("/metadata/description"))
+        .or_else(|| properties.get("patterns"))
+        .and_then(extract_text_from_json)
+        .map(|text| truncate_tool_text(&text, 120));
+    Some(match command.filter(|text| !text.is_empty()) {
+        Some(command) => format!("[opencode:permission:{phase}] {permission}: {command}"),
+        None => format!("[opencode:permission:{phase}] {permission}"),
+    })
+}
+
+fn render_opencode_file_event_status(event_type: &str, properties: &Value) -> Option<String> {
+    let path = properties
+        .get("path")
+        .or_else(|| properties.get("file"))
+        .and_then(Value::as_str)
+        .map(|text| truncate_tool_text(text, 120));
+    let label = match event_type {
+        "file.edited" => "[opencode:file] edited",
+        "file.watcher.updated" => "[opencode:file] watcher updated",
+        _ => "[opencode:file] updated",
+    };
+    Some(match path {
+        Some(path) if !path.is_empty() => format!("{label}: {path}"),
+        _ => label.to_string(),
+    })
 }
 
 fn render_opencode_patch_status(part: &Value) -> Option<String> {
@@ -4734,6 +5576,22 @@ fn extract_text_from_json(value: &Value) -> Option<String> {
             .or_else(|| map.get("output_text").and_then(extract_text_from_json)),
         _ => None,
     }
+}
+
+fn extract_command_like_text(value: &Value) -> Option<String> {
+    value
+        .get("command")
+        .or_else(|| value.get("cmd"))
+        .or_else(|| value.get("query"))
+        .or_else(|| value.get("url"))
+        .or_else(|| value.get("file_path"))
+        .or_else(|| value.get("path"))
+        .or_else(|| value.get("description"))
+        .or_else(|| value.get("pattern"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(ToString::to_string)
 }
 
 fn extract_stream_delta_text(value: &Value) -> Option<String> {

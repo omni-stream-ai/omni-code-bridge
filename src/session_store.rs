@@ -403,14 +403,10 @@ fn parse_session_summary_file(path: &Path) -> Option<ParsedSessionSummaryRecord>
             "event_msg" if payload.get("type").and_then(Value::as_str) == Some("task_started") => {
                 status = SessionStatus::Running;
             }
-            "event_msg"
-                if payload.get("type").and_then(Value::as_str) == Some("task_complete") =>
-            {
+            "event_msg" if payload.get("type").and_then(Value::as_str) == Some("task_complete") => {
                 status = SessionStatus::Idle;
             }
-            "event_msg"
-                if payload.get("type").and_then(Value::as_str) == Some("turn_aborted") =>
-            {
+            "event_msg" if payload.get("type").and_then(Value::as_str) == Some("turn_aborted") => {
                 status = SessionStatus::Interrupted;
             }
             "event_msg" if payload.get("type").and_then(Value::as_str) == Some("user_message") => {

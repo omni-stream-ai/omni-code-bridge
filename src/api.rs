@@ -29,10 +29,9 @@ use crate::{
     bridge_settings::{BridgeSettings, BridgeSettingsInput},
     models::{
         AgentCommandForwarding, AgentCommandSummary, AgentCommandsSummary, AgentInstallInput,
-        AgentKind, AgentSummary, ApiError, ApiResponse, AppUpdateManifest,
-        ApprovalDecisionInput, AudioSpeechStreamResponse, ClientAuthRequestInput,
-        CreateProjectInput, CreateSessionInput, FileCompletionItem, FileCompletionQuery,
-        OpenAiAudioSpeechRequest, OpenAiErrorDetail,
+        AgentKind, AgentSummary, ApiError, ApiResponse, AppUpdateManifest, ApprovalDecisionInput,
+        AudioSpeechStreamResponse, ClientAuthRequestInput, CreateProjectInput, CreateSessionInput,
+        FileCompletionItem, FileCompletionQuery, OpenAiAudioSpeechRequest, OpenAiErrorDetail,
         OpenAiErrorResponse, OpenAiModel, OpenAiModelList, OpenAiTranscriptionResponse,
         OpenAiVerboseTranscriptionResponse, OpenAiVerboseTranscriptionSegment,
         RegisterPushDeviceInput, ReplySummary, SendMessageInput, SessionEvent,
@@ -2076,7 +2075,11 @@ fn list_completion_items(
             }
             let path = entry.path();
             let is_dir = path.is_dir();
-            let relative = path.strip_prefix(root).ok()?.to_string_lossy().replace('\\', "/");
+            let relative = path
+                .strip_prefix(root)
+                .ok()?
+                .to_string_lossy()
+                .replace('\\', "/");
             let path = if is_dir {
                 format!("{relative}/")
             } else {
@@ -2119,14 +2122,14 @@ fn normalize_completion_prefix(prefix: &str) -> Result<String, ApiError> {
                     StatusCode::BAD_REQUEST,
                     "prefix cannot traverse outside the project root".to_string(),
                 )
-                    .into())
+                    .into());
             }
             _ => {
                 return Err((
                     StatusCode::BAD_REQUEST,
                     "invalid prefix for file completion".to_string(),
                 )
-                    .into())
+                    .into());
             }
         }
     }
@@ -2351,10 +2354,7 @@ mod tests {
 
     #[test]
     fn file_completion_normalizes_relative_prefix() {
-        assert_eq!(
-            normalize_completion_prefix(" src/api").unwrap(),
-            "src/api"
-        );
+        assert_eq!(normalize_completion_prefix(" src/api").unwrap(), "src/api");
         assert_eq!(
             normalize_completion_prefix("./src/api.rs").unwrap(),
             "src/api.rs"
@@ -2378,8 +2378,7 @@ mod tests {
         fs::create_dir_all(&src).unwrap();
 
         let canonical_root = fs::canonicalize(&root).unwrap();
-        let (search_dir, file_prefix) =
-            completion_search_scope(&canonical_root, "src/ap").unwrap();
+        let (search_dir, file_prefix) = completion_search_scope(&canonical_root, "src/ap").unwrap();
 
         assert_eq!(search_dir, fs::canonicalize(src).unwrap());
         assert_eq!(file_prefix, "ap");
@@ -2409,7 +2408,10 @@ mod tests {
         )
         .unwrap();
 
-        let paths = items.iter().map(|item| item.path.as_str()).collect::<Vec<_>>();
+        let paths = items
+            .iter()
+            .map(|item| item.path.as_str())
+            .collect::<Vec<_>>();
         assert_eq!(paths, vec!["src/api.rs", "src/app.rs"]);
         assert!(items.iter().all(|item| !item.is_dir));
         fs::remove_dir_all(root).unwrap();
@@ -2434,9 +2436,16 @@ mod tests {
         )
         .unwrap();
 
-        let paths = items.iter().map(|item| item.path.as_str()).collect::<Vec<_>>();
+        let paths = items
+            .iter()
+            .map(|item| item.path.as_str())
+            .collect::<Vec<_>>();
         assert_eq!(paths, vec!["src/api/", "src/app.rs"]);
-        assert!(items.iter().any(|item| item.is_dir && item.path == "src/api/"));
+        assert!(
+            items
+                .iter()
+                .any(|item| item.is_dir && item.path == "src/api/")
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2544,11 +2553,21 @@ mod tests {
     #[test]
     fn agent_commands_summary_exposes_supported_slash_commands() {
         let codex = agent_commands_summary(AgentKind::Codex);
-        assert!(codex.commands.iter().any(|command| command.name == "/compact"));
+        assert!(
+            codex
+                .commands
+                .iter()
+                .any(|command| command.name == "/compact")
+        );
         assert!(codex.commands.iter().any(|command| command.name == "/goal"));
 
         let claude = agent_commands_summary(AgentKind::ClaudeCode);
-        assert!(claude.commands.iter().any(|command| command.name == "/clear"));
+        assert!(
+            claude
+                .commands
+                .iter()
+                .any(|command| command.name == "/clear")
+        );
 
         let opencode = agent_commands_summary(AgentKind::OpenCode);
         assert!(opencode.commands.is_empty());

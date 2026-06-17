@@ -666,7 +666,7 @@ impl AppState {
                         api_key: p.api_key.clone(),
                         model: p.model.clone(),
                         format: p.format,
-                        provider_id: None,
+                        provider_id: Some(p.id.clone()),
                         opencode_provider_name: match p.format {
                             ApiFormat::AnthropicMessages => {
                                 Some("omni-bridge-anthropic".to_string())
@@ -2431,7 +2431,7 @@ mod tests {
         let resolved = state.resolve_provider_config(&session, &None).await;
         let resolved = resolved.expect("AUTO should resolve provider");
         assert_eq!(resolved.base_url, "https://primary.test/v1");
-        assert_eq!(resolved.provider_id, None);
+        assert_eq!(resolved.provider_id.as_deref(), Some("codex-primary"));
     }
 
     #[tokio::test]
