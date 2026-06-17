@@ -357,6 +357,16 @@ pub struct FileCompletionItem {
     pub is_dir: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadedFileResponse {
+    pub id: String,
+    pub file_name: String,
+    pub content_type: String,
+    pub size_bytes: u64,
+    pub url: String,
+    pub absolute_url: String,
+}
+
 /// Unified JSON error response: `{"error": "message"}`
 #[derive(Debug)]
 pub struct ApiError {

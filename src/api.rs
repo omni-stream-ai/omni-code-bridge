@@ -37,7 +37,7 @@ use crate::{
         RegisterPushDeviceInput, ReplySummary, SendMessageInput, SessionEvent,
         SpeakerFilterSettingsInput, SpeechModelDownloadInput, SpeechModelKind, SpeechProfile,
         SpeechProfileSelectionInput, SpeechVoiceSelectionInput, SummarizeReplyInput,
-        TriggerClientMessageInput, UpdateSessionInput,
+        TriggerClientMessageInput, UpdateSessionInput, UploadedFileResponse,
     },
     realtime, speaker,
     speech::{
@@ -51,6 +51,8 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/health", get(health))
         .route("/files", get(get_file_by_path))
         .route("/files/completions", get(list_file_completions))
+        .route("/uploads", post(upload_file))
+        .route("/uploads/{id}", get(download_uploaded_file))
         .route("/app-update/manifest", get(app_update_manifest))
         .route("/app-update/apk", get(download_app_update_apk))
         .route("/client-auth/requests", post(request_client_auth))
@@ -265,6 +267,107 @@ async fn list_file_completions(
     let root = resolve_completion_root(&state, &query).await?;
     let items = list_completion_items(&root, &query)?;
     Ok(Json(ApiResponse { data: items }))
+}
+
+async fn upload_file(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    mut multipart: Multipart,
+) -> Result<impl IntoResponse, ApiError> {
+    authorize_request(&headers, &state).await?;
+
+    let mut uploaded = None;
+    while let Some(field) = multipart.next_field().await.map_err(|error| ApiError {
+        status: StatusCode::BAD_REQUEST,
+        message: format!("invalid multipart payload: {error}"),
+    })? {
+        let field_name = field.name().map(ToString::to_string);
+        if field_name.as_deref() != Some("file") {
+            continue;
+        }
+
+        let original_file_name = field
+            .file_name()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "upload.bin".to_string());
+        let content_type = field
+            .content_type()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| content_type_for_upload_name(&original_file_name).to_string());
+        let bytes = field.bytes().await.map_err(|error| ApiError {
+            status: StatusCode::BAD_REQUEST,
+            message: format!("failed to read uploaded file: {error}"),
+        })?;
+        uploaded = Some((original_file_name, content_type, bytes));
+        break;
+    }
+
+    let Some((original_file_name, content_type, bytes)) = uploaded else {
+        return Err(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            message: "missing multipart field 'file'".to_string(),
+        });
+    };
+
+    let id = uuid::Uuid::new_v4().to_string().replace('-', "");
+    let file_name = sanitize_upload_file_name(&original_file_name);
+    let stored_name = format!("{id}-{file_name}");
+    let upload_dir = uploads_dir();
+    tokio::fs::create_dir_all(&upload_dir)
+        .await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let path = upload_dir.join(&stored_name);
+    tokio::fs::write(&path, &bytes)
+        .await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+
+    let url = format!("/uploads/{stored_name}");
+    let absolute_url = absolute_url_from_headers(&headers, &url);
+    Ok((
+        StatusCode::CREATED,
+        Json(ApiResponse {
+            data: UploadedFileResponse {
+                id: stored_name,
+                file_name,
+                content_type,
+                size_bytes: bytes.len() as u64,
+                url,
+                absolute_url,
+            },
+        }),
+    ))
+}
+
+async fn download_uploaded_file(Path(id): Path<String>) -> Result<impl IntoResponse, ApiError> {
+    let file_name = sanitize_upload_lookup_id(&id).ok_or(ApiError {
+        status: StatusCode::BAD_REQUEST,
+        message: "invalid upload id".to_string(),
+    })?;
+    let path = uploads_dir().join(&file_name);
+    let bytes = tokio::fs::read(&path).await.map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            ApiError {
+                status: StatusCode::NOT_FOUND,
+                message: "uploaded file not found".to_string(),
+            }
+        } else {
+            ApiError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                message: error.to_string(),
+            }
+        }
+    })?;
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(content_type_for_path(&path)),
+    );
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=86400"),
+    );
+    Ok((StatusCode::OK, headers, Body::from(bytes)))
 }
 
 async fn get_settings(headers: HeaderMap, State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -2298,19 +2401,127 @@ fn content_type_for_path(path: &StdPath) -> &'static str {
     }
 }
 
+fn content_type_for_upload_name(file_name: &str) -> &'static str {
+    content_type_for_path(StdPath::new(file_name))
+}
+
+fn uploads_dir() -> PathBuf {
+    crate::bridge_settings::settings_path()
+        .parent()
+        .map(StdPath::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from(".omni-code"))
+        .join("uploads")
+}
+
+fn absolute_url_from_headers(headers: &HeaderMap, path: &str) -> String {
+    let forwarded = headers
+        .get("forwarded")
+        .and_then(|value| value.to_str().ok());
+    let forwarded_proto = forwarded
+        .and_then(|value| forwarded_param(value, "proto"))
+        .or_else(|| {
+            headers
+                .get("x-forwarded-proto")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.split(',').next())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+        })
+        .unwrap_or_else(|| "http".to_string());
+    let forwarded_host = forwarded
+        .and_then(|value| forwarded_param(value, "host"))
+        .or_else(|| {
+            headers
+                .get("x-forwarded-host")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.split(',').next())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+        })
+        .or_else(|| {
+            headers
+                .get(header::HOST)
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+        })
+        .unwrap_or_else(|| "127.0.0.1:8787".to_string());
+
+    format!("{forwarded_proto}://{forwarded_host}{path}")
+}
+
+fn forwarded_param(header_value: &str, key: &str) -> Option<String> {
+    header_value
+        .split(',')
+        .next()?
+        .split(';')
+        .filter_map(|part| part.trim().split_once('='))
+        .find_map(|(name, value)| {
+            if name.trim().eq_ignore_ascii_case(key) {
+                let value = value.trim().trim_matches('"');
+                (!value.is_empty()).then(|| value.to_string())
+            } else {
+                None
+            }
+        })
+}
+
+fn sanitize_upload_file_name(file_name: &str) -> String {
+    let base = StdPath::new(file_name)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("upload.bin");
+    let sanitized = base
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('.')
+        .trim_matches('_')
+        .to_string();
+    if sanitized.is_empty() {
+        "upload.bin".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn sanitize_upload_lookup_id(id: &str) -> Option<String> {
+    if id.is_empty()
+        || id.contains('/')
+        || id.contains('\\')
+        || id.contains("..")
+        || !id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_'))
+    {
+        return None;
+    }
+    Some(id.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_commands_summary, agent_summary, completion_search_scope, content_type_for_path,
-        encode_session_event, list_completion_items, normalize_completion_prefix,
-        normalize_transcription_language, normalize_transcription_response_format,
-        resolve_path_within_root, transcription_response, validate_speech_options,
-        validate_transcription_options,
+        absolute_url_from_headers, agent_commands_summary, agent_summary, completion_search_scope,
+        content_type_for_path, content_type_for_upload_name, encode_session_event,
+        list_completion_items, normalize_completion_prefix, normalize_transcription_language,
+        normalize_transcription_response_format, resolve_path_within_root,
+        sanitize_upload_file_name, sanitize_upload_lookup_id, transcription_response, uploads_dir,
+        validate_speech_options, validate_transcription_options,
     };
     use crate::models::{AgentKind, FileCompletionQuery, SessionEvent};
     use axum::{
         body::to_bytes,
-        http::{StatusCode, header},
+        http::{HeaderMap, StatusCode, header},
         response::IntoResponse,
     };
     use serde_json::Value;
@@ -2462,6 +2673,42 @@ mod tests {
         assert_eq!(
             content_type_for_path(Path::new("/tmp/archive.bin")),
             "application/octet-stream"
+        );
+        assert_eq!(content_type_for_upload_name("photo.webp"), "image/webp");
+    }
+
+    #[test]
+    fn upload_file_names_are_sanitized() {
+        assert_eq!(
+            sanitize_upload_file_name("../unsafe photo.png"),
+            "unsafe_photo.png"
+        );
+        assert_eq!(sanitize_upload_file_name("..."), "upload.bin");
+        assert_eq!(
+            sanitize_upload_lookup_id("abc-123_file.png").as_deref(),
+            Some("abc-123_file.png")
+        );
+        assert!(sanitize_upload_lookup_id("../secret").is_none());
+        assert!(sanitize_upload_lookup_id("nested/file.png").is_none());
+    }
+
+    #[test]
+    fn upload_urls_and_directory_are_stable() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "127.0.0.1:8787".parse().unwrap());
+        assert_eq!(
+            absolute_url_from_headers(&headers, "/uploads/file.png"),
+            "http://127.0.0.1:8787/uploads/file.png"
+        );
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        headers.insert("x-forwarded-host", "bridge.example.com".parse().unwrap());
+        assert_eq!(
+            absolute_url_from_headers(&headers, "/uploads/file.png"),
+            "https://bridge.example.com/uploads/file.png"
+        );
+        assert_eq!(
+            uploads_dir().file_name().and_then(|value| value.to_str()),
+            Some("uploads")
         );
     }
 
