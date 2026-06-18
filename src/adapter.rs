@@ -33,6 +33,10 @@ use crate::{
     session_store::{load_session_archive_summary, load_session_messages},
 };
 
+const CODEX_IDLE_TICK_SECONDS: u64 = 15;
+const CODEX_COMMAND_SOFT_RECOVERY_IDLE_TICKS: u32 = 8;
+const CODEX_COMMAND_STALLED_IDLE_TICKS: u32 = 20;
+
 #[async_trait]
 pub trait AgentProvider: Send + Sync {
     async fn list_projects(&self) -> HashMap<String, ProjectSummary> {
@@ -421,6 +425,95 @@ mod tests {
     }
 
     #[test]
+    fn codex_streaming_state_tracks_stalled_commands() {
+        let mut state = CodexAppServerStreamingState::default();
+
+        match state.ingest_value(&serde_json::json!({
+            "method": "item/started",
+            "params": {
+                "item": {
+                    "id": "cmd-1",
+                    "type": "commandExecution",
+                    "command": "flutter test",
+                    "status": "inProgress"
+                }
+            }
+        })) {
+            CodexAppServerEvent::None => {}
+            _ => panic!("expected command start to produce no content event"),
+        }
+        assert_eq!(
+            state
+                .running_command
+                .as_ref()
+                .map(|item| item.command.as_str()),
+            Some("flutter test")
+        );
+
+        for _ in 1..CODEX_COMMAND_SOFT_RECOVERY_IDLE_TICKS {
+            assert!(state.mark_idle_waiting(false).is_none());
+            assert_eq!(
+                state.current_status(),
+                Some("[status] command still running")
+            );
+        }
+
+        match state.mark_idle_waiting(false) {
+            Some(CommandWatchdogAction::SoftRecovery { command }) => {
+                assert_eq!(command, "flutter test");
+            }
+            _ => panic!("expected soft recovery"),
+        }
+        assert_eq!(
+            state.current_status(),
+            Some("[command:stalled] flutter test (no output yet; waiting once more)")
+        );
+
+        for _ in (CODEX_COMMAND_SOFT_RECOVERY_IDLE_TICKS + 1)..CODEX_COMMAND_STALLED_IDLE_TICKS {
+            assert!(state.mark_idle_waiting(false).is_none());
+        }
+
+        match state.mark_idle_waiting(false) {
+            Some(CommandWatchdogAction::Stalled { command }) => {
+                assert_eq!(command, "flutter test");
+            }
+            _ => panic!("expected stalled command"),
+        }
+    }
+
+    #[test]
+    fn codex_streaming_state_clears_completed_commands() {
+        let mut state = CodexAppServerStreamingState::default();
+
+        let _ = state.ingest_value(&serde_json::json!({
+            "method": "item/started",
+            "params": {
+                "item": {
+                    "id": "cmd-1",
+                    "type": "commandExecution",
+                    "command": "cargo test",
+                    "status": "inProgress"
+                }
+            }
+        }));
+        assert!(state.running_command.is_some());
+
+        let _ = state.ingest_value(&serde_json::json!({
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "id": "cmd-1",
+                    "type": "commandExecution",
+                    "command": "cargo test",
+                    "status": "completed",
+                    "exitCode": 0
+                }
+            }
+        }));
+        assert!(state.running_command.is_none());
+    }
+
+    #[test]
     fn codex_approval_result_serializes_file_change_decisions() {
         assert_eq!(
             approval_result_json(&ApprovalChoice::Accept, &ApprovalKind::FileChange),
@@ -647,6 +740,18 @@ mod tests {
         assert_eq!(
             decide_codex_thread_action(None, Some("provider-a"), Some("provider-a")),
             CodexThreadDecision::StartFresh
+        );
+    }
+
+    #[test]
+    fn codex_thread_action_resumes_when_provider_metadata_is_missing() {
+        assert_eq!(
+            decide_codex_thread_action(Some("thread-1"), None, Some("provider-a")),
+            CodexThreadDecision::Resume
+        );
+        assert_eq!(
+            decide_codex_thread_action(Some("thread-1"), Some("provider-a"), None),
+            CodexThreadDecision::Resume
         );
     }
 
@@ -1646,10 +1751,11 @@ fn decide_codex_thread_action(
         return CodexThreadDecision::StartFresh;
     }
 
-    if stored_provider_name == current_provider_name {
-        CodexThreadDecision::Resume
-    } else {
-        CodexThreadDecision::StartWithMigration
+    match (stored_provider_name, current_provider_name) {
+        (Some(stored), Some(current)) if stored != current => {
+            CodexThreadDecision::StartWithMigration
+        }
+        _ => CodexThreadDecision::Resume,
     }
 }
 
@@ -2255,12 +2361,6 @@ async fn run_codex(
             session.id, codex_provider_name, stored_model, current_model,
         );
     }
-    let existing_runtime_ref = if thread_decision == CodexThreadDecision::Resume {
-        existing_runtime_ref
-    } else {
-        None
-    };
-
     let thread_response = if thread_decision == CodexThreadDecision::StartWithMigration {
         let source_thread_id = existing_runtime_ref
             .as_deref()
@@ -2520,7 +2620,7 @@ async fn run_codex(
         state.emit_system_message(&session.id, status_message).await;
     }
 
-    let idle_deadline = Duration::from_secs(15);
+    let idle_deadline = Duration::from_secs(CODEX_IDLE_TICK_SECONDS);
     let idle_sleep = tokio::time::sleep(idle_deadline);
     tokio::pin!(idle_sleep);
     let mut pending_approval: Option<PendingApproval> = None;
@@ -2636,8 +2736,22 @@ async fn run_codex(
             }
             _ = &mut idle_sleep => {
                 let previous_status = parsed.current_status().map(ToString::to_string);
-                if let Some(text) = parsed.mark_idle_waiting() {
-                    push_incremental_text(&state, &session.id, &reply.id, &mut last_rendered, &text).await;
+                let watchdog_action = parsed.mark_idle_waiting(pending_approval.is_some());
+                match watchdog_action {
+                    Some(CommandWatchdogAction::SoftRecovery { command }) => {
+                        eprintln!(
+                            "[codex:watchdog] session={} command stalled; waiting once more: {}",
+                            session.id, command
+                        );
+                    }
+                    Some(CommandWatchdogAction::Stalled { command }) => {
+                        let message = format!(
+                            "codex command stalled without a completion event: {command}"
+                        );
+                        eprintln!("[codex:watchdog] session={} {message}", session.id);
+                        bail!(message);
+                    }
+                    None => {}
                 }
                 let next_status = parsed.current_status().map(ToString::to_string);
                 if next_status.is_some() && next_status != previous_status {
@@ -3536,6 +3650,7 @@ struct CodexAppServerStreamingState {
     partial_agent_messages: HashMap<String, String>,
     latest_status: Option<String>,
     session_id: Option<String>,
+    running_command: Option<RunningCommand>,
 }
 
 enum CodexAppServerEvent {
@@ -3546,6 +3661,14 @@ enum CodexAppServerEvent {
     ApprovalResolved { request_id: String },
     TurnCompleted,
     TurnFailed(String),
+}
+
+#[derive(Clone)]
+struct RunningCommand {
+    item_id: String,
+    command: String,
+    idle_ticks: u32,
+    recovery_requested: bool,
 }
 
 #[derive(Clone)]
@@ -3612,6 +3735,12 @@ impl CodexAppServerStreamingState {
                 "thread/tokenUsage/updated" | "account/rateLimits/updated" => {
                     CodexAppServerEvent::None
                 }
+                "item/commandExecution/outputDelta" => {
+                    self.mark_command_activity(params.get("itemId").and_then(Value::as_str));
+                    render_codex_status_notification(method, params)
+                        .map(CodexAppServerEvent::Status)
+                        .unwrap_or(CodexAppServerEvent::None)
+                }
                 "item/agentMessage/delta" => {
                     let item_id = params
                         .get("itemId")
@@ -3632,10 +3761,9 @@ impl CodexAppServerStreamingState {
                             .unwrap_or(CodexAppServerEvent::None)
                     }
                 }
-                "item/started" | "item/completed" => self
-                    .ingest_app_server_item(params.get("item").unwrap_or(&Value::Null), method)
-                    .map(CodexAppServerEvent::Content)
-                    .unwrap_or(CodexAppServerEvent::None),
+                "item/started" | "item/completed" => {
+                    self.ingest_app_server_item(params.get("item").unwrap_or(&Value::Null), method)
+                }
                 "serverRequest/resolved" => {
                     let request_id = params
                         .get("requestId")
@@ -3694,6 +3822,16 @@ impl CodexAppServerStreamingState {
         }
 
         CodexAppServerEvent::None
+    }
+
+    fn mark_command_activity(&mut self, item_id: Option<&str>) {
+        let Some(running) = self.running_command.as_mut() else {
+            return;
+        };
+        if item_id.is_none_or(|item_id| item_id.is_empty() || item_id == running.item_id) {
+            running.idle_ticks = 0;
+            running.recovery_requested = false;
+        }
     }
 
     fn ingest_app_server_request(&mut self, value: &Value) -> CodexAppServerEvent {
@@ -3826,46 +3964,73 @@ impl CodexAppServerStreamingState {
         }
     }
 
-    fn ingest_app_server_item(&mut self, item: &Value, method: &str) -> Option<String> {
+    fn ingest_app_server_item(&mut self, item: &Value, method: &str) -> CodexAppServerEvent {
         let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
         match item_type {
             "agentMessage" if method == "item/completed" => {
                 let item_id = item.get("id").and_then(Value::as_str).unwrap_or_default();
-                let text = item.get("text").and_then(Value::as_str)?.trim().to_string();
+                let Some(text) = item.get("text").and_then(Value::as_str) else {
+                    return CodexAppServerEvent::None;
+                };
+                let text = text.trim().to_string();
                 if text.is_empty() {
-                    return None;
+                    return CodexAppServerEvent::None;
                 }
                 self.partial_agent_messages.remove(item_id);
                 self.display_blocks.push(text.clone());
                 self.assistant_blocks.push(text);
                 self.render_assistant_text()
+                    .map(CodexAppServerEvent::Content)
+                    .unwrap_or(CodexAppServerEvent::None)
             }
-            "agentMessage" => None,
-            "userMessage" => None,
+            "agentMessage" => CodexAppServerEvent::None,
+            "userMessage" => CodexAppServerEvent::None,
             "reasoning" => {
                 self.latest_status = Some(if method == "item/started" {
                     "[reasoning] thinking".to_string()
                 } else {
                     "[reasoning] complete".to_string()
                 });
-                None
+                CodexAppServerEvent::None
             }
             "commandExecution" => {
+                let item_id = item.get("id").and_then(Value::as_str).unwrap_or_default();
+                let command = item
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let status = item
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if method == "item/started" || status == "inProgress" {
+                    if !item_id.is_empty() {
+                        self.running_command = Some(RunningCommand {
+                            item_id: item_id.to_string(),
+                            command: command.to_string(),
+                            idle_ticks: 0,
+                            recovery_requested: false,
+                        });
+                    }
+                } else if method == "item/completed" {
+                    let completed_running = self
+                        .running_command
+                        .as_ref()
+                        .map(|running| item_id.is_empty() || running.item_id == item_id)
+                        .unwrap_or(false);
+                    if completed_running {
+                        self.running_command = None;
+                    }
+                }
                 self.latest_status = Some(render_command_summary(
-                    item.get("command")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default(),
-                    match item
-                        .get("status")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                    {
+                    command,
+                    match status {
                         "inProgress" => "running",
                         other => other,
                     },
                     item.get("exitCode").and_then(Value::as_i64),
                 ));
-                None
+                CodexAppServerEvent::None
             }
             "webSearch" => {
                 self.latest_status = Some(render_web_search_summary(
@@ -3874,7 +4039,7 @@ impl CodexAppServerStreamingState {
                         .unwrap_or_default(),
                     method,
                 ));
-                None
+                CodexAppServerEvent::None
             }
             _ => {
                 self.latest_status =
@@ -3889,13 +4054,43 @@ impl CodexAppServerStreamingState {
                             }
                         ))
                     });
-                None
+                CodexAppServerEvent::None
             }
         }
     }
 
-    fn mark_idle_waiting(&mut self) -> Option<String> {
-        let waiting = "[status] waiting for approval or blocked by sandbox/network";
+    fn mark_idle_waiting(&mut self, pending_approval: bool) -> Option<CommandWatchdogAction> {
+        let waiting = if pending_approval {
+            "[status] waiting for approval"
+        } else if let Some(running) = self.running_command.as_mut() {
+            running.idle_ticks += 1;
+            if running.idle_ticks == 1 {
+                "[status] command still running"
+            } else if running.idle_ticks >= CODEX_COMMAND_SOFT_RECOVERY_IDLE_TICKS
+                && !running.recovery_requested
+            {
+                running.recovery_requested = true;
+                self.latest_status = Some(render_command_stalled_summary(
+                    &running.command,
+                    "no output yet; waiting once more",
+                ));
+                return Some(CommandWatchdogAction::SoftRecovery {
+                    command: running.command.clone(),
+                });
+            } else if running.idle_ticks >= CODEX_COMMAND_STALLED_IDLE_TICKS {
+                self.latest_status = Some(render_command_stalled_summary(
+                    &running.command,
+                    "no completion event after recovery wait",
+                ));
+                return Some(CommandWatchdogAction::Stalled {
+                    command: running.command.clone(),
+                });
+            } else {
+                "[status] command still running"
+            }
+        } else {
+            "[status] waiting for Codex response"
+        };
         if self.latest_status.as_deref() == Some(waiting) {
             None
         } else {
@@ -3920,6 +4115,11 @@ impl CodexAppServerStreamingState {
         let text = blocks.join("\n\n---\n\n").trim().to_string();
         if text.is_empty() { None } else { Some(text) }
     }
+}
+
+enum CommandWatchdogAction {
+    SoftRecovery { command: String },
+    Stalled { command: String },
 }
 
 async fn send_json_rpc_request(
@@ -4117,6 +4317,15 @@ fn render_command_summary(command: &str, status: &str, exit_code: Option<i64>) -
         Some(code) => format!("[command:{status}] {command} (exit {code})"),
         None => format!("[command:{status}] {command}"),
     }
+}
+
+fn render_command_stalled_summary(command: &str, reason: &str) -> String {
+    let command = if command.trim().is_empty() {
+        "command"
+    } else {
+        command
+    };
+    format!("[command:stalled] {command} ({reason})")
 }
 
 fn render_web_search_summary(query: &str, method: &str) -> String {

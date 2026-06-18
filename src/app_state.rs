@@ -409,6 +409,7 @@ impl AppState {
 
     pub async fn get_session(&self, session_id: &str) -> Option<SessionDetail> {
         let session = self.find_session(session_id).await?;
+        let session = self.with_runtime_approval(session).await;
         let git_status = self
             .find_project(&session.project_id)
             .await
@@ -983,33 +984,51 @@ impl AppState {
     }
 
     pub async fn cancel_turn(&self, session_id: &str) -> Result<bool, String> {
-        let abort_handle = {
-            let mut handle = None;
-            let mut had_active_turn = false;
-            let found = self
-                .update_existing_runtime_state(session_id, |entry| {
-                    handle = entry.turn_abort.take();
-                    had_active_turn = entry.turn_in_flight || handle.is_some();
-                    entry.turn_in_flight = false;
-                    entry.approval_tx = None;
-                    entry.pending_approval = None;
-                    if had_active_turn {
-                        entry.interrupted = true;
-                    }
-                })
-                .await;
-            if !found {
-                return Err(format!("unknown session: {session_id}"));
+        let session_snapshot = self
+            .find_session(session_id)
+            .await
+            .ok_or_else(|| format!("unknown session: {session_id}"))?;
+        let stale_running_without_runtime = matches!(
+            session_snapshot.status,
+            SessionStatus::Running | SessionStatus::AwaitingApproval
+        );
+        let (abort_handle, should_interrupt) = {
+            let mut runtime = self.runtime.lock().await;
+            let runtime_existed = runtime.contains_key(session_id);
+            let entry = runtime
+                .entry(session_id.to_string())
+                .or_insert_with(SessionRuntimeState::default);
+            let abort_handle = entry.turn_abort.take();
+            let had_active_turn = entry.turn_in_flight || abort_handle.is_some();
+            let had_detached_running = Self::is_detached_running(entry);
+            let should_interrupt = had_active_turn
+                || had_detached_running
+                || (!runtime_existed && stale_running_without_runtime);
+            entry.turn_in_flight = false;
+            entry.approval_tx = None;
+            entry.pending_approval = None;
+            if should_interrupt {
+                entry.interrupted = true;
             }
-            (handle, had_active_turn)
+            let snapshot = runtime
+                .iter()
+                .map(|(session_id, state)| (session_id.clone(), state.to_persisted()))
+                .collect::<HashMap<_, _>>();
+            drop(runtime);
+            if let Err(error) = write_persisted_runtime(&self.runtime_store_path, &snapshot).await {
+                eprintln!(
+                    "failed to persist session runtime metadata at {}: {error}",
+                    self.runtime_store_path.display()
+                );
+            }
+            (abort_handle, should_interrupt)
         };
 
-        let (abort_handle, had_active_turn) = abort_handle;
         if let Some(abort_handle) = abort_handle {
             abort_handle.abort();
         }
 
-        if had_active_turn {
+        if should_interrupt {
             let preview = self
                 .latest_assistant_preview(session_id)
                 .await
@@ -1024,7 +1043,7 @@ impl AppState {
                     error_message: None,
                 }));
         }
-        Ok(had_active_turn)
+        Ok(should_interrupt)
     }
 
     pub async fn submit_approval(
@@ -1333,30 +1352,6 @@ impl AppState {
                 self.runtime_store_path.display()
             );
         }
-    }
-
-    async fn update_existing_runtime_state<F>(&self, session_id: &str, update: F) -> bool
-    where
-        F: FnOnce(&mut SessionRuntimeState),
-    {
-        let snapshot = {
-            let mut runtime = self.runtime.lock().await;
-            let Some(entry) = runtime.get_mut(session_id) else {
-                return false;
-            };
-            update(entry);
-            runtime
-                .iter()
-                .map(|(session_id, state)| (session_id.clone(), state.to_persisted()))
-                .collect::<HashMap<_, _>>()
-        };
-        if let Err(error) = write_persisted_runtime(&self.runtime_store_path, &snapshot).await {
-            eprintln!(
-                "failed to persist session runtime metadata at {}: {error}",
-                self.runtime_store_path.display()
-            );
-        }
-        true
     }
 
     pub async fn project_root_path_for_session(&self, session_id: &str) -> Result<String, String> {
@@ -2377,6 +2372,131 @@ mod tests {
 
         let resolved = state.resolve_provider_config(&session, &None).await;
         assert!(resolved.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_session_applies_detached_running_overlay() {
+        let state = test_state("detached-running-detail").await;
+        let project = state
+            .create_project(CreateProjectInput {
+                name: "Project".to_string(),
+                root_path: std::env::temp_dir().to_string_lossy().to_string(),
+            })
+            .await;
+        let session = state
+            .create_session(CreateSessionInput {
+                project_id: project.id,
+                title: Some("Session".to_string()),
+                agent: AgentKind::Codex,
+                brief_reply_mode: false,
+                provider_id: None,
+            })
+            .await
+            .expect("session should be created");
+
+        state
+            .patch_session(
+                &session.id,
+                SessionStatus::Running,
+                Some("running".to_string()),
+            )
+            .await;
+        state
+            .set_provider_session_ref(&session.id, Some("codex-thread".to_string()))
+            .await;
+
+        let detail = state
+            .get_session(&session.id)
+            .await
+            .expect("session detail should exist");
+
+        assert!(matches!(detail.session.status, SessionStatus::Interrupted));
+    }
+
+    #[tokio::test]
+    async fn cancel_turn_interrupts_detached_running_session() {
+        let state = test_state("cancel-detached-running").await;
+        let project = state
+            .create_project(CreateProjectInput {
+                name: "Project".to_string(),
+                root_path: std::env::temp_dir().to_string_lossy().to_string(),
+            })
+            .await;
+        let session = state
+            .create_session(CreateSessionInput {
+                project_id: project.id,
+                title: Some("Session".to_string()),
+                agent: AgentKind::Codex,
+                brief_reply_mode: false,
+                provider_id: None,
+            })
+            .await
+            .expect("session should be created");
+
+        state
+            .patch_session(
+                &session.id,
+                SessionStatus::Running,
+                Some("running".to_string()),
+            )
+            .await;
+        state
+            .set_provider_session_ref(&session.id, Some("codex-thread".to_string()))
+            .await;
+
+        let cancelled = state
+            .cancel_turn(&session.id)
+            .await
+            .expect("cancel should succeed");
+        let detail = state
+            .get_session(&session.id)
+            .await
+            .expect("session detail should exist");
+
+        assert!(cancelled);
+        assert!(matches!(detail.session.status, SessionStatus::Interrupted));
+    }
+
+    #[tokio::test]
+    async fn cancel_turn_interrupts_running_session_missing_runtime_entry() {
+        let state = test_state("cancel-missing-runtime").await;
+        let project = state
+            .create_project(CreateProjectInput {
+                name: "Project".to_string(),
+                root_path: std::env::temp_dir().to_string_lossy().to_string(),
+            })
+            .await;
+        let session = state
+            .create_session(CreateSessionInput {
+                project_id: project.id,
+                title: Some("Session".to_string()),
+                agent: AgentKind::Codex,
+                brief_reply_mode: false,
+                provider_id: None,
+            })
+            .await
+            .expect("session should be created");
+
+        state
+            .patch_session(
+                &session.id,
+                SessionStatus::Running,
+                Some("running".to_string()),
+            )
+            .await;
+        state.runtime.lock().await.remove(&session.id);
+
+        let cancelled = state
+            .cancel_turn(&session.id)
+            .await
+            .expect("cancel should succeed for persisted sessions");
+        let detail = state
+            .get_session(&session.id)
+            .await
+            .expect("session detail should exist");
+
+        assert!(cancelled);
+        assert!(matches!(detail.session.status, SessionStatus::Interrupted));
     }
 
     #[tokio::test]

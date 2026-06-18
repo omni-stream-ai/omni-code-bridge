@@ -138,6 +138,11 @@ pub struct SessionDetail {
     pub git_status: Option<GitStatusDetail>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CancelSessionReplyResult {
+    pub cancelled: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProjectGitStatus {
@@ -365,6 +370,7 @@ pub struct UploadedFileResponse {
     pub size_bytes: u64,
     pub url: String,
     pub absolute_url: String,
+    pub local_path: String,
 }
 
 /// Unified JSON error response: `{"error": "message"}`

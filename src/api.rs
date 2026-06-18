@@ -30,13 +30,13 @@ use crate::{
     models::{
         AgentCommandForwarding, AgentCommandSummary, AgentCommandsSummary, AgentInstallInput,
         AgentKind, AgentSummary, ApiError, ApiResponse, AppUpdateManifest, ApprovalDecisionInput,
-        AudioSpeechStreamResponse, ClientAuthRequestInput, CreateProjectInput, CreateSessionInput,
-        FileCompletionItem, FileCompletionQuery, OpenAiAudioSpeechRequest, OpenAiErrorDetail,
-        OpenAiErrorResponse, OpenAiModel, OpenAiModelList, OpenAiTranscriptionResponse,
-        OpenAiVerboseTranscriptionResponse, OpenAiVerboseTranscriptionSegment,
-        RegisterPushDeviceInput, ReplySummary, SendMessageInput, SessionEvent,
-        SpeakerFilterSettingsInput, SpeechModelDownloadInput, SpeechModelKind, SpeechProfile,
-        SpeechProfileSelectionInput, SpeechVoiceSelectionInput, SummarizeReplyInput,
+        AudioSpeechStreamResponse, CancelSessionReplyResult, ClientAuthRequestInput,
+        CreateProjectInput, CreateSessionInput, FileCompletionItem, FileCompletionQuery,
+        OpenAiAudioSpeechRequest, OpenAiErrorDetail, OpenAiErrorResponse, OpenAiModel,
+        OpenAiModelList, OpenAiTranscriptionResponse, OpenAiVerboseTranscriptionResponse,
+        OpenAiVerboseTranscriptionSegment, RegisterPushDeviceInput, ReplySummary, SendMessageInput,
+        SessionEvent, SpeakerFilterSettingsInput, SpeechModelDownloadInput, SpeechModelKind,
+        SpeechProfile, SpeechProfileSelectionInput, SpeechVoiceSelectionInput, SummarizeReplyInput,
         TriggerClientMessageInput, UpdateSessionInput, UploadedFileResponse,
     },
     realtime, speaker,
@@ -323,6 +323,7 @@ async fn upload_file(
 
     let url = format!("/uploads/{stored_name}");
     let absolute_url = absolute_url_from_headers(&headers, &url);
+    let local_path = path.display().to_string();
     Ok((
         StatusCode::CREATED,
         Json(ApiResponse {
@@ -333,6 +334,7 @@ async fn upload_file(
                 size_bytes: bytes.len() as u64,
                 url,
                 absolute_url,
+                local_path,
             },
         }),
     ))
@@ -1672,11 +1674,13 @@ async fn cancel_session_reply(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize_request(&headers, &state).await?;
-    state
+    let cancelled = state
         .cancel_turn(&id)
         .await
         .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(Json(ApiResponse {
+        data: CancelSessionReplyResult { cancelled },
+    }))
 }
 
 async fn list_agents(headers: HeaderMap, State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -2710,6 +2714,8 @@ mod tests {
             uploads_dir().file_name().and_then(|value| value.to_str()),
             Some("uploads")
         );
+        let stored_path = uploads_dir().join("file.png");
+        assert!(stored_path.ends_with("uploads/file.png"));
     }
 
     #[test]
