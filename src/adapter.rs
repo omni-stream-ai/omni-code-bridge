@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex},
@@ -219,6 +219,61 @@ mod tests {
         }
 
         assert_eq!(state.finish_text().as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn codex_streaming_state_keeps_partial_text_when_turn_completes_early() {
+        let mut state = CodexAppServerStreamingState::default();
+
+        match state.ingest_value(&serde_json::json!({
+            "method": "item/agentMessage/delta",
+            "params": {
+                "itemId": "msg-1",
+                "delta": "partial answer"
+            }
+        })) {
+            CodexAppServerEvent::Content(text) => assert_eq!(text, "partial answer"),
+            _ => panic!("expected content delta"),
+        }
+
+        match state.ingest_value(&serde_json::json!({
+            "method": "turn/completed",
+            "params": {
+                "turn": {
+                    "status": "completed"
+                }
+            }
+        })) {
+            CodexAppServerEvent::TurnCompleted => {}
+            _ => panic!("expected turn completion"),
+        }
+
+        assert_eq!(state.finish_text().as_deref(), Some("partial answer"));
+    }
+
+    #[test]
+    fn codex_streaming_state_renders_multiple_partial_blocks_in_order() {
+        let mut state = CodexAppServerStreamingState::default();
+
+        let _ = state.ingest_value(&serde_json::json!({
+            "method": "item/agentMessage/delta",
+            "params": {
+                "itemId": "msg-1",
+                "delta": "first"
+            }
+        }));
+        let rendered = state.ingest_value(&serde_json::json!({
+            "method": "item/agentMessage/delta",
+            "params": {
+                "itemId": "msg-2",
+                "delta": "second"
+            }
+        }));
+
+        match rendered {
+            CodexAppServerEvent::Content(text) => assert_eq!(text, "first\n\n---\n\nsecond"),
+            _ => panic!("expected combined partial content"),
+        }
     }
 
     #[test]
@@ -3647,7 +3702,7 @@ async fn push_incremental_text(
 struct CodexAppServerStreamingState {
     display_blocks: Vec<String>,
     assistant_blocks: Vec<String>,
-    partial_agent_messages: HashMap<String, String>,
+    partial_agent_messages: BTreeMap<String, String>,
     latest_status: Option<String>,
     session_id: Option<String>,
     running_command: Option<RunningCommand>,
@@ -4100,13 +4155,20 @@ impl CodexAppServerStreamingState {
     }
 
     fn finish_text(&self) -> Option<String> {
-        let text = self.assistant_blocks.join("\n\n---\n\n");
+        let mut blocks = self.assistant_blocks.clone();
+        for partial in self.partial_agent_messages.values() {
+            let partial = partial.trim();
+            if !partial.is_empty() {
+                blocks.push(partial.to_string());
+            }
+        }
+        let text = blocks.join("\n\n---\n\n");
         if text.is_empty() { None } else { Some(text) }
     }
 
     fn render_assistant_text(&self) -> Option<String> {
         let mut blocks = self.display_blocks.clone();
-        if let Some((_, partial)) = self.partial_agent_messages.iter().last() {
+        for partial in self.partial_agent_messages.values() {
             let partial = partial.trim();
             if !partial.is_empty() {
                 blocks.push(partial.to_string());
