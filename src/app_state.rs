@@ -75,6 +75,18 @@ struct PersistedSessionRuntimeState {
     interrupted: bool,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct PersistedSessionMetadata {
+    #[serde(default)]
+    sessions: HashMap<String, PersistedSessionMetadataEntry>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct PersistedSessionMetadataEntry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+}
+
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -146,6 +158,7 @@ pub struct TtsStreamSession {
 pub struct AppState {
     projects: RwLock<HashMap<String, ProjectSummary>>,
     sessions: RwLock<HashMap<String, SessionSummary>>,
+    session_title_overrides: RwLock<HashMap<String, String>>,
     messages: RwLock<HashMap<String, Vec<ChatMessage>>>,
     devices: RwLock<HashMap<String, PushDeviceRegistration>>,
     list_cache: Mutex<Option<AggregatedListCache>>,
@@ -158,6 +171,7 @@ pub struct AppState {
     push: PushService,
     tts_stream_sessions: Mutex<HashMap<String, TtsStreamSession>>,
     runtime_store_path: PathBuf,
+    session_metadata_store_path: PathBuf,
 }
 
 impl AppState {
@@ -166,15 +180,40 @@ impl AppState {
     pub async fn new() -> Self {
         let settings_path = crate::bridge_settings::settings_path();
         let runtime_store_path = runtime_store_path();
-        Self::new_with_paths(settings_path, runtime_store_path).await
+        let session_metadata_store_path = session_metadata_store_path();
+        Self::new_with_paths(
+            settings_path,
+            runtime_store_path,
+            session_metadata_store_path,
+        )
+        .await
     }
 
-    async fn new_with_paths(settings_path: PathBuf, runtime_store_path: PathBuf) -> Self {
+    async fn new_with_paths(
+        settings_path: PathBuf,
+        runtime_store_path: PathBuf,
+        session_metadata_store_path: PathBuf,
+    ) -> Self {
         let (event_tx, _) = broadcast::channel(256);
         let persisted_runtime = load_persisted_runtime(&runtime_store_path).await;
+        let persisted_metadata =
+            load_persisted_session_metadata(&session_metadata_store_path).await;
         Self {
             projects: RwLock::new(HashMap::new()),
             sessions: RwLock::new(HashMap::new()),
+            session_title_overrides: RwLock::new(
+                persisted_metadata
+                    .sessions
+                    .into_iter()
+                    .filter_map(|(session_id, entry)| {
+                        entry
+                            .title
+                            .map(|title| title.trim().to_string())
+                            .filter(|title| !title.is_empty())
+                            .map(|title| (session_id, title))
+                    })
+                    .collect(),
+            ),
             messages: RwLock::new(HashMap::new()),
             devices: RwLock::new(load_device_registrations()),
             list_cache: Mutex::new(None),
@@ -194,6 +233,7 @@ impl AppState {
             push: PushService::new(),
             tts_stream_sessions: Mutex::new(HashMap::new()),
             runtime_store_path,
+            session_metadata_store_path,
         }
     }
 
@@ -335,8 +375,11 @@ impl AppState {
     }
 
     pub async fn list_sessions(&self) -> Vec<SessionSummary> {
-        self.with_runtime_approvals(self.ensure_list_cache().await.sessions)
-            .await
+        self.with_runtime_approvals(
+            self.overlay_persisted_session_titles(self.ensure_list_cache().await.sessions)
+                .await,
+        )
+        .await
     }
 
     pub async fn list_project_sessions(&self, project_id: &str) -> Option<Vec<SessionSummary>> {
@@ -353,6 +396,7 @@ impl AppState {
             }
         }
         items.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        let items = self.overlay_persisted_session_titles(items).await;
         Some(self.with_runtime_approvals(items).await)
     }
 
@@ -368,10 +412,37 @@ impl AppState {
     }
 
     async fn with_runtime_approval(&self, mut session: SessionSummary) -> SessionSummary {
+        session = self.overlay_persisted_session_title(session).await;
         let runtime = self.runtime.lock().await;
         let session_id = session.id.clone();
         Self::apply_runtime_overlay(&mut session, runtime.get(&session_id));
         session
+    }
+
+    async fn overlay_persisted_session_titles(
+        &self,
+        sessions: Vec<SessionSummary>,
+    ) -> Vec<SessionSummary> {
+        let mut updated = Vec::with_capacity(sessions.len());
+        for session in sessions {
+            updated.push(self.overlay_persisted_session_title(session).await);
+        }
+        updated
+    }
+
+    async fn overlay_persisted_session_title(&self, mut session: SessionSummary) -> SessionSummary {
+        if let Some(title) = self.persisted_session_title(&session.id).await {
+            session.title = title;
+        }
+        session
+    }
+
+    async fn persisted_session_title(&self, session_id: &str) -> Option<String> {
+        self.session_title_overrides
+            .read()
+            .await
+            .get(session_id)
+            .cloned()
     }
 
     fn apply_runtime_overlay(session: &mut SessionSummary, runtime: Option<&SessionRuntimeState>) {
@@ -1615,12 +1686,45 @@ impl AppState {
             .write()
             .await
             .insert(current.id.clone(), current);
+        self.persist_session_title_override(session_id, &summary.title)
+            .await?;
         self.invalidate_list_cache().await;
         self.refresh_project_summary(&project_id).await;
         let _ = self
             .event_tx
             .send(SessionEvent::SessionSnapshot(summary.clone()));
         Ok(summary)
+    }
+
+    async fn persist_session_title_override(
+        &self,
+        session_id: &str,
+        title: &str,
+    ) -> Result<(), String> {
+        self.session_title_overrides
+            .write()
+            .await
+            .insert(session_id.to_string(), title.to_string());
+        let entries = self.session_title_overrides.read().await.clone();
+        let metadata = PersistedSessionMetadata {
+            sessions: entries
+                .into_iter()
+                .map(|(session_id, title)| {
+                    (
+                        session_id,
+                        PersistedSessionMetadataEntry { title: Some(title) },
+                    )
+                })
+                .collect(),
+        };
+        write_persisted_session_metadata(&self.session_metadata_store_path, &metadata)
+            .await
+            .map_err(|error| {
+                format!(
+                    "failed to persist session metadata at {}: {error}",
+                    self.session_metadata_store_path.display()
+                )
+            })
     }
 
     async fn refresh_project_summary(&self, project_id: &str) {
@@ -2098,12 +2202,39 @@ async fn write_persisted_runtime(
     tokio::fs::write(path, body).await
 }
 
+async fn load_persisted_session_metadata(path: &PathBuf) -> PersistedSessionMetadata {
+    match tokio::fs::read_to_string(path).await {
+        Ok(body) => serde_json::from_str::<PersistedSessionMetadata>(&body).unwrap_or_default(),
+        Err(_) => PersistedSessionMetadata::default(),
+    }
+}
+
+async fn write_persisted_session_metadata(
+    path: &PathBuf,
+    metadata: &PersistedSessionMetadata,
+) -> Result<(), std::io::Error> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let body = serde_json::to_string_pretty(metadata)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    tokio::fs::write(path, body).await
+}
+
 fn runtime_store_path() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".omni-code")
         .join("session-runtime.json")
+}
+
+fn session_metadata_store_path() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".omni-code")
+        .join("session-metadata.json")
 }
 
 fn approval_choice_preview(choice: &ApprovalChoice) -> &'static str {
@@ -2155,7 +2286,8 @@ mod tests {
     async fn test_state(prefix: &str) -> AppState {
         let settings_path = test_path(&format!("{prefix}-settings"));
         let runtime_path = test_path(&format!("{prefix}-runtime"));
-        AppState::new_with_paths(settings_path, runtime_path).await
+        let metadata_path = test_path(&format!("{prefix}-metadata"));
+        AppState::new_with_paths(settings_path, runtime_path, metadata_path).await
     }
 
     #[tokio::test]
@@ -2411,6 +2543,101 @@ mod tests {
             .expect("session detail should exist");
 
         assert!(matches!(detail.session.status, SessionStatus::Interrupted));
+    }
+
+    #[tokio::test]
+    async fn update_session_title_persists_override_metadata() {
+        let settings_path = test_path("persist-title-settings");
+        let runtime_path = test_path("persist-title-runtime");
+        let metadata_path = test_path("persist-title-metadata");
+        let state =
+            AppState::new_with_paths(settings_path, runtime_path, metadata_path.clone()).await;
+        let project = state
+            .create_project(CreateProjectInput {
+                name: "Project".to_string(),
+                root_path: std::env::temp_dir().to_string_lossy().to_string(),
+            })
+            .await;
+        let session = state
+            .create_session(CreateSessionInput {
+                project_id: project.id,
+                title: Some("Old".to_string()),
+                agent: AgentKind::Codex,
+                brief_reply_mode: false,
+                provider_id: None,
+            })
+            .await
+            .expect("session should be created");
+
+        state
+            .update_session_title(&session.id, "Renamed".to_string())
+            .await
+            .expect("rename should persist");
+
+        let body = tokio::fs::read_to_string(metadata_path)
+            .await
+            .expect("metadata should be written");
+        let metadata: PersistedSessionMetadata =
+            serde_json::from_str(&body).expect("metadata should parse");
+        assert_eq!(
+            metadata
+                .sessions
+                .get(&session.id)
+                .and_then(|entry| entry.title.as_deref()),
+            Some("Renamed")
+        );
+    }
+
+    #[tokio::test]
+    async fn persisted_title_override_survives_restart() {
+        let settings_path = test_path("restore-title-settings");
+        let runtime_path = test_path("restore-title-runtime");
+        let metadata_path = test_path("restore-title-metadata");
+        let state = AppState::new_with_paths(
+            settings_path.clone(),
+            runtime_path.clone(),
+            metadata_path.clone(),
+        )
+        .await;
+        let project = state
+            .create_project(CreateProjectInput {
+                name: "Project".to_string(),
+                root_path: std::env::temp_dir().to_string_lossy().to_string(),
+            })
+            .await;
+        let session = state
+            .create_session(CreateSessionInput {
+                project_id: project.id,
+                title: Some("Original".to_string()),
+                agent: AgentKind::Codex,
+                brief_reply_mode: false,
+                provider_id: None,
+            })
+            .await
+            .expect("session should be created");
+        state
+            .update_session_title(&session.id, "Restarted Title".to_string())
+            .await
+            .expect("rename should persist");
+
+        let restarted = AppState::new_with_paths(settings_path, runtime_path, metadata_path).await;
+        let detail = restarted
+            .with_runtime_approval(SessionSummary {
+                id: session.id.clone(),
+                project_id: session.project_id.clone(),
+                title: "Derived Again".to_string(),
+                agent: session.agent,
+                brief_reply_mode: session.brief_reply_mode,
+                status: SessionStatus::Idle,
+                updated_at: Utc::now(),
+                unread_count: 0,
+                last_message_preview: None,
+                pending_approval: None,
+                provider_id: None,
+            })
+            .await;
+
+        assert_eq!(detail.title, "Restarted Title");
     }
 
     #[tokio::test]
