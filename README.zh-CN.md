@@ -108,6 +108,18 @@ Agent 二进制路径可以通过 `ECHO_MATE_CODEX_BIN` 和 `ECHO_MATE_OPENCODE_
 对于 `PATCH /sessions/{id}`，请求体里省略 `provider_id` 表示不修改当前会话设置，
 而 `"provider_id": null` 表示清空已保存的会话级选择。
 
+### 思考等级
+
+创建会话（`POST /sessions`）、更新会话（`PATCH /sessions/{id}`）和发送消息
+（`POST /sessions/{id}/messages`）也支持可选的 `reasoning_effort`。
+
+允许值为 `"low"`、`"medium"`、`"high"`、`"xhigh"` 和 `"max"`。消息级
+`reasoning_effort` 会覆盖本轮的会话默认值。对于 `PATCH /sessions/{id}`，
+省略 `reasoning_effort` 表示不修改，`"reasoning_effort": null` 表示清空会话默认值。
+
+Codex 会收到 `model_reasoning_effort`，Claude Code 会收到 `--effort`。OpenCode 当前会忽略
+这个字段，因为 bridge 使用的 headless prompt API 还没有暴露对应选项。
+
 ## 本地语音接口
 
 桥接服务现在可以通过 `sherpa-onnx` 跑本地 ASR 和 TTS，并提供两层 API：

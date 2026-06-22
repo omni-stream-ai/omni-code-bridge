@@ -4,7 +4,8 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Visitor};
+use std::marker::PhantomData;
 
 pub const AUTO_PROVIDER_ID: &str = "AUTO";
 
@@ -83,6 +84,28 @@ pub enum AgentKind {
     Custom,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl ReasoningEffort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+}
+
 #[cfg(test)]
 impl AgentKind {
     pub const ALL: [AgentKind; 4] = [
@@ -129,6 +152,9 @@ pub struct SessionSummary {
     /// Default provider for this session (references provider config id)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
+    /// Default reasoning effort for this session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,6 +214,9 @@ pub struct CreateSessionInput {
     /// Omit to avoid bridge-side provider resolution; use "AUTO" to enable auto-selection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
+    /// Default reasoning effort for this session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -195,8 +224,56 @@ pub struct UpdateSessionInput {
     /// Update the session-level provider selection.
     /// `Some(id)` uses a specific provider, `Some("AUTO")` enables auto-selection,
     /// and `None` clears provider resolution.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_patch_value"
+    )]
     pub provider_id: Option<Option<String>>,
+    /// Update the session-level reasoning effort.
+    /// `Some(level)` sets the default, and `None` clears the default.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_patch_value"
+    )]
+    pub reasoning_effort: Option<Option<ReasoningEffort>>,
+}
+
+fn deserialize_patch_value<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct PatchValueVisitor<T>(PhantomData<T>);
+
+    impl<'de, T> Visitor<'de> for PatchValueVisitor<T>
+    where
+        T: Deserialize<'de>,
+    {
+        type Value = Option<Option<T>>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("null or a valid field value")
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E> {
+            Ok(Some(None))
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E> {
+            Ok(Some(None))
+        }
+
+        fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            T::deserialize(deserializer).map(|value| Some(Some(value)))
+        }
+    }
+
+    deserializer.deserialize_option(PatchValueVisitor(PhantomData))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -236,6 +313,9 @@ pub struct SendMessageInput {
     /// Omit to avoid bridge-side provider resolution; use "AUTO" to enable auto-selection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
+    /// Override reasoning effort for this message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -251,6 +331,50 @@ pub struct TriggerClientMessageResult {
     pub project: ProjectSummary,
     pub session: SessionSummary,
     pub message: ChatMessage,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ReasoningEffort, UpdateSessionInput};
+
+    #[test]
+    fn update_session_input_distinguishes_null_from_missing_reasoning_effort() {
+        let missing: UpdateSessionInput =
+            serde_json::from_str("{}").expect("missing payload should parse");
+        assert!(missing.reasoning_effort.is_none());
+
+        let explicit_null: UpdateSessionInput = serde_json::from_str(
+            r#"{"reasoning_effort":null}"#,
+        )
+        .expect("null payload should parse");
+        assert_eq!(explicit_null.reasoning_effort, Some(None));
+
+        let explicit_value: UpdateSessionInput = serde_json::from_str(
+            r#"{"reasoning_effort":"medium"}"#,
+        )
+        .expect("value payload should parse");
+        assert_eq!(
+            explicit_value.reasoning_effort,
+            Some(Some(ReasoningEffort::Medium))
+        );
+    }
+
+    #[test]
+    fn update_session_input_distinguishes_null_from_missing_provider_id() {
+        let missing: UpdateSessionInput =
+            serde_json::from_str("{}").expect("missing payload should parse");
+        assert!(missing.provider_id.is_none());
+
+        let explicit_null: UpdateSessionInput =
+            serde_json::from_str(r#"{"provider_id":null}"#)
+                .expect("null payload should parse");
+        assert_eq!(explicit_null.provider_id, Some(None));
+
+        let explicit_value: UpdateSessionInput =
+            serde_json::from_str(r#"{"provider_id":"AUTO"}"#)
+                .expect("value payload should parse");
+        assert_eq!(explicit_value.provider_id, Some(Some("AUTO".to_string())));
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

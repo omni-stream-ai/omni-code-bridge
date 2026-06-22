@@ -537,6 +537,7 @@ impl AppState {
             last_message_preview: Some("新会话已创建".to_string()),
             pending_approval: None,
             provider_id: input.provider_id,
+            reasoning_effort: input.reasoning_effort,
         };
 
         self.sessions
@@ -640,6 +641,7 @@ impl AppState {
             last_message_preview: Some(content.clone()),
             pending_approval: None,
             provider_id: None,
+            reasoning_effort: None,
         };
         let message = ChatMessage {
             id: Uuid::new_v4().to_string(),
@@ -961,12 +963,13 @@ impl AppState {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
         eprintln!(
-            "[messages] send session={session_id} input_mode={:?} system_prompt_present={} system_prompt_len={} message_provider_id={:?} session_provider_id={:?}",
+            "[messages] send session={session_id} input_mode={:?} system_prompt_present={} system_prompt_len={} message_provider_id={:?} session_provider_id={:?} reasoning_effort={:?}",
             input.input_mode,
             system_prompt.is_some(),
             system_prompt.as_ref().map(|value| value.len()).unwrap_or(0),
             input.provider_id,
             session_snapshot.provider_id,
+            input.reasoning_effort.or(session_snapshot.reasoning_effort),
         );
         let pending_reply = ChatMessage {
             id: Uuid::new_v4().to_string(),
@@ -1018,6 +1021,7 @@ impl AppState {
         }
 
         let state = Arc::clone(self);
+        let reasoning_effort = input.reasoning_effort.or(session_snapshot.reasoning_effort);
         let provider = self
             .provider_for_agent(session_snapshot.agent)
             .ok_or_else(|| format!("unsupported agent: {:?}", session_snapshot.agent))?;
@@ -1034,6 +1038,7 @@ impl AppState {
                     system_prompt,
                     pending_reply_for_task,
                     provider_config,
+                    reasoning_effort,
                 )
                 .await;
             if let Err(error) = result {
@@ -1636,10 +1641,11 @@ impl AppState {
         }
     }
 
-    pub async fn update_session_provider(
+    pub async fn update_session_settings(
         &self,
         session_id: &str,
-        provider_id: Option<String>,
+        provider_id: Option<Option<String>>,
+        reasoning_effort: Option<Option<crate::models::ReasoningEffort>>,
     ) -> Result<SessionSummary, String> {
         let mut sessions = self.sessions.write().await;
         let mut session = sessions.remove(session_id);
@@ -1648,7 +1654,12 @@ impl AppState {
             session = self.find_session(session_id).await;
         }
         let mut current = session.ok_or_else(|| format!("unknown session: {session_id}"))?;
-        current.provider_id = provider_id;
+        if let Some(provider_id) = provider_id {
+            current.provider_id = provider_id;
+        }
+        if let Some(reasoning_effort) = reasoning_effort {
+            current.reasoning_effort = reasoning_effort;
+        }
         current.updated_at = Utc::now();
         let project_id = current.project_id.clone();
         let summary = current.clone();
@@ -2405,6 +2416,7 @@ mod tests {
                     last_message_preview: Some("local".to_string()),
                     pending_approval: None,
                     provider_id: None,
+                    reasoning_effort: None,
                 },
             ),
             (
@@ -2421,6 +2433,7 @@ mod tests {
                     last_message_preview: Some("archived".to_string()),
                     pending_approval: None,
                     provider_id: None,
+                    reasoning_effort: None,
                 },
             ),
             (
@@ -2437,6 +2450,7 @@ mod tests {
                     last_message_preview: Some("provider".to_string()),
                     pending_approval: None,
                     provider_id: None,
+                    reasoning_effort: None,
                 },
             ),
         ]);
@@ -2500,6 +2514,7 @@ mod tests {
             last_message_preview: None,
             pending_approval: None,
             provider_id: None,
+            reasoning_effort: None,
         };
 
         let resolved = state.resolve_provider_config(&session, &None).await;
@@ -2522,6 +2537,7 @@ mod tests {
                 agent: AgentKind::Codex,
                 brief_reply_mode: false,
                 provider_id: None,
+                reasoning_effort: None,
             })
             .await
             .expect("session should be created");
@@ -2546,6 +2562,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_session_settings_clears_reasoning_effort_for_list_and_detail() {
+        let state = test_state("clear-reasoning-effort").await;
+        let project = state
+            .create_project(CreateProjectInput {
+                name: "Project".to_string(),
+                root_path: std::env::temp_dir().to_string_lossy().to_string(),
+            })
+            .await;
+        let session = state
+            .create_session(CreateSessionInput {
+                project_id: project.id,
+                title: Some("Session".to_string()),
+                agent: AgentKind::Codex,
+                brief_reply_mode: false,
+                provider_id: None,
+                reasoning_effort: Some(crate::models::ReasoningEffort::Medium),
+            })
+            .await
+            .expect("session should be created");
+
+        let updated = state
+            .update_session_settings(&session.id, None, Some(None))
+            .await
+            .expect("session should update");
+        assert_eq!(updated.reasoning_effort, None);
+
+        let listed = state.list_sessions().await;
+        let listed_session = listed
+            .into_iter()
+            .find(|item| item.id == session.id)
+            .expect("session should appear in list");
+        assert_eq!(listed_session.reasoning_effort, None);
+
+        let detail = state
+            .get_session(&session.id)
+            .await
+            .expect("session detail should exist");
+        assert_eq!(detail.session.reasoning_effort, None);
+    }
+
+    #[tokio::test]
     async fn update_session_title_persists_override_metadata() {
         let settings_path = test_path("persist-title-settings");
         let runtime_path = test_path("persist-title-runtime");
@@ -2565,6 +2622,7 @@ mod tests {
                 agent: AgentKind::Codex,
                 brief_reply_mode: false,
                 provider_id: None,
+                reasoning_effort: None,
             })
             .await
             .expect("session should be created");
@@ -2612,6 +2670,7 @@ mod tests {
                 agent: AgentKind::Codex,
                 brief_reply_mode: false,
                 provider_id: None,
+                reasoning_effort: None,
             })
             .await
             .expect("session should be created");
@@ -2634,6 +2693,7 @@ mod tests {
                 last_message_preview: None,
                 pending_approval: None,
                 provider_id: None,
+                reasoning_effort: None,
             })
             .await;
 
@@ -2656,6 +2716,7 @@ mod tests {
                 agent: AgentKind::Codex,
                 brief_reply_mode: false,
                 provider_id: None,
+                reasoning_effort: None,
             })
             .await
             .expect("session should be created");
@@ -2700,6 +2761,7 @@ mod tests {
                 agent: AgentKind::Codex,
                 brief_reply_mode: false,
                 provider_id: None,
+                reasoning_effort: None,
             })
             .await
             .expect("session should be created");
@@ -2773,6 +2835,7 @@ mod tests {
             last_message_preview: None,
             pending_approval: None,
             provider_id: Some(AUTO_PROVIDER_ID.to_string()),
+            reasoning_effort: None,
         };
 
         let resolved = state.resolve_provider_config(&session, &None).await;
@@ -2828,6 +2891,7 @@ mod tests {
             last_message_preview: None,
             pending_approval: None,
             provider_id: Some(AUTO_PROVIDER_ID.to_string()),
+            reasoning_effort: None,
         };
 
         let resolved = state

@@ -1657,9 +1657,8 @@ async fn update_session(
     Json(input): Json<UpdateSessionInput>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize_request(&headers, &state).await?;
-    let provider_id = input.provider_id.flatten();
     let session = state
-        .update_session_provider(&id, provider_id)
+        .update_session_settings(&id, input.provider_id, input.reasoning_effort)
         .await
         .map_err(|err| ApiError {
             status: StatusCode::NOT_FOUND,
@@ -2794,6 +2793,7 @@ mod tests {
             last_message_preview: Some("hello".to_string()),
             pending_approval: None,
             provider_id: None,
+            reasoning_effort: None,
         });
 
         let (name, body) = encode_session_event(&event).expect("snapshot should encode");

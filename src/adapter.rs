@@ -28,7 +28,7 @@ use crate::{
     claude_store::{load_claude_archive_summary, load_claude_messages},
     models::{
         AgentKind, ApprovalChoice, ApprovalKind, ApprovalRequest, ChatMessage, ProjectSummary,
-        ResolvedProviderConfig, SessionSummary,
+        ReasoningEffort, ResolvedProviderConfig, SessionSummary,
     },
     session_store::{load_session_archive_summary, load_session_messages},
 };
@@ -63,6 +63,7 @@ pub trait AgentProvider: Send + Sync {
         system_prompt: Option<String>,
         reply: ChatMessage,
         provider_config: Option<ResolvedProviderConfig>,
+        reasoning_effort: Option<ReasoningEffort>,
     ) -> Result<()>;
 
     async fn summarize_reply(
@@ -121,6 +122,7 @@ impl AgentProvider for StubProvider {
         _system_prompt: Option<String>,
         reply: ChatMessage,
         _provider_config: Option<ResolvedProviderConfig>,
+        _reasoning_effort: Option<ReasoningEffort>,
     ) -> Result<()> {
         let prefix = match self.kind {
             AgentKind::ClaudeCode => "ClaudeCode",
@@ -896,6 +898,7 @@ mod tests {
             last_message_preview: None,
             pending_approval: None,
             provider_id: None,
+            reasoning_effort: None,
         };
         let input = ChatMessage {
             id: "input".to_string(),
@@ -913,7 +916,7 @@ mod tests {
         };
 
         let result = provider
-            .run_session(Arc::clone(&state), session, input, None, reply, None)
+            .run_session(Arc::clone(&state), session, input, None, reply, None, None)
             .await
             .expect_err("direct call without seeded reply should expose state contract");
         assert!(result.to_string().contains("unknown message"));
@@ -1127,6 +1130,7 @@ impl AgentProvider for CodexProvider {
         system_prompt: Option<String>,
         reply: ChatMessage,
         provider_config: Option<ResolvedProviderConfig>,
+        reasoning_effort: Option<ReasoningEffort>,
     ) -> Result<()> {
         run_codex(
             state,
@@ -1135,6 +1139,7 @@ impl AgentProvider for CodexProvider {
             system_prompt.as_deref(),
             &reply,
             provider_config,
+            reasoning_effort,
         )
         .await
     }
@@ -1259,6 +1264,7 @@ impl AgentProvider for ClaudeCodeProvider {
         system_prompt: Option<String>,
         reply: ChatMessage,
         provider_config: Option<ResolvedProviderConfig>,
+        reasoning_effort: Option<ReasoningEffort>,
     ) -> Result<()> {
         run_claude_code(
             state,
@@ -1267,6 +1273,7 @@ impl AgentProvider for ClaudeCodeProvider {
             system_prompt.as_deref(),
             &reply,
             provider_config,
+            reasoning_effort,
         )
         .await
     }
@@ -1385,7 +1392,9 @@ impl AgentProvider for OpenCodeProvider {
         system_prompt: Option<String>,
         reply: ChatMessage,
         provider_config: Option<ResolvedProviderConfig>,
+        reasoning_effort: Option<ReasoningEffort>,
     ) -> Result<()> {
+        let _ = reasoning_effort;
         run_opencode(
             state,
             &session,
@@ -1408,13 +1417,14 @@ impl AgentProvider for OpenCodeProvider {
 }
 
 fn spawn_codex_app_server(cwd: &Path) -> Result<Child> {
-    spawn_codex_app_server_with_config(cwd, None, None)
+    spawn_codex_app_server_with_config(cwd, None, None, None)
 }
 
 fn spawn_codex_app_server_with_config(
     cwd: &Path,
     provider_config: Option<&ResolvedProviderConfig>,
     codex_provider_name: Option<&str>,
+    reasoning_effort: Option<ReasoningEffort>,
 ) -> Result<Child> {
     let binary = codex_binary_path();
     let mut command = Command::new(&binary);
@@ -1445,6 +1455,16 @@ fn spawn_codex_app_server_with_config(
         &mut c_overrides,
         "approvals_reviewer=\"user\"".to_string(),
     );
+    if let Some(reasoning_effort) = reasoning_effort {
+        push_arg(
+            &mut command,
+            &mut c_overrides,
+            format!(
+                "model_reasoning_effort={}",
+                toml_string(reasoning_effort.as_str())
+            ),
+        );
+    }
 
     // Apply provider configuration via -c config overrides while preserving the
     // user's CODEX_HOME for MCP, trust, and other Codex settings.
@@ -2298,6 +2318,7 @@ async fn run_codex(
     system_prompt: Option<&str>,
     reply: &ChatMessage,
     provider_config: Option<ResolvedProviderConfig>,
+    reasoning_effort: Option<ReasoningEffort>,
 ) -> Result<()> {
     let project_root = state
         .project_root_path_for_session(&session.id)
@@ -2322,6 +2343,7 @@ async fn run_codex(
         &project_root,
         provider_config.as_ref(),
         codex_provider_name.as_deref(),
+        reasoning_effort,
     )
     .context("failed to spawn `codex app-server`")?;
 
@@ -2931,6 +2953,7 @@ async fn run_claude_code(
     system_prompt: Option<&str>,
     reply: &ChatMessage,
     provider_config: Option<ResolvedProviderConfig>,
+    reasoning_effort: Option<ReasoningEffort>,
 ) -> Result<()> {
     let state_dir = claude_state_dir();
     ensure_runtime_dirs(&state_dir).await?;
@@ -3027,6 +3050,9 @@ async fn run_claude_code(
         .arg("--include-partial-messages")
         .arg("--settings")
         .arg(settings_value.to_string());
+    if let Some(reasoning_effort) = reasoning_effort {
+        command.arg("--effort").arg(reasoning_effort.as_str());
+    }
 
     // Also set env vars directly on the process as a fallback
     if let Some(ref config) = provider_config {
@@ -5500,6 +5526,7 @@ fn opencode_session_summary(value: &Value) -> Option<SessionSummary> {
         last_message_preview: Some(title),
         pending_approval: None,
         provider_id: None,
+        reasoning_effort: None,
     })
 }
 

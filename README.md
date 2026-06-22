@@ -108,6 +108,20 @@ Examples:
 For `PATCH /sessions/{id}`, omitting `provider_id` leaves the session unchanged, while
 `"provider_id": null` clears the stored session-level selection.
 
+### Reasoning Effort
+
+Session creation (`POST /sessions`), session update (`PATCH /sessions/{id}`), and message send
+(`POST /sessions/{id}/messages`) also accept optional `reasoning_effort`.
+
+Allowed values are `"low"`, `"medium"`, `"high"`, `"xhigh"`, and `"max"`. Message-level
+`reasoning_effort` overrides the session default for that turn. For `PATCH /sessions/{id}`,
+omitting `reasoning_effort` leaves it unchanged, while `"reasoning_effort": null` clears the
+session default.
+
+Codex receives this as `model_reasoning_effort`, Claude Code receives it as `--effort`, and
+OpenCode currently ignores the field because the headless prompt API used by the bridge does not
+expose a matching option.
+
 ## Local Speech API
 
 The bridge can run local ASR and TTS through `sherpa-onnx` and exposes two API layers:
