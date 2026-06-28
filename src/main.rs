@@ -12,6 +12,7 @@ mod device_store;
 mod models;
 mod push;
 mod realtime;
+mod secret_store;
 mod session_store;
 mod session_trace;
 mod speaker;
@@ -40,6 +41,12 @@ enum Command {
     Serve {
         #[arg(long, default_value = "8787")]
         port: u16,
+    },
+    /// Validate a bridge settings file without starting the server
+    SettingsValidate {
+        /// Settings file path. Defaults to the resolved bridge settings path.
+        #[arg(long)]
+        path: Option<PathBuf>,
     },
     /// Claude Code permission hook (invoked by Claude Code, not by users)
     ClaudePermissionHook {
@@ -102,6 +109,7 @@ async fn run() -> Result<()> {
             run_id,
             project_root,
         }) => claude_hook::run_permission_hook(state_dir, session_id, run_id, project_root).await,
+        Some(Command::SettingsValidate { path }) => validate_settings_cli(path).await,
         Some(Command::ClientAuth(sub)) => handle_client_auth(sub).await,
         Some(Command::SessionTrace { session, limit }) => {
             session_trace::print_session_trace(&session, limit)
@@ -112,7 +120,7 @@ async fn run() -> Result<()> {
 }
 
 async fn serve(port: u16) -> Result<()> {
-    let state = Arc::new(AppState::new().await);
+    let state = Arc::new(AppState::new_strict().await?);
     let app = router(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
@@ -121,6 +129,17 @@ async fn serve(port: u16) -> Result<()> {
     println!("Omni Code bridge listening on http://{addr}");
 
     axum::serve(listener, app).await?;
+    Ok(())
+}
+
+async fn validate_settings_cli(path: Option<PathBuf>) -> Result<()> {
+    let path = path.unwrap_or_else(bridge_settings::settings_path);
+    let settings = bridge_settings::load_settings_from_path(&path).await?;
+    bridge_settings::validate_bridge_settings(&settings).map_err(anyhow::Error::msg)?;
+
+    println!("Bridge settings are valid: {}", path.display());
+    println!("  model_providers: {}", settings.model_providers.len());
+    println!("  acp_servers: {}", settings.acp_servers.len());
     Ok(())
 }
 

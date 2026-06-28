@@ -22,6 +22,9 @@ pub enum ApiFormat {
     /// Codex API (uses JSON-RPC protocol, internally calls OpenAI-compatible API)
     #[serde(alias = "codex")]
     Codex,
+    /// Experimental ACP-compatible agent endpoint
+    #[serde(alias = "acp")]
+    Acp,
 }
 
 impl Default for ApiFormat {
@@ -67,12 +70,21 @@ pub struct ResolvedProviderConfig {
     pub api_key: String,
     pub model: Option<String>,
     pub format: ApiFormat,
+    pub acp_profile: Option<AcpProfile>,
     /// The bridge provider ID that was explicitly specified (message-level or session-level).
     /// None when auto-selected from the provider list by priority.
     pub provider_id: Option<String>,
     /// The opencode provider name to use in prompt_async (e.g., "omni-bridge", "omni-bridge-anthropic").
     /// This is determined by the format and must match what modify_opencode_config creates.
     pub opencode_provider_name: Option<String>,
+    /// Additional headers required by non-model agent runtimes such as ACP.
+    pub extra_headers: Vec<(String, String)>,
+    /// Command used to launch local ACP runtimes such as `kiro-cli acp`.
+    pub acp_command: Option<String>,
+    /// Arguments for launching a local ACP runtime.
+    pub acp_args: Vec<String>,
+    /// Environment variables for launching a local ACP runtime.
+    pub acp_env: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -81,6 +93,7 @@ pub enum AgentKind {
     Codex,
     ClaudeCode,
     OpenCode,
+    Acp,
     Custom,
 }
 
@@ -108,12 +121,53 @@ impl ReasoningEffort {
 
 #[cfg(test)]
 impl AgentKind {
-    pub const ALL: [AgentKind; 4] = [
+    pub const ALL: [AgentKind; 5] = [
         AgentKind::Codex,
         AgentKind::ClaudeCode,
         AgentKind::OpenCode,
+        AgentKind::Acp,
         AgentKind::Custom,
     ];
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AcpServerConfig {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub profile: AcpProfile,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub auth_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub priority: i32,
+    #[serde(default)]
+    pub headers: Vec<HeaderKeyValue>,
+    #[serde(default)]
+    pub env: Vec<HeaderKeyValue>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AcpProfile {
+    #[default]
+    Kiro,
+    GenericHttp,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeaderKeyValue {
+    pub key: String,
+    pub value: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -343,16 +397,14 @@ mod tests {
             serde_json::from_str("{}").expect("missing payload should parse");
         assert!(missing.reasoning_effort.is_none());
 
-        let explicit_null: UpdateSessionInput = serde_json::from_str(
-            r#"{"reasoning_effort":null}"#,
-        )
-        .expect("null payload should parse");
+        let explicit_null: UpdateSessionInput =
+            serde_json::from_str(r#"{"reasoning_effort":null}"#)
+                .expect("null payload should parse");
         assert_eq!(explicit_null.reasoning_effort, Some(None));
 
-        let explicit_value: UpdateSessionInput = serde_json::from_str(
-            r#"{"reasoning_effort":"medium"}"#,
-        )
-        .expect("value payload should parse");
+        let explicit_value: UpdateSessionInput =
+            serde_json::from_str(r#"{"reasoning_effort":"medium"}"#)
+                .expect("value payload should parse");
         assert_eq!(
             explicit_value.reasoning_effort,
             Some(Some(ReasoningEffort::Medium))
@@ -366,13 +418,11 @@ mod tests {
         assert!(missing.provider_id.is_none());
 
         let explicit_null: UpdateSessionInput =
-            serde_json::from_str(r#"{"provider_id":null}"#)
-                .expect("null payload should parse");
+            serde_json::from_str(r#"{"provider_id":null}"#).expect("null payload should parse");
         assert_eq!(explicit_null.provider_id, Some(None));
 
         let explicit_value: UpdateSessionInput =
-            serde_json::from_str(r#"{"provider_id":"AUTO"}"#)
-                .expect("value payload should parse");
+            serde_json::from_str(r#"{"provider_id":"AUTO"}"#).expect("value payload should parse");
         assert_eq!(explicit_value.provider_id, Some(Some("AUTO".to_string())));
     }
 }
@@ -882,6 +932,14 @@ pub struct AgentInstallInput {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentReadiness {
+    Ready,
+    NotInstalled,
+    AttentionRequired,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct AgentSummary {
     pub kind: AgentKind,
     pub id: String,
@@ -894,7 +952,71 @@ pub struct AgentSummary {
     pub installed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub installed_path: Option<String>,
+    pub readiness: AgentReadiness,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_diagnostic: Option<AcpAgentDiagnostic>,
     pub install_hint: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AcpAgentDiagnostic {
+    pub configured_server_id: String,
+    pub configured_server_name: String,
+    pub enabled: bool,
+    pub profile: AcpProfile,
+    #[serde(default)]
+    pub auth_configured: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
+    #[serde(default)]
+    pub header_count: usize,
+    #[serde(default)]
+    pub env_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub turn_url_candidates: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approval_reply_url_templates: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cancel_url_templates: Vec<String>,
+    pub enabled_server_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AcpAgentDiagnosticResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    pub is_default_selected: bool,
+    pub installed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_path: Option<String>,
+    pub readiness: AgentReadiness,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness_message: Option<String>,
+    pub source: String,
+    pub probed_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handshake_probe: Option<AcpHandshakeProbe>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<AcpAgentDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AcpHandshakeProbe {
+    pub attempted: bool,
+    pub success: bool,
+    pub mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

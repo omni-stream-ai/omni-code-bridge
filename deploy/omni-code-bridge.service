@@ -5,6 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+ExecStartPre=/usr/bin/omni-code-bridge settings-validate
 ExecStart=/usr/bin/omni-code-bridge serve
 Restart=on-failure
 RestartSec=3

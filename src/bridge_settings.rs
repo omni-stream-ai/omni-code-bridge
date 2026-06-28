@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use crate::models::{
-    ModelProviderConfig, SpeakerFilterSettings, SpeechProfileSelection, SpeechVoiceSelection,
+    AcpServerConfig, ModelProviderConfig, SpeakerFilterSettings, SpeechProfileSelection,
+    SpeechVoiceSelection,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -24,6 +25,9 @@ pub struct BridgeSettings {
     /// Global model provider configurations (sorted by priority)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub model_providers: Vec<ModelProviderConfig>,
+    /// Experimental ACP agent server configurations (sorted by priority)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acp_servers: Vec<AcpServerConfig>,
     #[serde(default)]
     pub speech_profiles: SpeechProfileSelection,
     #[serde(default)]
@@ -38,6 +42,9 @@ pub struct BridgeSettingsInput {
     /// Global model provider configurations (replaces existing list when set)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_providers: Option<Vec<ModelProviderConfig>>,
+    /// ACP agent server configurations (replaces existing list when set)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_servers: Option<Vec<AcpServerConfig>>,
     #[serde(default)]
     pub speech_profiles: Option<SpeechProfileSelection>,
     #[serde(default)]
@@ -73,6 +80,7 @@ impl Default for BridgeSettings {
         Self {
             ai_approval: AiApprovalSettings::default(),
             model_providers: Vec::new(),
+            acp_servers: Vec::new(),
             speech_profiles: SpeechProfileSelection::default(),
             speech_voices: SpeechVoiceSelection::default(),
             speaker_filter: SpeakerFilterSettings::default(),
@@ -81,6 +89,7 @@ impl Default for BridgeSettings {
 }
 
 impl BridgeSettingsStore {
+    #[allow(dead_code)]
     pub async fn load_from_path(path: PathBuf) -> Self {
         let settings = match tokio::fs::read_to_string(&path).await {
             Ok(body) => match serde_json::from_str::<BridgeSettings>(&body) {
@@ -99,6 +108,15 @@ impl BridgeSettingsStore {
             path,
             settings: RwLock::new(settings),
         }
+    }
+
+    pub async fn load_from_path_strict(path: PathBuf) -> Result<Self> {
+        let settings = load_settings_from_path(&path).await?;
+        validate_bridge_settings(&settings).map_err(anyhow::Error::msg)?;
+        Ok(Self {
+            path,
+            settings: RwLock::new(settings),
+        })
     }
 
     pub async fn get(&self) -> BridgeSettings {
@@ -127,6 +145,20 @@ async fn write_settings(path: &PathBuf, settings: &BridgeSettings) -> Result<()>
     tokio::fs::write(path, body)
         .await
         .with_context(|| format!("failed to write bridge settings: {}", path.display()))
+}
+
+pub async fn load_settings_from_path(path: &PathBuf) -> Result<BridgeSettings> {
+    let body = tokio::fs::read_to_string(path)
+        .await
+        .with_context(|| format!("failed to read bridge settings: {}", path.display()))?;
+    serde_json::from_str::<BridgeSettings>(&body)
+        .with_context(|| format!("failed to parse bridge settings at {}", path.display()))
+}
+
+pub fn validate_bridge_settings(settings: &BridgeSettings) -> Result<(), String> {
+    validate_model_providers(&settings.model_providers)?;
+    validate_acp_servers(&settings.acp_servers)?;
+    Ok(())
 }
 
 pub fn settings_path() -> PathBuf {
@@ -191,6 +223,102 @@ pub fn validate_model_providers(providers: &[ModelProviderConfig]) -> Result<(),
     Ok(())
 }
 
+pub fn validate_acp_servers(servers: &[AcpServerConfig]) -> Result<(), String> {
+    let mut seen_ids = std::collections::HashSet::new();
+    for server in servers {
+        if server.id.trim().is_empty() {
+            return Err("ACP server id must not be empty".to_string());
+        }
+        if !seen_ids.insert(&server.id) {
+            return Err(format!("duplicate ACP server id: {}", server.id));
+        }
+        if server.name.trim().is_empty() {
+            return Err(format!("ACP server {} name must not be empty", server.id));
+        }
+        let has_endpoint = server
+            .endpoint
+            .as_deref()
+            .map(str::trim)
+            .filter(|endpoint| !endpoint.is_empty())
+            .is_some();
+        let has_command = server
+            .command
+            .as_deref()
+            .map(str::trim)
+            .filter(|command| !command.is_empty())
+            .is_some();
+        match server.profile {
+            crate::models::AcpProfile::Kiro => {
+                if !has_command {
+                    return Err(format!(
+                        "ACP server {} with profile `kiro` must configure command",
+                        server.id
+                    ));
+                }
+                if has_endpoint {
+                    return Err(format!(
+                        "ACP server {} with profile `kiro` must not configure endpoint",
+                        server.id
+                    ));
+                }
+            }
+            crate::models::AcpProfile::GenericHttp => {
+                if !has_endpoint {
+                    return Err(format!(
+                        "ACP server {} with profile `generic_http` must configure endpoint",
+                        server.id
+                    ));
+                }
+                if has_command {
+                    return Err(format!(
+                        "ACP server {} with profile `generic_http` must not configure command",
+                        server.id
+                    ));
+                }
+                if !server.args.is_empty() {
+                    return Err(format!(
+                        "ACP server {} with profile `generic_http` must not configure args",
+                        server.id
+                    ));
+                }
+                if !server.env.is_empty() {
+                    return Err(format!(
+                        "ACP server {} with profile `generic_http` must not configure env",
+                        server.id
+                    ));
+                }
+            }
+        }
+        if let Some(endpoint) = server.endpoint.as_deref().map(str::trim)
+            && !endpoint.is_empty()
+            && !endpoint.starts_with("http://")
+            && !endpoint.starts_with("https://")
+        {
+            return Err(format!(
+                "ACP server {} endpoint must start with http:// or https://",
+                server.id
+            ));
+        }
+        for header in &server.headers {
+            if header.key.trim().is_empty() {
+                return Err(format!(
+                    "ACP server {} has a header with an empty key",
+                    server.id
+                ));
+            }
+        }
+        for env in &server.env {
+            if env.key.trim().is_empty() {
+                return Err(format!(
+                    "ACP server {} has an env entry with an empty key",
+                    server.id
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn default_home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
@@ -219,7 +347,8 @@ fn env_bool(name: &str) -> bool {
 mod tests {
     use super::{
         AiApprovalSettings, BridgeSettings, BridgeSettingsInput, BridgeSettingsStore,
-        ModelProviderConfig, default_home_dir, validate_model_providers,
+        ModelProviderConfig, default_home_dir, validate_acp_servers, validate_bridge_settings,
+        validate_model_providers,
     };
     use std::{
         path::PathBuf,
@@ -267,6 +396,7 @@ mod tests {
             settings: tokio::sync::RwLock::new(BridgeSettings {
                 ai_approval: AiApprovalSettings::default(),
                 model_providers: Vec::new(),
+                acp_servers: Vec::new(),
                 speech_profiles: Default::default(),
                 speech_voices: Default::default(),
                 speaker_filter: Default::default(),
@@ -309,6 +439,22 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("omni-code-bridge-{prefix}-{unique}.json"))
+    }
+
+    #[tokio::test]
+    async fn load_settings_from_path_rejects_invalid_json() {
+        let path = test_path("invalid-settings-json");
+        tokio::fs::write(&path, "{not-json")
+            .await
+            .expect("invalid settings fixture should be written");
+
+        let error = super::load_settings_from_path(&path)
+            .await
+            .err()
+            .expect("invalid settings should fail to load");
+        assert!(error.to_string().contains("failed to parse bridge settings"));
+
+        let _ = tokio::fs::remove_file(path).await;
     }
 
     #[test]
@@ -408,5 +554,156 @@ mod tests {
             priority: 1,
         }];
         assert!(validate_model_providers(&providers).is_err());
+    }
+
+    #[test]
+    fn validate_acp_servers_accepts_kiro_command_profile() {
+        let servers = vec![crate::models::AcpServerConfig {
+            id: "kiro-local".to_string(),
+            name: "Kiro Local".to_string(),
+            profile: crate::models::AcpProfile::Kiro,
+            endpoint: None,
+            command: Some("kiro-cli".to_string()),
+            args: vec!["acp".to_string()],
+            auth_token: String::new(),
+            default_model: Some("claude-sonnet-4".to_string()),
+            enabled: true,
+            priority: 0,
+            headers: Vec::new(),
+            env: Vec::new(),
+        }];
+
+        assert!(validate_acp_servers(&servers).is_ok());
+    }
+
+    #[test]
+    fn validate_acp_servers_rejects_profile_transport_mismatch() {
+        let kiro_without_command = crate::models::AcpServerConfig {
+            id: "bad-kiro".to_string(),
+            name: "Bad Kiro".to_string(),
+            profile: crate::models::AcpProfile::Kiro,
+            endpoint: Some("https://acp.example.test".to_string()),
+            command: None,
+            args: Vec::new(),
+            auth_token: String::new(),
+            default_model: None,
+            enabled: true,
+            priority: 0,
+            headers: Vec::new(),
+            env: Vec::new(),
+        };
+        let http_without_endpoint = crate::models::AcpServerConfig {
+            id: "bad-http".to_string(),
+            name: "Bad HTTP".to_string(),
+            profile: crate::models::AcpProfile::GenericHttp,
+            endpoint: None,
+            command: Some("kiro-cli".to_string()),
+            args: vec!["acp".to_string()],
+            auth_token: String::new(),
+            default_model: None,
+            enabled: true,
+            priority: 1,
+            headers: Vec::new(),
+            env: Vec::new(),
+        };
+
+        assert!(validate_acp_servers(&[kiro_without_command]).is_err());
+        assert!(validate_acp_servers(&[http_without_endpoint]).is_err());
+    }
+
+    #[test]
+    fn validate_acp_servers_rejects_mixed_transport_fields() {
+        let kiro_with_endpoint = crate::models::AcpServerConfig {
+            id: "kiro-mixed".to_string(),
+            name: "Kiro Mixed".to_string(),
+            profile: crate::models::AcpProfile::Kiro,
+            endpoint: Some("https://acp.example.test".to_string()),
+            command: Some("kiro-cli".to_string()),
+            args: vec!["acp".to_string()],
+            auth_token: String::new(),
+            default_model: None,
+            enabled: true,
+            priority: 0,
+            headers: Vec::new(),
+            env: Vec::new(),
+        };
+        let http_with_stdio_fields = crate::models::AcpServerConfig {
+            id: "http-mixed".to_string(),
+            name: "HTTP Mixed".to_string(),
+            profile: crate::models::AcpProfile::GenericHttp,
+            endpoint: Some("https://acp.example.test".to_string()),
+            command: Some("kiro-cli".to_string()),
+            args: vec!["acp".to_string()],
+            auth_token: String::new(),
+            default_model: None,
+            enabled: true,
+            priority: 1,
+            headers: Vec::new(),
+            env: vec![crate::models::HeaderKeyValue {
+                key: "FOO".to_string(),
+                value: "bar".to_string(),
+            }],
+        };
+
+        assert!(validate_acp_servers(&[kiro_with_endpoint]).is_err());
+        assert!(validate_acp_servers(&[http_with_stdio_fields]).is_err());
+    }
+
+    #[test]
+    fn validate_bridge_settings_accepts_acp_example_shape() {
+        let settings = BridgeSettings {
+            ai_approval: AiApprovalSettings::default(),
+            model_providers: Vec::new(),
+            acp_servers: vec![
+                crate::models::AcpServerConfig {
+                    id: "kiro-local".to_string(),
+                    name: "Kiro Local ACP".to_string(),
+                    profile: crate::models::AcpProfile::Kiro,
+                    endpoint: None,
+                    command: Some("kiro-cli".to_string()),
+                    args: vec!["acp".to_string()],
+                    auth_token: String::new(),
+                    default_model: Some("claude-sonnet-4".to_string()),
+                    enabled: true,
+                    priority: 0,
+                    headers: Vec::new(),
+                    env: Vec::new(),
+                },
+                crate::models::AcpServerConfig {
+                    id: "acp-http".to_string(),
+                    name: "ACP HTTP Gateway".to_string(),
+                    profile: crate::models::AcpProfile::GenericHttp,
+                    endpoint: Some("https://acp.example.com".to_string()),
+                    command: None,
+                    args: Vec::new(),
+                    auth_token: "replace-me".to_string(),
+                    default_model: Some("acp-default-model".to_string()),
+                    enabled: false,
+                    priority: 10,
+                    headers: vec![crate::models::HeaderKeyValue {
+                        key: "X-ACP-Client".to_string(),
+                        value: "omni-code-bridge".to_string(),
+                    }],
+                    env: Vec::new(),
+                },
+            ],
+            speech_profiles: Default::default(),
+            speech_voices: Default::default(),
+            speaker_filter: Default::default(),
+        };
+
+        assert!(validate_bridge_settings(&settings).is_ok());
+    }
+
+    #[tokio::test]
+    async fn checked_in_acp_example_file_loads_and_validates() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("config")
+            .join("settings.acp.example.json");
+        let settings = super::load_settings_from_path(&path)
+            .await
+            .expect("checked-in ACP example should load");
+        validate_bridge_settings(&settings).expect("checked-in ACP example should validate");
+        assert_eq!(settings.acp_servers.len(), 2);
     }
 }

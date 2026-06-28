@@ -32,6 +32,7 @@ use crate::{
         TriggerClientMessageResult,
     },
     push::PushService,
+    secret_store::SecretStore,
     session_store::project_id_for_path,
     speech::SpeechService,
 };
@@ -52,6 +53,7 @@ struct SessionRuntimeState {
     pending_approval: Option<ApprovalRequest>,
     last_resolved_approval_request_id: Option<String>,
     approval_tx: Option<mpsc::UnboundedSender<ApprovalChoice>>,
+    cancel_tx: Option<mpsc::UnboundedSender<()>>,
     turn_abort: Option<AbortHandle>,
     turn_in_flight: bool,
     interrupted: bool,
@@ -113,6 +115,7 @@ impl SessionRuntimeState {
             pending_approval,
             last_resolved_approval_request_id: None,
             approval_tx: None,
+            cancel_tx: None,
             turn_abort: None,
             turn_in_flight: false,
             interrupted: value.interrupted,
@@ -168,6 +171,7 @@ pub struct AppState {
     settings: BridgeSettingsStore,
     speech: Arc<SpeechService>,
     client_auth: ClientAuthStore,
+    secret_store: SecretStore,
     push: PushService,
     tts_stream_sessions: Mutex<HashMap<String, TtsStreamSession>>,
     runtime_store_path: PathBuf,
@@ -177,6 +181,7 @@ pub struct AppState {
 impl AppState {
     const LIST_CACHE_TTL: Duration = Duration::from_secs(5);
 
+    #[allow(dead_code)]
     pub async fn new() -> Self {
         let settings_path = crate::bridge_settings::settings_path();
         let runtime_store_path = runtime_store_path();
@@ -189,7 +194,20 @@ impl AppState {
         .await
     }
 
-    async fn new_with_paths(
+    pub async fn new_strict() -> anyhow::Result<Self> {
+        let settings_path = crate::bridge_settings::settings_path();
+        let runtime_store_path = runtime_store_path();
+        let session_metadata_store_path = session_metadata_store_path();
+        Self::new_with_paths_strict(
+            settings_path,
+            runtime_store_path,
+            session_metadata_store_path,
+        )
+        .await
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn new_with_paths(
         settings_path: PathBuf,
         runtime_store_path: PathBuf,
         session_metadata_store_path: PathBuf,
@@ -230,11 +248,61 @@ impl AppState {
             settings: BridgeSettingsStore::load_from_path(settings_path).await,
             speech: Arc::new(SpeechService::load().await),
             client_auth: ClientAuthStore::load().await,
+            secret_store: SecretStore::load().await,
             push: PushService::new(),
             tts_stream_sessions: Mutex::new(HashMap::new()),
             runtime_store_path,
             session_metadata_store_path,
         }
+    }
+
+    pub(crate) async fn new_with_paths_strict(
+        settings_path: PathBuf,
+        runtime_store_path: PathBuf,
+        session_metadata_store_path: PathBuf,
+    ) -> anyhow::Result<Self> {
+        let (event_tx, _) = broadcast::channel(256);
+        let persisted_runtime = load_persisted_runtime(&runtime_store_path).await;
+        let persisted_metadata =
+            load_persisted_session_metadata(&session_metadata_store_path).await;
+        Ok(Self {
+            projects: RwLock::new(HashMap::new()),
+            sessions: RwLock::new(HashMap::new()),
+            session_title_overrides: RwLock::new(
+                persisted_metadata
+                    .sessions
+                    .into_iter()
+                    .filter_map(|(session_id, entry)| {
+                        entry
+                            .title
+                            .map(|title| title.trim().to_string())
+                            .filter(|title| !title.is_empty())
+                            .map(|title| (session_id, title))
+                    })
+                    .collect(),
+            ),
+            messages: RwLock::new(HashMap::new()),
+            devices: RwLock::new(load_device_registrations()),
+            list_cache: Mutex::new(None),
+            runtime: Mutex::new(
+                persisted_runtime
+                    .into_iter()
+                    .map(|(session_id, value)| {
+                        (session_id, SessionRuntimeState::from_persisted(value))
+                    })
+                    .collect(),
+            ),
+            event_tx,
+            providers: ProviderRegistry::new(),
+            settings: BridgeSettingsStore::load_from_path_strict(settings_path).await?,
+            speech: Arc::new(SpeechService::load().await),
+            client_auth: ClientAuthStore::load().await,
+            secret_store: SecretStore::load().await,
+            push: PushService::new(),
+            tts_stream_sessions: Mutex::new(HashMap::new()),
+            runtime_store_path,
+            session_metadata_store_path,
+        })
     }
 
     pub async fn create_tts_stream_session(
@@ -316,6 +384,17 @@ impl AppState {
         self.client_auth.get(request_id).await
     }
 
+    #[cfg(test)]
+    pub async fn approve_client_auth_for_test(
+        &self,
+        request_id: &str,
+    ) -> Result<ClientAuthRecord, String> {
+        self.client_auth
+            .approve(request_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     pub async fn bridge_settings(&self) -> BridgeSettings {
         self.settings.get().await
     }
@@ -328,12 +407,18 @@ impl AppState {
         if let Some(ref providers) = input.model_providers {
             crate::bridge_settings::validate_model_providers(providers)?;
         }
+        if let Some(ref servers) = input.acp_servers {
+            crate::bridge_settings::validate_acp_servers(servers)?;
+        }
 
         self.settings
             .update(|settings| {
                 settings.ai_approval = input.ai_approval;
                 if let Some(model_providers) = input.model_providers {
                     settings.model_providers = model_providers;
+                }
+                if let Some(acp_servers) = input.acp_servers {
+                    settings.acp_servers = acp_servers;
                 }
                 if let Some(speech_profiles) = input.speech_profiles {
                     settings.speech_profiles = speech_profiles;
@@ -368,6 +453,10 @@ impl AppState {
 
     pub fn settings_store(&self) -> &BridgeSettingsStore {
         &self.settings
+    }
+
+    pub fn secret_store(&self) -> &SecretStore {
+        &self.secret_store
     }
 
     pub async fn list_projects(&self) -> Vec<ProjectSummary> {
@@ -559,6 +648,7 @@ impl AppState {
                 pending_approval: None,
                 last_resolved_approval_request_id: None,
                 approval_tx: None,
+                cancel_tx: None,
                 turn_abort: None,
                 turn_in_flight: false,
                 interrupted: false,
@@ -723,7 +813,9 @@ impl AppState {
                 *format == ApiFormat::OpenAiCompatible
                     || *format == ApiFormat::AnthropicMessages
                     || *format == ApiFormat::Codex
+                    || *format == ApiFormat::Acp
             }
+            AgentKind::Acp => *format == ApiFormat::Acp,
             AgentKind::Custom => *format == ApiFormat::OpenAiCompatible,
         };
 
@@ -740,16 +832,51 @@ impl AppState {
                         api_key: p.api_key.clone(),
                         model: p.model.clone(),
                         format: p.format,
+                        acp_profile: None,
                         provider_id: Some(p.id.clone()),
+                        extra_headers: Vec::new(),
+                        acp_command: None,
+                        acp_args: Vec::new(),
+                        acp_env: Vec::new(),
                         opencode_provider_name: match p.format {
                             ApiFormat::AnthropicMessages => {
                                 Some("omni-bridge-anthropic".to_string())
                             }
                             ApiFormat::Codex => Some("omni-bridge-codex".to_string()),
+                            ApiFormat::Acp => Some("omni-bridge-acp".to_string()),
                             _ => Some("omni-bridge".to_string()),
                         },
                     })
             };
+
+        let find_best_acp_server = || -> Option<ResolvedProviderConfig> {
+            settings
+                .acp_servers
+                .iter()
+                .filter(|server| server.enabled)
+                .min_by_key(|server| server.priority)
+                .map(|server| ResolvedProviderConfig {
+                    base_url: server.endpoint.clone().unwrap_or_default(),
+                    api_key: server.auth_token.clone(),
+                    model: server.default_model.clone(),
+                    format: ApiFormat::Acp,
+                    acp_profile: Some(server.profile),
+                    provider_id: Some(server.id.clone()),
+                    extra_headers: server
+                        .headers
+                        .iter()
+                        .map(|header| (header.key.clone(), header.value.clone()))
+                        .collect(),
+                    acp_command: server.command.clone(),
+                    acp_args: server.args.clone(),
+                    acp_env: server
+                        .env
+                        .iter()
+                        .map(|entry| (entry.key.clone(), entry.value.clone()))
+                        .collect(),
+                    opencode_provider_name: Some("omni-bridge-acp".to_string()),
+                })
+        };
 
         // Message/session provider handling:
         // - missing provider_id => do not resolve any bridge provider
@@ -758,6 +885,36 @@ impl AppState {
         if let Some(provider_id) = requested_provider_id {
             if provider_id != AUTO_PROVIDER_ID {
                 eprintln!("[provider] looking up explicit provider_id={provider_id}");
+                if agent == AgentKind::Acp {
+                    if let Some(config) = settings
+                        .acp_servers
+                        .iter()
+                        .find(|server| server.id == provider_id)
+                        .map(|server| ResolvedProviderConfig {
+                            base_url: server.endpoint.clone().unwrap_or_default(),
+                            api_key: server.auth_token.clone(),
+                            model: server.default_model.clone(),
+                            format: ApiFormat::Acp,
+                            acp_profile: Some(server.profile),
+                            provider_id: Some(server.id.clone()),
+                            extra_headers: server
+                                .headers
+                                .iter()
+                                .map(|header| (header.key.clone(), header.value.clone()))
+                                .collect(),
+                            acp_command: server.command.clone(),
+                            acp_args: server.args.clone(),
+                            acp_env: server
+                                .env
+                                .iter()
+                                .map(|entry| (entry.key.clone(), entry.value.clone()))
+                                .collect(),
+                            opencode_provider_name: Some("omni-bridge-acp".to_string()),
+                        })
+                    {
+                        return Some(config);
+                    }
+                }
                 if let Some(config) = self
                     .find_provider_by_id(&provider_id, agent, &settings)
                     .await
@@ -778,6 +935,10 @@ impl AppState {
                 session.id
             );
             return None;
+        }
+
+        if agent == AgentKind::Acp {
+            return find_best_acp_server();
         }
 
         // 3. Project-level providers
@@ -863,7 +1024,9 @@ impl AppState {
                 provider.format == ApiFormat::OpenAiCompatible
                     || provider.format == ApiFormat::AnthropicMessages
                     || provider.format == ApiFormat::Codex
+                    || provider.format == ApiFormat::Acp
             }
+            AgentKind::Acp => provider.format == ApiFormat::Acp,
             AgentKind::Custom => provider.format == ApiFormat::OpenAiCompatible,
         };
 
@@ -880,10 +1043,16 @@ impl AppState {
             api_key: provider.api_key.clone(),
             model: provider.model.clone(),
             format: provider.format,
+            acp_profile: None,
             provider_id: Some(provider_id.to_string()),
+            extra_headers: Vec::new(),
+            acp_command: None,
+            acp_args: Vec::new(),
+            acp_env: Vec::new(),
             opencode_provider_name: match provider.format {
                 ApiFormat::AnthropicMessages => Some("omni-bridge-anthropic".to_string()),
                 ApiFormat::Codex => Some("omni-bridge-codex".to_string()),
+                ApiFormat::Acp => Some("omni-bridge-acp".to_string()),
                 _ => Some("omni-bridge".to_string()),
             },
         })
@@ -1068,13 +1237,14 @@ impl AppState {
             session_snapshot.status,
             SessionStatus::Running | SessionStatus::AwaitingApproval
         );
-        let (abort_handle, should_interrupt) = {
+        let (abort_handle, cancel_tx, should_interrupt) = {
             let mut runtime = self.runtime.lock().await;
             let runtime_existed = runtime.contains_key(session_id);
             let entry = runtime
                 .entry(session_id.to_string())
                 .or_insert_with(SessionRuntimeState::default);
             let abort_handle = entry.turn_abort.take();
+            let cancel_tx = entry.cancel_tx.take();
             let had_active_turn = entry.turn_in_flight || abort_handle.is_some();
             let had_detached_running = Self::is_detached_running(entry);
             let should_interrupt = had_active_turn
@@ -1097,8 +1267,13 @@ impl AppState {
                     self.runtime_store_path.display()
                 );
             }
-            (abort_handle, should_interrupt)
+            (abort_handle, cancel_tx, should_interrupt)
         };
+
+        if let Some(cancel_tx) = cancel_tx {
+            let _ = cancel_tx.send(());
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
 
         if let Some(abort_handle) = abort_handle {
             abort_handle.abort();
@@ -1465,8 +1640,37 @@ impl AppState {
         self.update_runtime_state(session_id, |entry| {
             entry.turn_in_flight = false;
             entry.turn_abort = None;
+            entry.cancel_tx = None;
         })
         .await;
+    }
+
+    pub async fn set_cancel_sender(&self, session_id: &str, sender: mpsc::UnboundedSender<()>) {
+        let mut runtime = self.runtime.lock().await;
+        let entry = runtime
+            .entry(session_id.to_string())
+            .or_insert_with(SessionRuntimeState::default);
+        entry.cancel_tx = Some(sender);
+    }
+
+    #[cfg(test)]
+    pub async fn has_cancel_sender_for_test(&self, session_id: &str) -> bool {
+        self.runtime
+            .lock()
+            .await
+            .get(session_id)
+            .and_then(|entry| entry.cancel_tx.as_ref())
+            .is_some()
+    }
+
+    #[cfg(test)]
+    pub async fn turn_in_flight_for_test(&self, session_id: &str) -> bool {
+        self.runtime
+            .lock()
+            .await
+            .get(session_id)
+            .map(|entry| entry.turn_in_flight)
+            .unwrap_or(false)
     }
 
     pub async fn set_turn_abort(&self, session_id: &str, abort_handle: Option<AbortHandle>) {
@@ -2302,6 +2506,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn strict_state_load_fails_for_invalid_settings_file() {
+        let settings_path = test_path("strict-invalid-settings");
+        let runtime_path = test_path("strict-invalid-runtime");
+        let metadata_path = test_path("strict-invalid-metadata");
+
+        tokio::fs::write(&settings_path, "{not-json")
+            .await
+            .expect("invalid settings fixture should be written");
+
+        let error = AppState::new_with_paths_strict(settings_path, runtime_path, metadata_path)
+            .await
+            .err()
+            .expect("strict state load should fail for invalid settings");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to parse bridge settings")
+        );
+    }
+
+    #[tokio::test]
     async fn tts_stream_session_can_be_read_multiple_times_until_ttl() {
         let state = test_state("tts-stream-session").await;
         let session = state
@@ -2495,6 +2720,7 @@ mod tests {
                     enabled: true,
                     priority: 0,
                 }]),
+                acp_servers: None,
                 speech_profiles: None,
                 speech_voices: None,
                 speaker_filter: None,
@@ -2816,6 +3042,7 @@ mod tests {
                         priority: 0,
                     },
                 ]),
+                acp_servers: None,
                 speech_profiles: None,
                 speech_voices: None,
                 speaker_filter: None,
@@ -2872,6 +3099,7 @@ mod tests {
                         priority: 20,
                     },
                 ]),
+                acp_servers: None,
                 speech_profiles: None,
                 speech_voices: None,
                 speaker_filter: None,

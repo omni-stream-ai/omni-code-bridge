@@ -34,6 +34,8 @@ Rust bridge for [Omni Code](https://github.com/omni-stream-ai/omni-code). Expose
 > ```bash
 > systemctl --user enable --now omni-code-bridge.service
 > ```
+> The bundled user service now runs `omni-code-bridge settings-validate` as `ExecStartPre`, so
+> invalid bridge settings fail before the server starts.
 
 ## Quick Start
 
@@ -48,7 +50,7 @@ The bridge listens on `http://127.0.0.1:8787` by default.
 
 ## Optional Dependencies
 
-- Agent CLIs: `codex`, `claude`, or `opencode`
+- Agent CLIs: `codex`, `claude`, `opencode`, or `kiro-cli`
 - A local checkout of [omni-code](https://github.com/omni-stream-ai/omni-code) if you want the built-in APK update manifest endpoints to serve a local Android build
 
 Agent binary paths can be overridden with `ECHO_MATE_CODEX_BIN` and `ECHO_MATE_OPENCODE_BIN`.
@@ -107,6 +109,144 @@ Examples:
 
 For `PATCH /sessions/{id}`, omitting `provider_id` leaves the session unchanged, while
 `"provider_id": null` clears the stored session-level selection.
+
+### ACP Profiles
+
+Experimental ACP agent support is configured through `acp_servers` in `~/.omni-code/settings.json`.
+You can start from the checked-in example at
+[`config/settings.acp.example.json`](config/settings.acp.example.json) and adapt it for your local
+deployment.
+
+The bridge currently supports two ACP profiles:
+
+- `kiro`: local `stdio + JSON-RPC` via `kiro-cli acp`
+- `generic_http`: experimental HTTP/SSE ACP endpoint compatibility
+
+Before using the `kiro` profile, make sure `kiro-cli` is installed and authenticated:
+
+```bash
+kiro-cli login
+```
+
+For `AgentKind::Acp`, set `provider_id` to an `acp_servers[].id`, or use `"AUTO"` to select the
+highest-priority enabled ACP server.
+
+Example Kiro ACP configuration:
+
+```json
+{
+  "ai_approval": {
+    "enabled": false,
+    "base_url": "https://api.openai.com/v1",
+    "api_key": "",
+    "model": "gpt-4.1-mini",
+    "max_risk": "low"
+  },
+  "model_providers": [],
+  "acp_servers": [
+    {
+      "id": "kiro-local",
+      "name": "Kiro Local ACP",
+      "profile": "kiro",
+      "command": "kiro-cli",
+      "args": ["acp"],
+      "default_model": "claude-sonnet-4",
+      "enabled": true,
+      "priority": 0,
+      "headers": [],
+      "env": []
+    }
+  ]
+}
+```
+
+Example generic HTTP ACP configuration:
+
+```json
+{
+  "ai_approval": {
+    "enabled": false,
+    "base_url": "https://api.openai.com/v1",
+    "api_key": "",
+    "model": "gpt-4.1-mini",
+    "max_risk": "low"
+  },
+  "model_providers": [],
+  "acp_servers": [
+    {
+      "id": "acp-http",
+      "name": "ACP HTTP Gateway",
+      "profile": "generic_http",
+      "endpoint": "https://acp.example.com",
+      "auth_token": "replace-me",
+      "enabled": true,
+      "priority": 10,
+      "headers": [
+        { "key": "X-ACP-Client", "value": "omni-code-bridge" }
+      ],
+      "env": []
+    }
+  ]
+}
+```
+
+Example session creation using ACP:
+
+```json
+{
+  "project_id": "my-project",
+  "title": "Try Kiro ACP",
+  "agent": "acp",
+  "provider_id": "kiro-local"
+}
+```
+
+For `generic_http`, the bridge currently probes and runs against these candidate turn URLs in order:
+`/turns`, `/turn`, `/sessions/{session_id}/turns`, then the configured endpoint itself.
+Requests are sent as JSON with fields like `session_id`, `thread_id`, `conversation_id`, `cwd`,
+`project_root`, `input`, `message`, and `prompt`. The response may be either:
+
+- JSON containing assistant text under fields such as `output_text`, `text`, `content`, or
+  `message.text`
+- SSE with `data: {...}` events that emit `delta.text`, approval events, and a terminal
+  `{ "type": "done" }`
+
+For approval round-trips, the bridge currently tries these reply URLs:
+`/approvals/{request_id}/reply`, `/approval/{request_id}/reply`,
+`/permissions/{request_id}/reply`, `/permission/{request_id}/reply`,
+`/approvals/{request_id}`, `/approval/{request_id}`.
+Cancellation is best-effort via `/sessions/{session_ref}/cancel`, `/session/{session_ref}/cancel`,
+`/turns/cancel`, `/turn/cancel`, and `/cancel`.
+
+`GET /agents` now reports both binary presence and structured readiness state. For Kiro-backed ACP,
+`readiness` becomes `attention_required` when `kiro-cli` is installed but still needs
+`kiro-cli login`, and `readiness_message` explains the next step. ACP entries also include
+`acp_diagnostic` for the currently selected enabled server, including its `server_id`, `name`,
+`profile`, `command`/`args` or `endpoint`, auth/model/header/env summary, and how many ACP servers
+are enabled.
+
+For health checks and scripting, `GET /agents/acp/diagnostic` returns the selected ACP server's
+structured diagnostic together with `installed`, `installed_path`, `readiness`, and
+`readiness_message`. The response is marked with `source: "live_probe"` and `probed_at`, and the
+endpoint accepts `?refresh=true` so callers can explicitly request a fresh probe contract. You can
+also pass `?provider_id=<acp_server_id>` to diagnose a specific configured ACP server directly,
+including lower-priority or disabled entries. When omitted, the response fills in the resolved
+`provider_id` for the selected server. For bulk inspection, `?all=true` returns diagnostics for all
+configured ACP servers in one response. For a minimal real runtime check, `?probe=true` adds a
+`handshake_probe` result. Today this performs a live `initialize -> session/new -> session/prompt`
+probe turn for Kiro-backed ACP servers, and a live turn-creation `POST` probe for `generic_http`
+endpoints. Probe results now include `mode` and `stage` so clients can distinguish a full stdio
+probe turn from a best-effort HTTP turn probe. The `generic_http` probe now follows the same
+candidate turn URLs as real runtime requests and can validate both JSON and SSE turn responses, but
+it is still a lightweight healthcheck rather than a full end-to-end ACP conversation guarantee. When
+`provider_id` is supplied but does not match any configured ACP server, the endpoint returns
+`400 Bad Request`. Bulk results also include
+`is_default_selected` so clients can tell which ACP server would currently be chosen by default.
+For `generic_http`, diagnostics now also expose `turn_url_candidates`,
+`approval_reply_url_templates`, and `cancel_url_templates`, so operators can see the exact bridge
+URL patterns used during runtime without reading the source.
+`all=true` and `provider_id` are mutually exclusive and also return `400 Bad Request` when used
+together.
 
 ### Reasoning Effort
 
@@ -300,6 +440,19 @@ sh scripts/setup-git-hooks.sh
 
 Run `sh scripts/setup-git-hooks.sh` once after cloning to enable the local `commit-msg` hook.
 
+### Settings Validation
+
+Validate a bridge settings file before starting the server:
+
+```bash
+cargo run -- settings-validate --path config/settings.acp.example.json
+```
+
+If `--path` is omitted, the command validates the resolved default settings path
+(`~/.omni-code/settings.json`, or `ECHO_MATE_SETTINGS_PATH` when set).
+The production server startup path now uses the same strict settings parsing and validation rules,
+so invalid settings fail fast instead of silently falling back to defaults.
+
 ### Session Trace
 
 Inspect the last few agent command/response pairs from a local Codex or Claude transcript:
@@ -354,6 +507,37 @@ cargo run --example speech_realtime_smoke -- \
 The example expects a local wav file, resamples it to `16 kHz`, streams it to
 `/speech/realtime/ws`, and prints the observed realtime events and completed
 transcript.
+
+### ACP Smoke Test
+
+For ACP validation there is also a bridge-level smoke script:
+
+```bash
+scripts/acp-smoke.sh --keep-artifacts
+```
+
+What it does:
+
+- Checks `GET /health`
+- Auto-provisions a local client auth token when `BRIDGE_CLIENT_ID` and `BRIDGE_TOKEN` are not set
+- Fetches `GET /agents` and verifies the ACP summary is present
+- Fetches `GET /agents/acp/diagnostic`
+- By default, runs `?probe=true&refresh=true` so you get a live ACP probe result as part of the smoke check
+- Fails fast when ACP readiness is not `ready`, or when the live probe does not succeed
+
+Useful options:
+
+| Option | Description |
+| --- | --- |
+| `--provider-id ID` | Diagnose a specific `acp_servers[].id` |
+| `--all` | Fetch diagnostics for all configured ACP servers |
+| `--no-probe` | Skip the live probe and only inspect static diagnostics |
+| `--allow-attention-required` | Allow `readiness=attention_required` without failing the smoke run |
+| `--output-dir DIR` | Store JSON outputs in a fixed directory |
+| `--no-auto-auth` | Require an existing `BRIDGE_CLIENT_ID` and `BRIDGE_TOKEN` |
+
+The script requires `curl` and `jq`. If auto-auth is enabled, it also uses `cargo` when no local
+`omni-code-bridge` binary is already available for approving the temporary client auth request.
 
 ### Commit Messages
 

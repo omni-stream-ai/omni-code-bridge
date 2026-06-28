@@ -28,15 +28,16 @@ use crate::{
     asr,
     bridge_settings::{BridgeSettings, BridgeSettingsInput},
     models::{
-        AgentCommandForwarding, AgentCommandSummary, AgentCommandsSummary, AgentInstallInput,
-        AgentKind, AgentSummary, ApiError, ApiResponse, AppUpdateManifest, ApprovalDecisionInput,
-        AudioSpeechStreamResponse, CancelSessionReplyResult, ClientAuthRequestInput,
-        CreateProjectInput, CreateSessionInput, FileCompletionItem, FileCompletionQuery,
-        OpenAiAudioSpeechRequest, OpenAiErrorDetail, OpenAiErrorResponse, OpenAiModel,
-        OpenAiModelList, OpenAiTranscriptionResponse, OpenAiVerboseTranscriptionResponse,
-        OpenAiVerboseTranscriptionSegment, RegisterPushDeviceInput, ReplySummary, SendMessageInput,
-        SessionEvent, SpeakerFilterSettingsInput, SpeechModelDownloadInput, SpeechModelKind,
-        SpeechProfile, SpeechProfileSelectionInput, SpeechVoiceSelectionInput, SummarizeReplyInput,
+        AcpAgentDiagnosticResponse, AcpHandshakeProbe, AgentCommandForwarding, AgentCommandSummary,
+        AgentCommandsSummary, AgentInstallInput, AgentKind, AgentReadiness, AgentSummary, ApiError,
+        ApiResponse, AppUpdateManifest, ApprovalDecisionInput, AudioSpeechStreamResponse,
+        CancelSessionReplyResult, ClientAuthRequestInput, CreateProjectInput, CreateSessionInput,
+        FileCompletionItem, FileCompletionQuery, OpenAiAudioSpeechRequest, OpenAiErrorDetail,
+        OpenAiErrorResponse, OpenAiModel, OpenAiModelList, OpenAiTranscriptionResponse,
+        OpenAiVerboseTranscriptionResponse, OpenAiVerboseTranscriptionSegment,
+        RegisterPushDeviceInput, ReplySummary, SendMessageInput, SessionEvent,
+        SpeakerFilterSettingsInput, SpeechModelDownloadInput, SpeechModelKind, SpeechProfile,
+        SpeechProfileSelectionInput, SpeechVoiceSelectionInput, SummarizeReplyInput,
         TriggerClientMessageInput, UpdateSessionInput, UploadedFileResponse,
     },
     realtime, speaker,
@@ -104,6 +105,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/sessions/{id}", get(get_session).patch(update_session))
         .route("/sessions/{id}/summary", post(summarize_reply))
         .route("/agents", get(list_agents))
+        .route("/agents/acp/diagnostic", get(get_acp_agent_diagnostic))
         .route("/agents/commands", get(list_agent_commands))
         .route("/agents/install", post(install_agent_handler))
         .route(
@@ -120,6 +122,18 @@ struct FileQuery {
     project_id: Option<String>,
     #[serde(default)]
     session_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct AcpDiagnosticQuery {
+    #[serde(default)]
+    refresh: bool,
+    #[serde(default)]
+    provider_id: Option<String>,
+    #[serde(default)]
+    all: bool,
+    #[serde(default)]
+    probe: bool,
 }
 
 async fn app_update_manifest() -> Result<Json<AppUpdateManifest>, ApiError> {
@@ -1687,9 +1701,10 @@ async fn list_agents(headers: HeaderMap, State(state): State<Arc<AppState>>) -> 
         return error.into_response();
     }
     let agents = vec![
-        agent_summary(AgentKind::Codex),
-        agent_summary(AgentKind::ClaudeCode),
-        agent_summary(AgentKind::OpenCode),
+        agent_summary(&state, AgentKind::Codex).await,
+        agent_summary(&state, AgentKind::ClaudeCode).await,
+        agent_summary(&state, AgentKind::OpenCode).await,
+        agent_summary(&state, AgentKind::Acp).await,
     ];
     Json(ApiResponse { data: agents }).into_response()
 }
@@ -1705,8 +1720,153 @@ async fn list_agent_commands(
         agent_commands_summary(AgentKind::Codex),
         agent_commands_summary(AgentKind::ClaudeCode),
         agent_commands_summary(AgentKind::OpenCode),
+        agent_commands_summary(AgentKind::Acp),
     ];
     Json(ApiResponse { data: commands }).into_response()
+}
+
+async fn get_acp_agent_diagnostic(
+    headers: HeaderMap,
+    Query(query): Query<AcpDiagnosticQuery>,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    if let Err(error) = authorize_request(&headers, &state).await {
+        return error.into_response();
+    }
+    let _refresh = query.refresh;
+    let settings = state.bridge_settings().await;
+    if query.all && query.provider_id.is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse {
+                data: serde_json::json!({
+                    "error": "query parameters `all=true` and `provider_id` cannot be used together"
+                }),
+            }),
+        )
+            .into_response();
+    }
+    let default_selected_provider_id = settings
+        .acp_servers
+        .iter()
+        .filter(|server| server.enabled)
+        .min_by_key(|server| server.priority)
+        .map(|server| server.id.clone());
+    if let Some(provider_id) = query
+        .provider_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        && !settings
+            .acp_servers
+            .iter()
+            .any(|server| server.id == provider_id)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse {
+                data: serde_json::json!({
+                    "error": format!(
+                        "configured ACP server `{provider_id}` was not found in settings"
+                    )
+                }),
+            }),
+        )
+            .into_response();
+    }
+    let probed_at = chrono::Utc::now().to_rfc3339();
+    if query.all && query.provider_id.is_none() {
+        let provider_ids = settings
+            .acp_servers
+            .iter()
+            .map(|server| server.id.clone())
+            .collect::<Vec<_>>();
+        let mut items = Vec::with_capacity(provider_ids.len());
+        for provider_id in provider_ids {
+            let is_default_selected = default_selected_provider_id
+                .as_deref()
+                .map(|selected| selected == provider_id)
+                .unwrap_or(false);
+            let summary =
+                adapter::summarize_acp_agent_for_provider(&settings, Some(provider_id.as_str()))
+                    .await;
+            let probe = if query.probe {
+                adapter::probe_acp_handshake_for_provider(&settings, Some(provider_id.as_str()))
+                    .await
+            } else {
+                None
+            };
+            items.push(acp_diagnostic_response_from_summary(
+                summary,
+                Some(provider_id),
+                is_default_selected,
+                probed_at.clone(),
+                probe,
+            ));
+        }
+        return Json(ApiResponse { data: items }).into_response();
+    }
+
+    let summary =
+        adapter::summarize_acp_agent_for_provider(&settings, query.provider_id.as_deref()).await;
+    Json(ApiResponse {
+        data: acp_diagnostic_response_from_summary(
+            summary,
+            query.provider_id.clone(),
+            query
+                .provider_id
+                .as_deref()
+                .map(|provider_id| {
+                    default_selected_provider_id
+                        .as_deref()
+                        .map(|selected| selected == provider_id)
+                        .unwrap_or(false)
+                })
+                .unwrap_or(true),
+            probed_at,
+            if query.probe {
+                adapter::probe_acp_handshake_for_provider(&settings, query.provider_id.as_deref())
+                    .await
+            } else {
+                None
+            },
+        ),
+    })
+    .into_response()
+}
+
+fn acp_diagnostic_response_from_summary(
+    summary: adapter::AcpAgentStatus,
+    provider_id: Option<String>,
+    is_default_selected: bool,
+    probed_at: String,
+    handshake_probe: Option<AcpHandshakeProbe>,
+) -> AcpAgentDiagnosticResponse {
+    let resolved_provider_id = provider_id.or_else(|| {
+        summary
+            .diagnostic
+            .as_ref()
+            .map(|diagnostic| diagnostic.configured_server_id.clone())
+    });
+    let readiness = if !summary.installed {
+        AgentReadiness::NotInstalled
+    } else if summary.readiness_message.is_some() {
+        AgentReadiness::AttentionRequired
+    } else {
+        AgentReadiness::Ready
+    };
+    AcpAgentDiagnosticResponse {
+        provider_id: resolved_provider_id,
+        is_default_selected,
+        installed: summary.installed,
+        installed_path: summary.installed_path,
+        readiness,
+        readiness_message: summary.readiness_message,
+        source: "live_probe".to_string(),
+        probed_at,
+        handshake_probe,
+        diagnostic: summary.diagnostic,
+    }
 }
 
 async fn install_agent_handler(
@@ -1721,7 +1881,7 @@ async fn install_agent_handler(
     Json(ApiResponse { data: result }).into_response()
 }
 
-fn agent_summary(kind: AgentKind) -> AgentSummary {
+async fn agent_summary(state: &Arc<AppState>, kind: AgentKind) -> AgentSummary {
     let (id, label, aliases, selectable, default_selected, compatible_formats, binary_name) =
         agent_descriptor(kind);
     if matches!(kind, AgentKind::Custom) {
@@ -1735,10 +1895,39 @@ fn agent_summary(kind: AgentKind) -> AgentSummary {
             compatible_formats,
             installed: false,
             installed_path: None,
+            readiness: AgentReadiness::NotInstalled,
+            readiness_message: None,
+            acp_diagnostic: None,
             install_hint: "Custom agent does not support auto-install".to_string(),
         };
     }
-    let installed_path = adapter::find_executable_in_path(binary_name);
+    let (installed, installed_path, readiness_message, acp_diagnostic) =
+        if matches!(kind, AgentKind::Acp) {
+            let settings = state.bridge_settings().await;
+            let summary = adapter::summarize_acp_agent(&settings).await;
+            (
+                summary.installed,
+                summary.installed_path,
+                summary.readiness_message,
+                summary.diagnostic,
+            )
+        } else {
+            let installed_path = adapter::find_executable_in_path(binary_name);
+            let readiness_message = adapter::agent_readiness_message(kind).await;
+            (
+                installed_path.is_some(),
+                installed_path.map(|p| p.display().to_string()),
+                readiness_message,
+                None,
+            )
+        };
+    let readiness = if !installed {
+        AgentReadiness::NotInstalled
+    } else if readiness_message.is_some() {
+        AgentReadiness::AttentionRequired
+    } else {
+        AgentReadiness::Ready
+    };
     AgentSummary {
         kind,
         id: id.to_string(),
@@ -1747,8 +1936,11 @@ fn agent_summary(kind: AgentKind) -> AgentSummary {
         selectable,
         default_selected,
         compatible_formats,
-        installed: installed_path.is_some(),
-        installed_path: installed_path.map(|p| p.display().to_string()),
+        installed,
+        installed_path,
+        readiness,
+        readiness_message,
+        acp_diagnostic,
         install_hint: adapter::manual_install_hint(kind),
     }
 }
@@ -1795,6 +1987,15 @@ fn agent_descriptor(
                 crate::models::ApiFormat::Codex,
             ],
             "opencode",
+        ),
+        AgentKind::Acp => (
+            "acp",
+            "ACP",
+            vec!["acp"],
+            true,
+            false,
+            vec![crate::models::ApiFormat::Acp],
+            "",
         ),
         AgentKind::Custom => (
             "custom",
@@ -1856,7 +2057,7 @@ fn agent_commands_summary(kind: AgentKind) -> AgentCommandsSummary {
                 forwarding: AgentCommandForwarding::Wrapped,
             },
         ],
-        AgentKind::OpenCode | AgentKind::Custom => Vec::new(),
+        AgentKind::OpenCode | AgentKind::Acp | AgentKind::Custom => Vec::new(),
     };
     AgentCommandsSummary { kind, commands }
 }
@@ -2514,25 +2715,115 @@ fn sanitize_upload_lookup_id(id: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        absolute_url_from_headers, agent_commands_summary, agent_summary, completion_search_scope,
-        content_type_for_path, content_type_for_upload_name, encode_session_event,
-        list_completion_items, normalize_completion_prefix, normalize_transcription_language,
+        AcpDiagnosticQuery, absolute_url_from_headers, agent_commands_summary, agent_summary,
+        completion_search_scope, content_type_for_path, content_type_for_upload_name,
+        encode_session_event, get_acp_agent_diagnostic, list_completion_items,
+        normalize_completion_prefix, normalize_transcription_language,
         normalize_transcription_response_format, resolve_path_within_root,
         sanitize_upload_file_name, sanitize_upload_lookup_id, transcription_response, uploads_dir,
         validate_speech_options, validate_transcription_options,
     };
-    use crate::models::{AgentKind, FileCompletionQuery, SessionEvent};
+    use crate::{
+        app_state::AppState,
+        bridge_settings::{AiApprovalSettings, BridgeSettingsInput},
+        models::{
+            AcpProfile, AcpServerConfig, AgentKind, AgentReadiness, ClientAuthRequestInput,
+            FileCompletionQuery, HeaderKeyValue, SessionEvent,
+        },
+    };
     use axum::{
+        Json,
         body::to_bytes,
+        extract::{Query, State},
         http::{HeaderMap, StatusCode, header},
         response::IntoResponse,
+        routing::{get, post},
     };
     use serde_json::Value;
     use std::{
         fs,
         path::{Path, PathBuf},
+        sync::Arc,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    fn test_path(prefix: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("omni-code-bridge-api-{prefix}-{unique}.json"))
+    }
+
+    async fn test_state(prefix: &str) -> Arc<AppState> {
+        let settings_path = test_path(&format!("{prefix}-settings"));
+        let runtime_path = test_path(&format!("{prefix}-runtime"));
+        let metadata_path = test_path(&format!("{prefix}-metadata"));
+        Arc::new(AppState::new_with_paths(settings_path, runtime_path, metadata_path).await)
+    }
+
+    async fn authorized_headers(state: &Arc<AppState>) -> HeaderMap {
+        let record = state
+            .request_client_auth(ClientAuthRequestInput {
+                client_id: "test-client".to_string(),
+                device_name: Some("API tests".to_string()),
+            })
+            .await
+            .expect("client auth request should succeed");
+        let token = if let Some(token) = record.token.clone() {
+            token
+        } else {
+            state
+                .approve_client_auth_for_test(&record.request_id)
+                .await
+                .expect("client auth approval should succeed")
+                .token
+                .unwrap_or_default()
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("x-omni-code-client-id", "test-client".parse().unwrap());
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        headers
+    }
+
+    fn mock_kiro_acp_script_path() -> PathBuf {
+        let path = std::env::temp_dir().join("omni-code-bridge-api-mock-kiro-acp.py");
+        std::fs::write(
+            &path,
+            r#"#!/usr/bin/env python3
+import json
+import sys
+
+scenario = sys.argv[1] if len(sys.argv) > 1 else "probe-success"
+
+def write(value):
+    sys.stdout.write(json.dumps(value, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    value = json.loads(line)
+    request_id = value.get("id")
+    method = value.get("method", "")
+
+    if method == "initialize":
+        write({"jsonrpc": "2.0", "id": request_id, "result": {"protocolVersion": 1, "serverInfo": {"name": "mock-kiro-acp", "version": "test"}}})
+    elif method == "session/new":
+        write({"jsonrpc": "2.0", "id": request_id, "result": {"sessionId": "kiro-probe-session"}})
+    elif method == "session/prompt" and scenario == "probe-success":
+        write({"jsonrpc": "2.0", "method": "session/notification", "params": {"type": "AgentMessageChunk", "chunk": {"text": "probe ok"}}})
+        write({"jsonrpc": "2.0", "method": "session/notification", "params": {"type": "TurnEnd", "status": "completed"}})
+        write({"jsonrpc": "2.0", "id": request_id, "result": {}})
+        sys.exit(0)
+    else:
+        write({"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": f"unsupported mock method: {method}"}})
+"#,
+        )
+        .expect("mock Kiro ACP script should be written");
+        path
+    }
 
     #[test]
     fn resolves_file_inside_root() {
@@ -2826,20 +3117,885 @@ mod tests {
         assert!(opencode.commands.is_empty());
     }
 
-    #[test]
-    fn agent_summary_exposes_descriptor_metadata() {
-        let codex = agent_summary(AgentKind::Codex);
+    #[tokio::test]
+    async fn agent_summary_exposes_descriptor_metadata() {
+        let state = test_state("agent-summary-metadata").await;
+        let codex = agent_summary(&state, AgentKind::Codex).await;
         assert_eq!(codex.id, "codex");
         assert_eq!(codex.label, "Codex");
         assert!(codex.default_selected);
         assert_eq!(codex.compatible_formats.len(), 1);
+        assert!(matches!(
+            codex.readiness,
+            AgentReadiness::Ready
+                | AgentReadiness::AttentionRequired
+                | AgentReadiness::NotInstalled
+        ));
 
-        let claude = agent_summary(AgentKind::ClaudeCode);
+        let claude = agent_summary(&state, AgentKind::ClaudeCode).await;
         assert!(claude.aliases.contains(&"claudecode".to_string()));
         assert!(!claude.default_selected);
 
-        let custom = agent_summary(AgentKind::Custom);
+        let acp = agent_summary(&state, AgentKind::Acp).await;
+        assert_eq!(acp.id, "acp");
+        assert_eq!(acp.compatible_formats.len(), 1);
+        assert!(matches!(
+            acp.readiness,
+            AgentReadiness::Ready
+                | AgentReadiness::AttentionRequired
+                | AgentReadiness::NotInstalled
+        ));
+        assert!(acp.acp_diagnostic.is_none());
+
+        let custom = agent_summary(&state, AgentKind::Custom).await;
         assert!(!custom.selectable);
+        assert!(matches!(custom.readiness, AgentReadiness::NotInstalled));
+        assert!(custom.acp_diagnostic.is_none());
+    }
+
+    #[tokio::test]
+    async fn acp_agent_summary_reports_unconfigured_when_no_enabled_servers_exist() {
+        let state = test_state("acp-summary-unconfigured").await;
+
+        let acp = agent_summary(&state, AgentKind::Acp).await;
+
+        assert!(matches!(acp.readiness, AgentReadiness::NotInstalled));
+        assert!(!acp.installed);
+        assert!(acp.installed_path.is_none());
+        assert!(
+            acp.readiness_message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("no enabled ACP servers")
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_agent_summary_uses_enabled_generic_http_server() {
+        let state = test_state("acp-summary-generic-http").await;
+        state
+            .update_bridge_settings(BridgeSettingsInput {
+                ai_approval: AiApprovalSettings::default(),
+                model_providers: None,
+                acp_servers: Some(vec![AcpServerConfig {
+                    id: "generic-acp".to_string(),
+                    name: "Generic ACP".to_string(),
+                    profile: AcpProfile::GenericHttp,
+                    endpoint: Some("https://acp.example.test".to_string()),
+                    command: None,
+                    args: Vec::new(),
+                    auth_token: String::new(),
+                    default_model: None,
+                    enabled: true,
+                    priority: 0,
+                    headers: Vec::new(),
+                    env: Vec::new(),
+                }]),
+                speech_profiles: None,
+                speech_voices: None,
+                speaker_filter: None,
+            })
+            .await
+            .expect("settings update should succeed");
+
+        let acp = agent_summary(&state, AgentKind::Acp).await;
+
+        assert!(matches!(acp.readiness, AgentReadiness::Ready));
+        assert!(acp.installed);
+        assert!(acp.installed_path.is_none());
+        assert!(acp.readiness_message.is_none());
+        let diagnostic = acp.acp_diagnostic.expect("diagnostic should exist");
+        assert_eq!(diagnostic.configured_server_id, "generic-acp");
+        assert_eq!(diagnostic.configured_server_name, "Generic ACP");
+        assert!(matches!(diagnostic.profile, AcpProfile::GenericHttp));
+        assert_eq!(
+            diagnostic.endpoint.as_deref(),
+            Some("https://acp.example.test")
+        );
+        assert!(!diagnostic.auth_configured);
+        assert_eq!(diagnostic.default_model, None);
+        assert_eq!(diagnostic.header_count, 0);
+        assert_eq!(diagnostic.env_count, 0);
+        assert_eq!(
+            diagnostic.turn_url_candidates,
+            vec![
+                "https://acp.example.test/turns".to_string(),
+                "https://acp.example.test/turn".to_string(),
+                "https://acp.example.test/sessions/{session_id}/turns".to_string(),
+                "https://acp.example.test".to_string(),
+            ]
+        );
+        assert_eq!(diagnostic.approval_reply_url_templates.len(), 6);
+        assert_eq!(diagnostic.cancel_url_templates.len(), 5);
+        assert_eq!(diagnostic.enabled_server_count, 1);
+    }
+
+    #[tokio::test]
+    async fn acp_agent_summary_prefers_highest_priority_enabled_server() {
+        let state = test_state("acp-summary-priority").await;
+        state
+            .update_bridge_settings(BridgeSettingsInput {
+                ai_approval: AiApprovalSettings::default(),
+                model_providers: None,
+                acp_servers: Some(vec![
+                    AcpServerConfig {
+                        id: "kiro-primary".to_string(),
+                        name: "Kiro Primary".to_string(),
+                        profile: AcpProfile::Kiro,
+                        endpoint: None,
+                        command: Some("/definitely/missing/kiro-cli".to_string()),
+                        args: vec!["acp".to_string()],
+                        auth_token: String::new(),
+                        default_model: None,
+                        enabled: true,
+                        priority: 0,
+                        headers: Vec::new(),
+                        env: Vec::new(),
+                    },
+                    AcpServerConfig {
+                        id: "generic-fallback".to_string(),
+                        name: "Generic Fallback".to_string(),
+                        profile: AcpProfile::GenericHttp,
+                        endpoint: Some("https://acp.example.test".to_string()),
+                        command: None,
+                        args: Vec::new(),
+                        auth_token: String::new(),
+                        default_model: None,
+                        enabled: true,
+                        priority: 10,
+                        headers: vec![HeaderKeyValue {
+                            key: "Authorization".to_string(),
+                            value: "Bearer token".to_string(),
+                        }],
+                        env: Vec::new(),
+                    },
+                ]),
+                speech_profiles: None,
+                speech_voices: None,
+                speaker_filter: None,
+            })
+            .await
+            .expect("settings update should succeed");
+
+        let acp = agent_summary(&state, AgentKind::Acp).await;
+
+        assert!(matches!(acp.readiness, AgentReadiness::NotInstalled));
+        assert!(!acp.installed);
+        assert!(acp.installed_path.is_none());
+        assert!(
+            acp.readiness_message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("kiro-primary")
+        );
+        let diagnostic = acp.acp_diagnostic.expect("diagnostic should exist");
+        assert_eq!(diagnostic.configured_server_id, "kiro-primary");
+        assert_eq!(diagnostic.configured_server_name, "Kiro Primary");
+        assert!(matches!(diagnostic.profile, AcpProfile::Kiro));
+        assert_eq!(
+            diagnostic.command.as_deref(),
+            Some("/definitely/missing/kiro-cli")
+        );
+        assert_eq!(diagnostic.args, vec!["acp".to_string()]);
+        assert!(!diagnostic.auth_configured);
+        assert_eq!(diagnostic.default_model, None);
+        assert_eq!(diagnostic.header_count, 0);
+        assert_eq!(diagnostic.env_count, 0);
+        assert_eq!(diagnostic.enabled_server_count, 2);
+    }
+
+    #[tokio::test]
+    async fn acp_agent_diagnostic_endpoint_returns_selected_server_details() {
+        let state = test_state("acp-diagnostic-endpoint").await;
+        state
+            .update_bridge_settings(BridgeSettingsInput {
+                ai_approval: AiApprovalSettings::default(),
+                model_providers: None,
+                acp_servers: Some(vec![AcpServerConfig {
+                    id: "generic-acp".to_string(),
+                    name: "Generic ACP".to_string(),
+                    profile: AcpProfile::GenericHttp,
+                    endpoint: Some("https://acp.example.test".to_string()),
+                    command: None,
+                    args: Vec::new(),
+                    auth_token: String::new(),
+                    default_model: None,
+                    enabled: true,
+                    priority: 0,
+                    headers: Vec::new(),
+                    env: Vec::new(),
+                }]),
+                speech_profiles: None,
+                speech_voices: None,
+                speaker_filter: None,
+            })
+            .await
+            .expect("settings update should succeed");
+
+        let headers = authorized_headers(&state).await;
+        let response =
+            get_acp_agent_diagnostic(headers, Query(AcpDiagnosticQuery::default()), State(state))
+                .await
+                .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["data"]["provider_id"],
+            Value::String("generic-acp".to_string())
+        );
+        assert_eq!(json["data"]["is_default_selected"], Value::Bool(true));
+        assert_eq!(json["data"]["installed"], Value::Bool(true));
+        assert_eq!(
+            json["data"]["readiness"],
+            Value::String("ready".to_string())
+        );
+        assert!(json["data"]["readiness_message"].is_null());
+        assert_eq!(
+            json["data"]["source"],
+            Value::String("live_probe".to_string())
+        );
+        assert!(json["data"]["probed_at"].as_str().is_some());
+        assert_eq!(
+            json["data"]["diagnostic"]["configured_server_id"],
+            Value::String("generic-acp".to_string())
+        );
+        assert_eq!(json["data"]["diagnostic"]["enabled"], Value::Bool(true));
+        assert_eq!(
+            json["data"]["diagnostic"]["endpoint"],
+            Value::String("https://acp.example.test".to_string())
+        );
+        assert_eq!(
+            json["data"]["diagnostic"]["auth_configured"],
+            Value::Bool(false)
+        );
+        assert_eq!(json["data"]["diagnostic"]["default_model"], Value::Null);
+        assert_eq!(
+            json["data"]["diagnostic"]["header_count"],
+            Value::Number(0.into())
+        );
+        assert_eq!(
+            json["data"]["diagnostic"]["env_count"],
+            Value::Number(0.into())
+        );
+        assert_eq!(
+            json["data"]["diagnostic"]["turn_url_candidates"][0],
+            Value::String("https://acp.example.test/turns".to_string())
+        );
+        assert_eq!(
+            json["data"]["diagnostic"]["approval_reply_url_templates"][0],
+            Value::String("https://acp.example.test/approvals/{request_id}/reply".to_string())
+        );
+        assert_eq!(
+            json["data"]["diagnostic"]["cancel_url_templates"][0],
+            Value::String("https://acp.example.test/sessions/{session_ref}/cancel".to_string())
+        );
+        assert_eq!(
+            json["data"]["diagnostic"]["enabled_server_count"],
+            Value::Number(1.into())
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_agent_diagnostic_endpoint_can_target_disabled_server_by_provider_id() {
+        let state = test_state("acp-diagnostic-provider-id").await;
+        state
+            .update_bridge_settings(BridgeSettingsInput {
+                ai_approval: AiApprovalSettings::default(),
+                model_providers: None,
+                acp_servers: Some(vec![
+                    AcpServerConfig {
+                        id: "generic-primary".to_string(),
+                        name: "Generic Primary".to_string(),
+                        profile: AcpProfile::GenericHttp,
+                        endpoint: Some("https://acp-primary.example.test".to_string()),
+                        command: None,
+                        args: Vec::new(),
+                        auth_token: "secret-token".to_string(),
+                        default_model: None,
+                        enabled: true,
+                        priority: 0,
+                        headers: vec![HeaderKeyValue {
+                            key: "X-ACP-Client".to_string(),
+                            value: "omni-code-bridge".to_string(),
+                        }],
+                        env: Vec::new(),
+                    },
+                    AcpServerConfig {
+                        id: "generic-disabled".to_string(),
+                        name: "Generic Disabled".to_string(),
+                        profile: AcpProfile::GenericHttp,
+                        endpoint: Some("https://acp-disabled.example.test".to_string()),
+                        command: None,
+                        args: Vec::new(),
+                        auth_token: String::new(),
+                        default_model: None,
+                        enabled: false,
+                        priority: 100,
+                        headers: Vec::new(),
+                        env: Vec::new(),
+                    },
+                ]),
+                speech_profiles: None,
+                speech_voices: None,
+                speaker_filter: None,
+            })
+            .await
+            .expect("settings update should succeed");
+
+        let headers = authorized_headers(&state).await;
+        let response = get_acp_agent_diagnostic(
+            headers,
+            Query(AcpDiagnosticQuery {
+                refresh: true,
+                provider_id: Some("generic-disabled".to_string()),
+                all: false,
+                probe: false,
+            }),
+            State(state),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["data"]["provider_id"],
+            Value::String("generic-disabled".to_string())
+        );
+        assert_eq!(json["data"]["is_default_selected"], Value::Bool(false));
+        assert_eq!(
+            json["data"]["diagnostic"]["configured_server_id"],
+            Value::String("generic-disabled".to_string())
+        );
+        assert_eq!(json["data"]["diagnostic"]["enabled"], Value::Bool(false));
+        assert_eq!(
+            json["data"]["diagnostic"]["endpoint"],
+            Value::String("https://acp-disabled.example.test".to_string())
+        );
+        assert_eq!(
+            json["data"]["diagnostic"]["auth_configured"],
+            Value::Bool(false)
+        );
+        assert_eq!(
+            json["data"]["diagnostic"]["header_count"],
+            Value::Number(0.into())
+        );
+        assert_eq!(
+            json["data"]["readiness"],
+            Value::String("attention_required".to_string())
+        );
+        assert!(
+            json["data"]["readiness_message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("disabled in settings")
+        );
+        assert_eq!(
+            json["data"]["diagnostic"]["enabled_server_count"],
+            Value::Number(1.into())
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_agent_diagnostic_endpoint_rejects_unknown_provider_id() {
+        let state = test_state("acp-diagnostic-missing-provider").await;
+        state
+            .update_bridge_settings(BridgeSettingsInput {
+                ai_approval: AiApprovalSettings::default(),
+                model_providers: None,
+                acp_servers: Some(vec![AcpServerConfig {
+                    id: "generic-primary".to_string(),
+                    name: "Generic Primary".to_string(),
+                    profile: AcpProfile::GenericHttp,
+                    endpoint: Some("https://acp-primary.example.test".to_string()),
+                    command: None,
+                    args: Vec::new(),
+                    auth_token: String::new(),
+                    default_model: None,
+                    enabled: true,
+                    priority: 0,
+                    headers: Vec::new(),
+                    env: Vec::new(),
+                }]),
+                speech_profiles: None,
+                speech_voices: None,
+                speaker_filter: None,
+            })
+            .await
+            .expect("settings update should succeed");
+
+        let headers = authorized_headers(&state).await;
+        let response = get_acp_agent_diagnostic(
+            headers,
+            Query(AcpDiagnosticQuery {
+                refresh: true,
+                provider_id: Some("missing-provider".to_string()),
+                all: false,
+                probe: false,
+            }),
+            State(state),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json["data"]["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("missing-provider")
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_agent_diagnostic_endpoint_can_return_all_servers() {
+        let state = test_state("acp-diagnostic-all").await;
+        state
+            .update_bridge_settings(BridgeSettingsInput {
+                ai_approval: AiApprovalSettings::default(),
+                model_providers: None,
+                acp_servers: Some(vec![
+                    AcpServerConfig {
+                        id: "generic-primary".to_string(),
+                        name: "Generic Primary".to_string(),
+                        profile: AcpProfile::GenericHttp,
+                        endpoint: Some("https://acp-primary.example.test".to_string()),
+                        command: None,
+                        args: Vec::new(),
+                        auth_token: String::new(),
+                        default_model: None,
+                        enabled: true,
+                        priority: 0,
+                        headers: Vec::new(),
+                        env: Vec::new(),
+                    },
+                    AcpServerConfig {
+                        id: "generic-disabled".to_string(),
+                        name: "Generic Disabled".to_string(),
+                        profile: AcpProfile::GenericHttp,
+                        endpoint: Some("https://acp-disabled.example.test".to_string()),
+                        command: None,
+                        args: Vec::new(),
+                        auth_token: String::new(),
+                        default_model: None,
+                        enabled: false,
+                        priority: 10,
+                        headers: Vec::new(),
+                        env: Vec::new(),
+                    },
+                ]),
+                speech_profiles: None,
+                speech_voices: None,
+                speaker_filter: None,
+            })
+            .await
+            .expect("settings update should succeed");
+
+        let headers = authorized_headers(&state).await;
+        let response = get_acp_agent_diagnostic(
+            headers,
+            Query(AcpDiagnosticQuery {
+                refresh: true,
+                provider_id: None,
+                all: true,
+                probe: false,
+            }),
+            State(state),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let items = json["data"].as_array().expect("data should be an array");
+        assert_eq!(items.len(), 2);
+        assert_eq!(
+            items[0]["provider_id"],
+            Value::String("generic-primary".to_string())
+        );
+        assert_eq!(items[0]["is_default_selected"], Value::Bool(true));
+        assert_eq!(items[0]["diagnostic"]["enabled"], Value::Bool(true));
+        assert_eq!(
+            items[1]["provider_id"],
+            Value::String("generic-disabled".to_string())
+        );
+        assert_eq!(items[1]["is_default_selected"], Value::Bool(false));
+        assert_eq!(items[1]["diagnostic"]["enabled"], Value::Bool(false));
+        assert_eq!(
+            items[1]["readiness"],
+            Value::String("attention_required".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_agent_diagnostic_endpoint_rejects_conflicting_all_and_provider_id() {
+        let state = test_state("acp-diagnostic-conflict").await;
+        state
+            .update_bridge_settings(BridgeSettingsInput {
+                ai_approval: AiApprovalSettings::default(),
+                model_providers: None,
+                acp_servers: Some(vec![AcpServerConfig {
+                    id: "generic-primary".to_string(),
+                    name: "Generic Primary".to_string(),
+                    profile: AcpProfile::GenericHttp,
+                    endpoint: Some("https://acp-primary.example.test".to_string()),
+                    command: None,
+                    args: Vec::new(),
+                    auth_token: String::new(),
+                    default_model: None,
+                    enabled: true,
+                    priority: 0,
+                    headers: Vec::new(),
+                    env: Vec::new(),
+                }]),
+                speech_profiles: None,
+                speech_voices: None,
+                speaker_filter: None,
+            })
+            .await
+            .expect("settings update should succeed");
+
+        let headers = authorized_headers(&state).await;
+        let response = get_acp_agent_diagnostic(
+            headers,
+            Query(AcpDiagnosticQuery {
+                refresh: true,
+                provider_id: Some("generic-primary".to_string()),
+                all: true,
+                probe: false,
+            }),
+            State(state),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json["data"]["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("cannot be used together")
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_agent_diagnostic_endpoint_reports_turn_probe_for_generic_http() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let address = listener.local_addr().expect("listener should expose addr");
+        let app = axum::Router::new()
+            .route(
+                "/turns",
+                post(|| async {
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        Json(serde_json::json!({
+                            "session_id": "acp-probe-session",
+                            "output_text": "probe ok"
+                        })),
+                    )
+                }),
+            )
+            .route(
+                "/",
+                get(|| async {
+                    (
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        Json(serde_json::json!({
+                            "error": "POST required for ACP turn creation"
+                        })),
+                    )
+                }),
+            )
+            .route(
+                "/",
+                post(|| async {
+                    (
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        Json(serde_json::json!({
+                            "error": "Use /turns for ACP turn creation"
+                        })),
+                    )
+                }),
+            );
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let state = test_state("acp-diagnostic-generic-probe").await;
+        state
+            .update_bridge_settings(BridgeSettingsInput {
+                ai_approval: AiApprovalSettings::default(),
+                model_providers: None,
+                acp_servers: Some(vec![AcpServerConfig {
+                    id: "generic-acp".to_string(),
+                    name: "Generic ACP".to_string(),
+                    profile: AcpProfile::GenericHttp,
+                    endpoint: Some(format!("http://{}", address)),
+                    command: None,
+                    args: Vec::new(),
+                    auth_token: "secret-token".to_string(),
+                    default_model: Some("acp-probe-model".to_string()),
+                    enabled: true,
+                    priority: 0,
+                    headers: vec![HeaderKeyValue {
+                        key: "X-ACP-Client".to_string(),
+                        value: "omni-code-bridge".to_string(),
+                    }],
+                    env: Vec::new(),
+                }]),
+                speech_profiles: None,
+                speech_voices: None,
+                speaker_filter: None,
+            })
+            .await
+            .expect("settings update should succeed");
+
+        let headers = authorized_headers(&state).await;
+        let response = get_acp_agent_diagnostic(
+            headers,
+            Query(AcpDiagnosticQuery {
+                refresh: true,
+                provider_id: None,
+                all: false,
+                probe: true,
+            }),
+            State(state),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["data"]["handshake_probe"]["attempted"],
+            Value::Bool(true)
+        );
+        assert_eq!(
+            json["data"]["handshake_probe"]["success"],
+            Value::Bool(true)
+        );
+        assert_eq!(
+            json["data"]["handshake_probe"]["mode"],
+            Value::String("generic_http_turn_create".to_string())
+        );
+        assert_eq!(
+            json["data"]["handshake_probe"]["stage"],
+            Value::String("turn_post".to_string())
+        );
+        assert_eq!(
+            json["data"]["diagnostic"]["auth_configured"],
+            Value::Bool(true)
+        );
+        assert_eq!(
+            json["data"]["diagnostic"]["default_model"],
+            Value::String("acp-probe-model".to_string())
+        );
+        assert_eq!(
+            json["data"]["diagnostic"]["header_count"],
+            Value::Number(1.into())
+        );
+        assert_eq!(
+            json["data"]["diagnostic"]["env_count"],
+            Value::Number(0.into())
+        );
+        assert!(
+            json["data"]["handshake_probe"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("accepted a probe request")
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn acp_agent_diagnostic_endpoint_reports_sse_turn_probe_for_generic_http() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let address = listener.local_addr().expect("listener should expose addr");
+        let app = axum::Router::new().route(
+            "/turns",
+            post(|| async {
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    "data: {\"session_id\":\"acp-probe-session\",\"delta\":{\"text\":\"stream \"}}\n\n\
+data: {\"delta\":{\"text\":\"ok\"}}\n\n\
+data: {\"type\":\"done\"}\n\n",
+                )
+            }),
+        );
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let state = test_state("acp-diagnostic-generic-sse-probe").await;
+        state
+            .update_bridge_settings(BridgeSettingsInput {
+                ai_approval: AiApprovalSettings::default(),
+                model_providers: None,
+                acp_servers: Some(vec![AcpServerConfig {
+                    id: "generic-acp-sse".to_string(),
+                    name: "Generic ACP SSE".to_string(),
+                    profile: AcpProfile::GenericHttp,
+                    endpoint: Some(format!("http://{}", address)),
+                    command: None,
+                    args: Vec::new(),
+                    auth_token: String::new(),
+                    default_model: None,
+                    enabled: true,
+                    priority: 0,
+                    headers: Vec::new(),
+                    env: Vec::new(),
+                }]),
+                speech_profiles: None,
+                speech_voices: None,
+                speaker_filter: None,
+            })
+            .await
+            .expect("settings update should succeed");
+
+        let headers = authorized_headers(&state).await;
+        let response = get_acp_agent_diagnostic(
+            headers,
+            Query(AcpDiagnosticQuery {
+                refresh: true,
+                provider_id: None,
+                all: false,
+                probe: true,
+            }),
+            State(state),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["data"]["handshake_probe"]["attempted"],
+            Value::Bool(true)
+        );
+        assert_eq!(
+            json["data"]["handshake_probe"]["success"],
+            Value::Bool(true)
+        );
+        assert_eq!(
+            json["data"]["handshake_probe"]["mode"],
+            Value::String("generic_http_turn_create".to_string())
+        );
+        assert_eq!(
+            json["data"]["handshake_probe"]["stage"],
+            Value::String("turn_post".to_string())
+        );
+        assert!(
+            json["data"]["handshake_probe"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("SSE stream completed normally")
+        );
+        assert!(
+            json["data"]["handshake_probe"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("stream ok")
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn acp_agent_diagnostic_endpoint_reports_successful_kiro_probe() {
+        let state = test_state("acp-diagnostic-kiro-probe").await;
+        let script = mock_kiro_acp_script_path();
+        state
+            .update_bridge_settings(BridgeSettingsInput {
+                ai_approval: AiApprovalSettings::default(),
+                model_providers: None,
+                acp_servers: Some(vec![AcpServerConfig {
+                    id: "kiro-mock".to_string(),
+                    name: "Kiro Mock".to_string(),
+                    profile: AcpProfile::Kiro,
+                    endpoint: None,
+                    command: Some("python3".to_string()),
+                    args: vec![
+                        script.to_string_lossy().to_string(),
+                        "probe-success".to_string(),
+                    ],
+                    auth_token: String::new(),
+                    default_model: None,
+                    enabled: true,
+                    priority: 0,
+                    headers: Vec::new(),
+                    env: Vec::new(),
+                }]),
+                speech_profiles: None,
+                speech_voices: None,
+                speaker_filter: None,
+            })
+            .await
+            .expect("settings update should succeed");
+
+        let headers = authorized_headers(&state).await;
+        let response = get_acp_agent_diagnostic(
+            headers,
+            Query(AcpDiagnosticQuery {
+                refresh: true,
+                provider_id: None,
+                all: false,
+                probe: true,
+            }),
+            State(state),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["data"]["handshake_probe"]["attempted"],
+            Value::Bool(true)
+        );
+        assert_eq!(
+            json["data"]["handshake_probe"]["success"],
+            Value::Bool(true)
+        );
+        assert_eq!(
+            json["data"]["handshake_probe"]["mode"],
+            Value::String("kiro_stdio_handshake".to_string())
+        );
+        assert_eq!(
+            json["data"]["handshake_probe"]["stage"],
+            Value::String("session/prompt".to_string())
+        );
+        assert!(
+            json["data"]["handshake_probe"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("kiro-probe-session")
+        );
+        assert!(
+            json["data"]["handshake_probe"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("probe turn")
+        );
     }
 
     #[tokio::test]

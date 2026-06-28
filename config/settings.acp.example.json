@@ -1,0 +1,57 @@
+{
+  "ai_approval": {
+    "enabled": false,
+    "base_url": "https://api.openai.com/v1",
+    "api_key": "",
+    "model": "gpt-4.1-mini",
+    "max_risk": "low"
+  },
+  "model_providers": [],
+  "acp_servers": [
+    {
+      "id": "kiro-local",
+      "name": "Kiro Local ACP",
+      "profile": "kiro",
+      "command": "kiro-cli",
+      "args": ["acp"],
+      "auth_token": "",
+      "default_model": "claude-sonnet-4",
+      "enabled": true,
+      "priority": 0,
+      "headers": [],
+      "env": [
+        {
+          "key": "XDG_RUNTIME_DIR",
+          "value": "/run/user/1000"
+        },
+        {
+          "key": "DBUS_SESSION_BUS_ADDRESS",
+          "value": "unix:path=/run/user/1000/bus"
+        }
+      ]
+    },
+    {
+      "id": "acp-http",
+      "name": "ACP HTTP Gateway",
+      "profile": "generic_http",
+      "endpoint": "https://acp.example.com",
+      "auth_token": "replace-me",
+      "default_model": "acp-default-model",
+      "enabled": false,
+      "priority": 10,
+      "headers": [
+        {
+          "key": "X-ACP-Client",
+          "value": "omni-code-bridge"
+        }
+      ],
+      "env": []
+    }
+  ],
+  "speech_profiles": {},
+  "speech_voices": {},
+  "speaker_filter": {
+    "enabled": false,
+    "threshold": 0.45
+  }
+}

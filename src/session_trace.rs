@@ -33,6 +33,7 @@ pub fn print_session_trace(query: &str, limit: usize) -> Result<()> {
         AgentKind::Codex => parse_codex_trace_entries(&target.path)?,
         AgentKind::ClaudeCode => parse_claude_trace_entries(&target.path)?,
         AgentKind::OpenCode => bail!("session trace is not supported for OpenCode sessions yet"),
+        AgentKind::Acp => bail!("session trace is not supported for ACP sessions yet"),
         AgentKind::Custom => bail!("session trace is not supported for Custom sessions"),
     };
 
