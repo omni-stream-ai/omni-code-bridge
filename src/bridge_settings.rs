@@ -248,17 +248,19 @@ pub fn validate_acp_servers(servers: &[AcpServerConfig]) -> Result<(), String> {
             .filter(|command| !command.is_empty())
             .is_some();
         match server.profile {
-            crate::models::AcpProfile::Kiro => {
+            crate::models::AcpProfile::Stdio | crate::models::AcpProfile::Kiro => {
                 if !has_command {
                     return Err(format!(
-                        "ACP server {} with profile `kiro` must configure command",
-                        server.id
+                        "ACP server {} with profile `{}` must configure command",
+                        server.id,
+                        acp_profile_name(server.profile)
                     ));
                 }
                 if has_endpoint {
                     return Err(format!(
-                        "ACP server {} with profile `kiro` must not configure endpoint",
-                        server.id
+                        "ACP server {} with profile `{}` must not configure endpoint",
+                        server.id,
+                        acp_profile_name(server.profile)
                     ));
                 }
             }
@@ -317,6 +319,14 @@ pub fn validate_acp_servers(servers: &[AcpServerConfig]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn acp_profile_name(profile: crate::models::AcpProfile) -> &'static str {
+    match profile {
+        crate::models::AcpProfile::Stdio => "stdio",
+        crate::models::AcpProfile::Kiro => "kiro",
+        crate::models::AcpProfile::GenericHttp => "generic_http",
+    }
 }
 
 fn default_home_dir() -> Option<PathBuf> {
@@ -452,7 +462,11 @@ mod tests {
             .await
             .err()
             .expect("invalid settings should fail to load");
-        assert!(error.to_string().contains("failed to parse bridge settings"));
+        assert!(
+            error
+                .to_string()
+                .contains("failed to parse bridge settings")
+        );
 
         let _ = tokio::fs::remove_file(path).await;
     }
@@ -577,6 +591,26 @@ mod tests {
     }
 
     #[test]
+    fn validate_acp_servers_accepts_stdio_command_profile() {
+        let servers = vec![crate::models::AcpServerConfig {
+            id: "opencode-acp".to_string(),
+            name: "OpenCode ACP".to_string(),
+            profile: crate::models::AcpProfile::Stdio,
+            endpoint: None,
+            command: Some("opencode".to_string()),
+            args: vec!["acp".to_string()],
+            auth_token: String::new(),
+            default_model: None,
+            enabled: false,
+            priority: 20,
+            headers: Vec::new(),
+            env: Vec::new(),
+        }];
+
+        assert!(validate_acp_servers(&servers).is_ok());
+    }
+
+    #[test]
     fn validate_acp_servers_rejects_profile_transport_mismatch() {
         let kiro_without_command = crate::models::AcpServerConfig {
             id: "bad-kiro".to_string(),
@@ -658,7 +692,7 @@ mod tests {
                 crate::models::AcpServerConfig {
                     id: "kiro-local".to_string(),
                     name: "Kiro Local ACP".to_string(),
-                    profile: crate::models::AcpProfile::Kiro,
+                    profile: crate::models::AcpProfile::Stdio,
                     endpoint: None,
                     command: Some("kiro-cli".to_string()),
                     args: vec!["acp".to_string()],
@@ -666,6 +700,34 @@ mod tests {
                     default_model: Some("claude-sonnet-4".to_string()),
                     enabled: true,
                     priority: 0,
+                    headers: Vec::new(),
+                    env: Vec::new(),
+                },
+                crate::models::AcpServerConfig {
+                    id: "opencode-acp".to_string(),
+                    name: "OpenCode ACP".to_string(),
+                    profile: crate::models::AcpProfile::Stdio,
+                    endpoint: None,
+                    command: Some("opencode".to_string()),
+                    args: vec!["acp".to_string()],
+                    auth_token: String::new(),
+                    default_model: Some(String::new()),
+                    enabled: false,
+                    priority: 20,
+                    headers: Vec::new(),
+                    env: Vec::new(),
+                },
+                crate::models::AcpServerConfig {
+                    id: "codex-acp".to_string(),
+                    name: "Codex ACP".to_string(),
+                    profile: crate::models::AcpProfile::Stdio,
+                    endpoint: None,
+                    command: Some("codex".to_string()),
+                    args: vec!["acp".to_string()],
+                    auth_token: String::new(),
+                    default_model: Some(String::new()),
+                    enabled: false,
+                    priority: 30,
                     headers: Vec::new(),
                     env: Vec::new(),
                 },
@@ -704,6 +766,20 @@ mod tests {
             .await
             .expect("checked-in ACP example should load");
         validate_bridge_settings(&settings).expect("checked-in ACP example should validate");
-        assert_eq!(settings.acp_servers.len(), 2);
+        assert_eq!(settings.acp_servers.len(), 4);
+        assert!(
+            settings
+                .acp_servers
+                .iter()
+                .any(|server| server.id == "opencode-acp"
+                    && matches!(server.profile, crate::models::AcpProfile::Stdio))
+        );
+        assert!(
+            settings
+                .acp_servers
+                .iter()
+                .any(|server| server.id == "codex-acp"
+                    && matches!(server.profile, crate::models::AcpProfile::Stdio))
+        );
     }
 }

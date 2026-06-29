@@ -117,21 +117,23 @@ Agent 二进制路径可以通过 `ECHO_MATE_CODEX_BIN` 和 `ECHO_MATE_OPENCODE_
 [`config/settings.acp.example.json`](config/settings.acp.example.json)
 拷贝一份，再按本地环境做修改。
 
-当前 bridge 支持两个 ACP profile：
+当前 bridge 支持这些 ACP profile：
 
-- `kiro`：通过 `kiro-cli acp` 走本地 `stdio + JSON-RPC`
+- `stdio`：本地 ACP `stdio + JSON-RPC` runtime，例如 `kiro-cli acp` 或其他 ACP 兼容 CLI 命令
+- `kiro`：旧版 Kiro 专用 stdio profile 的兼容别名
 - `generic_http`：实验性的 HTTP/SSE ACP endpoint 兼容模式
 
-使用 `kiro` profile 前，请先确认已经安装并登录 `kiro-cli`：
+通过 `stdio` 或 `kiro` 使用 Kiro 前，请先确认已经安装并登录 `kiro-cli`：
 
 ```bash
 kiro-cli login
 ```
 
 对于 `AgentKind::Acp`，可以把 `provider_id` 设为某个 `acp_servers[].id`，也可以传 `"AUTO"`
-按优先级自动选择启用中的 ACP server。
+按优先级自动选择启用中的 ACP server。Codex 和 OpenCode ACP 应该作为这里的 ACP stdio
+server 来验证；bridge 不需要为了这个再走单独的 Codex/OpenCode 接入路径。
 
-Kiro ACP 配置示例：
+stdio ACP 配置示例：
 
 ```json
 {
@@ -147,7 +149,7 @@ Kiro ACP 配置示例：
     {
       "id": "kiro-local",
       "name": "Kiro Local ACP",
-      "profile": "kiro",
+      "profile": "stdio",
       "command": "kiro-cli",
       "args": ["acp"],
       "default_model": "claude-sonnet-4",
@@ -155,10 +157,36 @@ Kiro ACP 配置示例：
       "priority": 0,
       "headers": [],
       "env": []
+    },
+    {
+      "id": "opencode-acp",
+      "name": "OpenCode ACP",
+      "profile": "stdio",
+      "command": "opencode",
+      "args": ["acp"],
+      "enabled": false,
+      "priority": 20,
+      "headers": [],
+      "env": []
+    },
+    {
+      "id": "codex-acp",
+      "name": "Codex ACP",
+      "profile": "stdio",
+      "command": "codex",
+      "args": ["acp"],
+      "enabled": false,
+      "priority": 30,
+      "headers": [],
+      "env": []
     }
   ]
 }
 ```
+
+请按本机实际 ACP runtime 调整 `command` 和 `args`。可以先保留 disabled 验证模板，再用
+`GET /agents/acp/diagnostic?provider_id=<id>&probe=true&refresh=true` 定向探测，确认后再按
+priority 启用。
 
 generic HTTP ACP 配置示例：
 
@@ -195,7 +223,7 @@ generic HTTP ACP 配置示例：
 ```json
 {
   "project_id": "my-project",
-  "title": "Try Kiro ACP",
+  "title": "Try ACP",
   "agent": "acp",
   "provider_id": "kiro-local"
 }
@@ -219,7 +247,8 @@ generic HTTP ACP 配置示例：
 
 `GET /agents` 现在除了报告 binary 是否存在，也会返回结构化的 readiness 状态。对于
 Kiro 型 ACP，如果 `kiro-cli` 已安装但还没有完成 `kiro-cli login`，`readiness` 会变成
-`attention_required`，同时 `readiness_message` 会直接提示下一步动作。ACP 条目还会带上
+`attention_required`，同时 `readiness_message` 会直接提示下一步动作。通用 `stdio` 条目只
+检查配置的 command 是否存在；真实 ACP 握手请用 `?probe=true`。ACP 条目还会带上
 `acp_diagnostic`，描述当前实际会选中的 enabled server，包括它的 `server_id`、名称、
 `profile`、`command`/`args` 或 `endpoint`、auth/model/header/env 摘要，以及当前启用了
 多少个 ACP server。
@@ -231,21 +260,18 @@ Kiro 型 ACP，如果 `kiro-cli` 已安装但还没有完成 `kiro-cli login`，
 `?provider_id=<acp_server_id>` 来定向诊断某个已配置的 ACP server，包括低优先级或
 disabled 的条目。不传时，响应会自动回填最终命中的 `provider_id`。如果需要批量排查，
 可以传 `?all=true` 一次返回所有已配置 ACP server 的诊断结果。如果需要一次最小真实运行
-探测，可以传 `?probe=true`，响应里会多出 `handshake_probe`。当前它会对 Kiro 型 ACP
-执行一次实时的 `initialize -> session/new -> session/prompt` 最小 probe turn 检查；对
-`generic_http` 则会执行一次真实的 turn-creation `POST` 探测。probe 结果里现在还会带上
-`mode` 和 `stage`，方便客户端区分“完整 stdio probe turn”与“尽力模拟真实 turn 请求的
-HTTP 探测”。需要注意的是，
-`generic_http` 的 probe 现在会沿用真实运行链路的候选 turn URL 去发请求，但它仍然是
-轻量健康检查；它现在既能验证 JSON 响应，也能验证 SSE 流式 turn 响应，但仍不代表完整
-ACP 对话已经端到端验证通过。
-对于 `generic_http`，诊断结果现在还会直接带上 `turn_url_candidates`、
-`approval_reply_url_templates`、`cancel_url_templates`，方便排障时直接确认 bridge 真实会
-尝试哪些 URL 模板，而不需要再翻源码。
-如果传了 `provider_id` 但 settings 里没有对应 ACP server，接口会直接返回
-`400 Bad Request`。批量结果里还会带上 `is_default_selected`，方便客户端判断当前默认会
-选中哪条 ACP 配置。`all=true` 和 `provider_id` 互斥，同时使用时也会返回
-`400 Bad Request`。
+探测，可以传 `?probe=true`，响应里会多出 `handshake_probe`。当前它会对 `stdio`/`kiro`
+ACP 执行一次实时的 `initialize -> session/new -> session/prompt` 最小 probe turn 检查；对
+`generic_http` 则会执行一次真实的 turn-creation `POST` 探测。probe 结果里会带上 `mode`
+和 `stage`，方便客户端区分“完整 stdio probe turn”与“尽力模拟真实 turn 请求的 HTTP 探测”。
+需要注意的是，`generic_http` 的 probe 会沿用真实运行链路的候选 turn URL 去发请求，但它
+仍然是轻量健康检查；它既能验证 JSON 响应，也能验证 SSE 流式 turn 响应，但仍不代表完整
+ACP 对话已经端到端验证通过。对于 `generic_http`，诊断结果还会直接带上
+`turn_url_candidates`、`approval_reply_url_templates`、`cancel_url_templates`，方便排障时
+直接确认 bridge 真实会尝试哪些 URL 模板，而不需要再翻源码。如果传了 `provider_id` 但
+settings 里没有对应 ACP server，接口会直接返回 `400 Bad Request`。批量结果里还会带上
+`is_default_selected`，方便客户端判断当前默认会选中哪条 ACP 配置。`all=true` 和
+`provider_id` 互斥，同时使用时也会返回 `400 Bad Request`。
 
 ### 思考等级
 

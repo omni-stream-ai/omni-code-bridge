@@ -4752,7 +4752,10 @@ async fn run_acp(
     let Some(config) = provider_config else {
         bail!("ACP agent requires an ACP server configuration");
     };
-    if matches!(config.acp_profile, Some(AcpProfile::Kiro)) {
+    if matches!(
+        config.acp_profile,
+        Some(AcpProfile::Stdio | AcpProfile::Kiro)
+    ) {
         run_kiro_acp(
             state,
             session,
@@ -5034,7 +5037,10 @@ async fn run_kiro_acp(
         command.env(key, value);
     }
     if !config.api_key.is_empty() {
-        command.env("KIRO_API_KEY", &config.api_key);
+        command.env("ACP_API_KEY", &config.api_key);
+        if matches!(config.acp_profile, Some(AcpProfile::Kiro)) {
+            command.env("KIRO_API_KEY", &config.api_key);
+        }
     }
 
     let mut child = command
@@ -5149,7 +5155,7 @@ async fn run_kiro_acp(
             Ok(response) => response,
             Err(error) => {
                 let message = format!(
-                    "[kiro] failed to load ACP session {runtime_ref}; starting a new session: {error}"
+                    "[acp] failed to load ACP session {runtime_ref}; starting a new session: {error}"
                 );
                 state.emit_system_message(&session.id, message).await;
                 state.set_provider_session_ref(&session.id, None).await;
@@ -5297,7 +5303,7 @@ async fn run_kiro_acp(
                         let message = error
                             .get("message")
                             .and_then(Value::as_str)
-                            .unwrap_or("Kiro ACP prompt failed");
+                            .unwrap_or("ACP stdio prompt failed");
                         bail!("{message}");
                     }
                     // Some Kiro ACP builds finish a turn by resolving the prompt request
@@ -5339,7 +5345,7 @@ async fn run_kiro_acp(
                     let request_id = value
                         .get("id")
                         .and_then(jsonrpc_id_to_string)
-                        .context("Kiro ACP permission request did not include id")?;
+                        .context("ACP stdio permission request did not include id")?;
                     let params = value.get("params").unwrap_or(&Value::Null);
                     let request = kiro_acp_permission_request_to_approval(&request_id, params);
                     if let Some(choice) = auto_approve_codex_request(&request, &project_root).await? {
@@ -5428,11 +5434,11 @@ async fn run_kiro_acp(
         return Ok(());
     }
     if !turn_finished && full_text.trim().is_empty() {
-        bail!("Kiro ACP response did not include assistant text");
+        bail!("ACP stdio response did not include assistant text");
     }
     let text = full_text.trim().to_string();
     if text.is_empty() {
-        bail!("Kiro ACP response did not include assistant text");
+        bail!("ACP stdio response did not include assistant text");
     }
     push_incremental_text(&state, &session.id, &reply.id, &mut last_rendered, &text).await;
     state
@@ -6584,8 +6590,15 @@ async fn handle_kiro_client_method_request(
             state.secret_store().delete(&key).await?;
             send_json_rpc_response(writer, request_id, serde_json::json!({})).await
         }
-        _ => send_json_rpc_error(writer, request_id, -32601, &format!("Method not found: {method}"))
-            .await,
+        _ => {
+            send_json_rpc_error(
+                writer,
+                request_id,
+                -32601,
+                &format!("Method not found: {method}"),
+            )
+            .await
+        }
     }
 }
 
@@ -6703,7 +6716,7 @@ async fn wait_for_kiro_json_rpc_response(
                 Err(error)
             } else {
                 Err(error.context(format!(
-                    "Kiro ACP runtime stderr while waiting for {request_name}: {stderr}"
+                    "ACP stdio runtime stderr while waiting for {request_name}: {stderr}"
                 )))
             }
         }
@@ -6720,12 +6733,12 @@ async fn wait_for_stdout_line(
     match tokio::time::timeout(timeout, stdout_rx.recv()).await {
         Ok(Some(Ok(line))) => Ok(line),
         Ok(Some(Err(error))) => {
-            bail!("Kiro ACP runtime stdout error during {request_name}: {error}")
+            bail!("ACP stdio runtime stdout error during {request_name}: {error}")
         }
         Ok(None) => {
             let status = child
                 .try_wait()
-                .context("failed to poll Kiro ACP runtime while reading stdout")?;
+                .context("failed to poll ACP stdio runtime while reading stdout")?;
             let status_code = status
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "running".to_string());
@@ -6736,7 +6749,7 @@ async fn wait_for_stdout_line(
             );
         }
         Err(_) => bail!(
-            "Kiro ACP runtime timed out waiting for {request_name} output after {}ms",
+            "ACP stdio runtime timed out waiting for {request_name} output after {}ms",
             timeout.as_millis()
         ),
     }
@@ -6750,11 +6763,11 @@ fn format_kiro_runtime_exit_error(
 ) -> String {
     let mut message = if stderr.is_empty() {
         format!(
-            "Kiro ACP runtime exited before responding to {request_name} (id={request_id}, status={status_code})"
+            "ACP stdio runtime exited before responding to {request_name} (id={request_id}, status={status_code})"
         )
     } else {
         format!(
-            "Kiro ACP runtime exited before responding to {request_name} (id={request_id}, status={status_code}): {stderr}"
+            "ACP stdio runtime exited before responding to {request_name} (id={request_id}, status={status_code}): {stderr}"
         )
     };
     let stderr_lower = stderr.to_ascii_lowercase();
@@ -8917,6 +8930,16 @@ async fn acp_readiness_message_for_command(command_path: &Path) -> Option<String
         .await
 }
 
+async fn acp_readiness_message_for_server(
+    server: &crate::models::AcpServerConfig,
+    command_path: &Path,
+) -> Option<String> {
+    if matches!(server.profile, AcpProfile::Kiro) {
+        return acp_readiness_message_for_command(command_path).await;
+    }
+    None
+}
+
 async fn acp_readiness_message_for_command_with_args(
     command_path: &Path,
     args: &[&str],
@@ -9010,7 +9033,7 @@ pub async fn probe_acp_handshake_for_provider(
     }?;
 
     match server.profile {
-        AcpProfile::Kiro => Some(probe_kiro_acp_handshake(server).await),
+        AcpProfile::Stdio | AcpProfile::Kiro => Some(probe_kiro_acp_handshake(server).await),
         AcpProfile::GenericHttp => Some(probe_generic_http_acp_connectivity(server).await),
     }
 }
@@ -9094,13 +9117,19 @@ pub async fn summarize_acp_agent_for_provider(
     };
 
     match server.profile {
-        AcpProfile::Kiro => {
-            let command = server.command.as_deref().unwrap_or("kiro-cli");
+        AcpProfile::Stdio | AcpProfile::Kiro => {
+            let command = server.command.as_deref().unwrap_or_else(|| {
+                if matches!(server.profile, AcpProfile::Kiro) {
+                    "kiro-cli"
+                } else {
+                    ""
+                }
+            });
             let installed_path = resolve_command_path(command);
             let readiness_message = match installed_path.as_ref() {
-                Some(path) => acp_readiness_message_for_command(path).await,
+                Some(path) => acp_readiness_message_for_server(server, path).await,
                 None => Some(format!(
-                    "ACP server `{}` is configured for Kiro but command `{}` was not found in PATH.",
+                    "ACP server `{}` is configured for stdio but command `{}` was not found in PATH.",
                     server.id, command
                 )),
             };
@@ -9182,7 +9211,10 @@ async fn probe_kiro_acp_handshake(server: &crate::models::AcpServerConfig) -> Ac
         command.env(&entry.key, &entry.value);
     }
     if !server.auth_token.is_empty() {
-        command.env("KIRO_API_KEY", &server.auth_token);
+        command.env("ACP_API_KEY", &server.auth_token);
+        if matches!(server.profile, AcpProfile::Kiro) {
+            command.env("KIRO_API_KEY", &server.auth_token);
+        }
     }
 
     let mut child = match command.spawn() {
@@ -9191,10 +9223,10 @@ async fn probe_kiro_acp_handshake(server: &crate::models::AcpServerConfig) -> Ac
             return AcpHandshakeProbe {
                 attempted: true,
                 success: false,
-                mode: "kiro_stdio_handshake".to_string(),
+                mode: "stdio_json_rpc_handshake".to_string(),
                 stage: Some("spawn".to_string()),
                 message: Some(format!(
-                    "Failed to spawn Kiro ACP runtime `{command_name}`: {error}"
+                    "Failed to spawn ACP stdio runtime `{command_name}`: {error}"
                 )),
             };
         }
@@ -9257,21 +9289,21 @@ async fn probe_kiro_acp_handshake(server: &crate::models::AcpServerConfig) -> Ac
             &mut stdin,
             &mut next_request_id,
             "initialize",
-        serde_json::json!({
-            "protocolVersion": 1,
-            "clientCapabilities": {
-                "fs": {
-                    "readTextFile": true,
-                    "writeTextFile": true
+            serde_json::json!({
+                "protocolVersion": 1,
+                "clientCapabilities": {
+                    "fs": {
+                        "readTextFile": true,
+                        "writeTextFile": true
+                    },
+                    "terminal": true,
+                    "secretStorage": true
                 },
-                "terminal": true,
-                "secretStorage": true
-            },
-            "clientInfo": {
-                "name": "omni-code-bridge-diagnostic",
-                "version": env!("CARGO_PKG_VERSION")
-            }
-        }),
+                "clientInfo": {
+                    "name": "omni-code-bridge-diagnostic",
+                    "version": env!("CARGO_PKG_VERSION")
+                }
+            }),
         )
         .await?;
         wait_for_kiro_json_rpc_response(
@@ -9349,7 +9381,7 @@ async fn probe_kiro_acp_handshake(server: &crate::models::AcpServerConfig) -> Ac
             raw_stdout.push('\n');
 
             let value = serde_json::from_str::<Value>(&line)
-                .with_context(|| format!("Kiro ACP probe emitted invalid JSON: {line}"))?;
+                .with_context(|| format!("ACP stdio probe emitted invalid JSON: {line}"))?;
             if value.get("id") == Some(&Value::from(prompt_request_id)) {
                 if let Some(error) = value.get("error") {
                     bail!(
@@ -9357,7 +9389,7 @@ async fn probe_kiro_acp_handshake(server: &crate::models::AcpServerConfig) -> Ac
                         error
                             .get("message")
                             .and_then(Value::as_str)
-                            .unwrap_or("Kiro ACP probe prompt failed")
+                            .unwrap_or("ACP stdio probe prompt failed")
                     );
                 }
                 break;
@@ -9382,11 +9414,13 @@ async fn probe_kiro_acp_handshake(server: &crate::models::AcpServerConfig) -> Ac
                 if kiro_acp_turn_end(params) {
                     continue;
                 }
-            } else if value.get("method").and_then(Value::as_str) == Some("session/request_permission") {
+            } else if value.get("method").and_then(Value::as_str)
+                == Some("session/request_permission")
+            {
                 let request_id = value
                     .get("id")
                     .and_then(jsonrpc_id_to_string)
-                    .context("Kiro ACP probe permission request did not include id")?;
+                    .context("ACP stdio probe permission request did not include id")?;
                 send_json_rpc_response(
                     &mut stdin,
                     &request_id,
@@ -9409,10 +9443,10 @@ async fn probe_kiro_acp_handshake(server: &crate::models::AcpServerConfig) -> Ac
         Ok((session_id, probe_text)) => AcpHandshakeProbe {
             attempted: true,
             success: true,
-            mode: "kiro_stdio_handshake".to_string(),
+            mode: "stdio_json_rpc_handshake".to_string(),
             stage: Some("session/prompt".to_string()),
             message: Some(format!(
-                "Kiro ACP handshake succeeded, created session `{session_id}`, and completed a probe turn{}.",
+                "ACP stdio handshake succeeded, created session `{session_id}`, and completed a probe turn{}.",
                 if probe_text.trim().is_empty() {
                     String::new()
                 } else {
@@ -9426,7 +9460,7 @@ async fn probe_kiro_acp_handshake(server: &crate::models::AcpServerConfig) -> Ac
         Err(error) => AcpHandshakeProbe {
             attempted: true,
             success: false,
-            mode: "kiro_stdio_handshake".to_string(),
+            mode: "stdio_json_rpc_handshake".to_string(),
             stage: None,
             message: Some(error.to_string()),
         },

@@ -160,6 +160,7 @@ pub struct AcpServerConfig {
 #[serde(rename_all = "snake_case")]
 pub enum AcpProfile {
     #[default]
+    Stdio,
     Kiro,
     GenericHttp,
 }

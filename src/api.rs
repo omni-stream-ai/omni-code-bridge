@@ -3978,7 +3978,7 @@ data: {\"type\":\"done\"}\n\n",
         );
         assert_eq!(
             json["data"]["handshake_probe"]["mode"],
-            Value::String("kiro_stdio_handshake".to_string())
+            Value::String("stdio_json_rpc_handshake".to_string())
         );
         assert_eq!(
             json["data"]["handshake_probe"]["stage"],

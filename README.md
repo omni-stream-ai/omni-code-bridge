@@ -117,21 +117,24 @@ You can start from the checked-in example at
 [`config/settings.acp.example.json`](config/settings.acp.example.json) and adapt it for your local
 deployment.
 
-The bridge currently supports two ACP profiles:
+The bridge currently supports these ACP profiles:
 
-- `kiro`: local `stdio + JSON-RPC` via `kiro-cli acp`
+- `stdio`: local ACP `stdio + JSON-RPC` runtime, such as `kiro-cli acp` or another ACP-compatible CLI command
+- `kiro`: backward-compatible alias for the older Kiro-specific stdio profile
 - `generic_http`: experimental HTTP/SSE ACP endpoint compatibility
 
-Before using the `kiro` profile, make sure `kiro-cli` is installed and authenticated:
+Before using Kiro through `stdio` or `kiro`, make sure `kiro-cli` is installed and authenticated:
 
 ```bash
 kiro-cli login
 ```
 
 For `AgentKind::Acp`, set `provider_id` to an `acp_servers[].id`, or use `"AUTO"` to select the
-highest-priority enabled ACP server.
+highest-priority enabled ACP server. Codex and OpenCode ACP should be configured here as ACP stdio
+servers for validation; the bridge does not need a separate Codex/OpenCode integration path for
+that.
 
-Example Kiro ACP configuration:
+Example stdio ACP configuration:
 
 ```json
 {
@@ -147,7 +150,7 @@ Example Kiro ACP configuration:
     {
       "id": "kiro-local",
       "name": "Kiro Local ACP",
-      "profile": "kiro",
+      "profile": "stdio",
       "command": "kiro-cli",
       "args": ["acp"],
       "default_model": "claude-sonnet-4",
@@ -155,10 +158,37 @@ Example Kiro ACP configuration:
       "priority": 0,
       "headers": [],
       "env": []
+    },
+    {
+      "id": "opencode-acp",
+      "name": "OpenCode ACP",
+      "profile": "stdio",
+      "command": "opencode",
+      "args": ["acp"],
+      "enabled": false,
+      "priority": 20,
+      "headers": [],
+      "env": []
+    },
+    {
+      "id": "codex-acp",
+      "name": "Codex ACP",
+      "profile": "stdio",
+      "command": "codex",
+      "args": ["acp"],
+      "enabled": false,
+      "priority": 30,
+      "headers": [],
+      "env": []
     }
   ]
 }
 ```
+
+Adjust the `command` and `args` values to match the installed ACP runtime. Use disabled entries as
+validation templates, then target them with
+`GET /agents/acp/diagnostic?provider_id=<id>&probe=true&refresh=true` before enabling them by
+priority.
 
 Example generic HTTP ACP configuration:
 
@@ -195,7 +225,7 @@ Example session creation using ACP:
 ```json
 {
   "project_id": "my-project",
-  "title": "Try Kiro ACP",
+  "title": "Try ACP",
   "agent": "acp",
   "provider_id": "kiro-local"
 }
@@ -220,10 +250,11 @@ Cancellation is best-effort via `/sessions/{session_ref}/cancel`, `/session/{ses
 
 `GET /agents` now reports both binary presence and structured readiness state. For Kiro-backed ACP,
 `readiness` becomes `attention_required` when `kiro-cli` is installed but still needs
-`kiro-cli login`, and `readiness_message` explains the next step. ACP entries also include
-`acp_diagnostic` for the currently selected enabled server, including its `server_id`, `name`,
-`profile`, `command`/`args` or `endpoint`, auth/model/header/env summary, and how many ACP servers
-are enabled.
+`kiro-cli login`, and `readiness_message` explains the next step. Generic `stdio` entries only check
+that the configured command exists; use `?probe=true` for the live ACP handshake. ACP entries also
+include `acp_diagnostic` for the currently selected enabled server, including its `server_id`,
+`name`, `profile`, `command`/`args` or `endpoint`, auth/model/header/env summary, and how many ACP
+servers are enabled.
 
 For health checks and scripting, `GET /agents/acp/diagnostic` returns the selected ACP server's
 structured diagnostic together with `installed`, `installed_path`, `readiness`, and
@@ -234,19 +265,17 @@ including lower-priority or disabled entries. When omitted, the response fills i
 `provider_id` for the selected server. For bulk inspection, `?all=true` returns diagnostics for all
 configured ACP servers in one response. For a minimal real runtime check, `?probe=true` adds a
 `handshake_probe` result. Today this performs a live `initialize -> session/new -> session/prompt`
-probe turn for Kiro-backed ACP servers, and a live turn-creation `POST` probe for `generic_http`
-endpoints. Probe results now include `mode` and `stage` so clients can distinguish a full stdio
-probe turn from a best-effort HTTP turn probe. The `generic_http` probe now follows the same
-candidate turn URLs as real runtime requests and can validate both JSON and SSE turn responses, but
-it is still a lightweight healthcheck rather than a full end-to-end ACP conversation guarantee. When
-`provider_id` is supplied but does not match any configured ACP server, the endpoint returns
-`400 Bad Request`. Bulk results also include
-`is_default_selected` so clients can tell which ACP server would currently be chosen by default.
-For `generic_http`, diagnostics now also expose `turn_url_candidates`,
+probe turn for `stdio`/`kiro` ACP servers, and a live turn-creation `POST` probe for `generic_http`
+endpoints. Probe results include `mode` and `stage` so clients can distinguish a full stdio probe
+turn from a best-effort HTTP turn probe. The `generic_http` probe follows the same candidate turn
+URLs as real runtime requests and can validate both JSON and SSE turn responses, but it is still a
+lightweight healthcheck rather than a full end-to-end ACP conversation guarantee. When `provider_id`
+is supplied but does not match any configured ACP server, the endpoint returns `400 Bad Request`.
+Bulk results also include `is_default_selected` so clients can tell which ACP server would currently
+be chosen by default. For `generic_http`, diagnostics now also expose `turn_url_candidates`,
 `approval_reply_url_templates`, and `cancel_url_templates`, so operators can see the exact bridge
-URL patterns used during runtime without reading the source.
-`all=true` and `provider_id` are mutually exclusive and also return `400 Bad Request` when used
-together.
+URL patterns used during runtime without reading the source. `all=true` and `provider_id` are
+mutually exclusive and also return `400 Bad Request` when used together.
 
 ### Reasoning Effort
 

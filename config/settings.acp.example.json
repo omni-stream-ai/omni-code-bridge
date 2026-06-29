@@ -11,7 +11,7 @@
     {
       "id": "kiro-local",
       "name": "Kiro Local ACP",
-      "profile": "kiro",
+      "profile": "stdio",
       "command": "kiro-cli",
       "args": ["acp"],
       "auth_token": "",
@@ -29,6 +29,32 @@
           "value": "unix:path=/run/user/1000/bus"
         }
       ]
+    },
+    {
+      "id": "opencode-acp",
+      "name": "OpenCode ACP",
+      "profile": "stdio",
+      "command": "opencode",
+      "args": ["acp"],
+      "auth_token": "",
+      "default_model": "",
+      "enabled": false,
+      "priority": 20,
+      "headers": [],
+      "env": []
+    },
+    {
+      "id": "codex-acp",
+      "name": "Codex ACP",
+      "profile": "stdio",
+      "command": "codex",
+      "args": ["acp"],
+      "auth_token": "",
+      "default_model": "",
+      "enabled": false,
+      "priority": 30,
+      "headers": [],
+      "env": []
     },
     {
       "id": "acp-http",
