@@ -44,7 +44,10 @@ impl SecretStore {
     async fn save(&self) -> Result<()> {
         if let Some(parent) = self.path.parent() {
             tokio::fs::create_dir_all(parent).await.with_context(|| {
-                format!("failed to create secret store directory: {}", parent.display())
+                format!(
+                    "failed to create secret store directory: {}",
+                    parent.display()
+                )
             })?;
         }
 

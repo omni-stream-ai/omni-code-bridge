@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
@@ -256,6 +256,57 @@ impl AppState {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) async fn new_with_paths_and_providers(
+        settings_path: PathBuf,
+        runtime_store_path: PathBuf,
+        session_metadata_store_path: PathBuf,
+        providers: ProviderRegistry,
+    ) -> Self {
+        let (event_tx, _) = broadcast::channel(256);
+        let persisted_runtime = load_persisted_runtime(&runtime_store_path).await;
+        let persisted_metadata =
+            load_persisted_session_metadata(&session_metadata_store_path).await;
+        Self {
+            projects: RwLock::new(HashMap::new()),
+            sessions: RwLock::new(HashMap::new()),
+            session_title_overrides: RwLock::new(
+                persisted_metadata
+                    .sessions
+                    .into_iter()
+                    .filter_map(|(session_id, entry)| {
+                        entry
+                            .title
+                            .map(|title| title.trim().to_string())
+                            .filter(|title| !title.is_empty())
+                            .map(|title| (session_id, title))
+                    })
+                    .collect(),
+            ),
+            messages: RwLock::new(HashMap::new()),
+            devices: RwLock::new(load_device_registrations()),
+            list_cache: Mutex::new(None),
+            runtime: Mutex::new(
+                persisted_runtime
+                    .into_iter()
+                    .map(|(session_id, value)| {
+                        (session_id, SessionRuntimeState::from_persisted(value))
+                    })
+                    .collect(),
+            ),
+            event_tx,
+            providers,
+            settings: BridgeSettingsStore::load_from_path(settings_path).await,
+            speech: Arc::new(SpeechService::load().await),
+            client_auth: ClientAuthStore::load().await,
+            secret_store: SecretStore::load().await,
+            push: PushService::new(),
+            tts_stream_sessions: Mutex::new(HashMap::new()),
+            runtime_store_path,
+            session_metadata_store_path,
+        }
+    }
+
     pub(crate) async fn new_with_paths_strict(
         settings_path: PathBuf,
         runtime_store_path: PathBuf,
@@ -493,18 +544,30 @@ impl AppState {
         &self,
         mut sessions: Vec<SessionSummary>,
     ) -> Vec<SessionSummary> {
+        let local_session_ids = self
+            .sessions
+            .read()
+            .await
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
         let runtime = self.runtime.lock().await;
         for session in &mut sessions {
-            Self::apply_runtime_overlay(session, runtime.get(&session.id));
+            Self::apply_runtime_overlay(
+                session,
+                runtime.get(&session.id),
+                local_session_ids.contains(&session.id),
+            );
         }
         sessions
     }
 
     async fn with_runtime_approval(&self, mut session: SessionSummary) -> SessionSummary {
         session = self.overlay_persisted_session_title(session).await;
+        let is_local_session = self.sessions.read().await.contains_key(&session.id);
         let runtime = self.runtime.lock().await;
         let session_id = session.id.clone();
-        Self::apply_runtime_overlay(&mut session, runtime.get(&session_id));
+        Self::apply_runtime_overlay(&mut session, runtime.get(&session_id), is_local_session);
         session
     }
 
@@ -534,8 +597,15 @@ impl AppState {
             .cloned()
     }
 
-    fn apply_runtime_overlay(session: &mut SessionSummary, runtime: Option<&SessionRuntimeState>) {
+    fn apply_runtime_overlay(
+        session: &mut SessionSummary,
+        runtime: Option<&SessionRuntimeState>,
+        is_local_session: bool,
+    ) {
         session.pending_approval = runtime.and_then(|entry| entry.pending_approval.clone());
+        session.runtime_session_ref = runtime
+            .and_then(|entry| entry.provider_session_ref.clone())
+            .or_else(|| (!is_local_session).then(|| session.id.clone()));
         if session.pending_approval.is_some() {
             session.status = SessionStatus::AwaitingApproval;
         } else if runtime.map(Self::is_recoverable_runtime).unwrap_or(false)
@@ -559,12 +629,28 @@ impl AppState {
     }
 
     pub async fn list_messages(&self, session_id: &str) -> Option<Vec<ChatMessage>> {
-        if let Some(messages) = self.messages.read().await.get(session_id).cloned() {
-            return Some(messages);
-        }
         let session = self.find_session(session_id).await?;
         let provider = self.provider_for_agent(session.agent)?;
-        provider.list_messages(session_id).await
+        let provider_session_id = self
+            .provider_session_ref(session_id)
+            .await
+            .unwrap_or_else(|| session_id.to_string());
+        let cached = self.messages.read().await.get(session_id).cloned();
+        let provider_messages = provider.list_messages(&provider_session_id).await;
+
+        match (cached, provider_messages) {
+            (Some(local), Some(remote)) => {
+                let merged = Self::merge_messages(remote, local);
+                self.messages
+                    .write()
+                    .await
+                    .insert(session_id.to_string(), merged.clone());
+                Some(merged)
+            }
+            (Some(local), None) => Some(local),
+            (None, Some(remote)) => Some(remote),
+            (None, None) => None,
+        }
     }
 
     pub async fn get_session(&self, session_id: &str) -> Option<SessionDetail> {
@@ -625,6 +711,7 @@ impl AppState {
             unread_count: 0,
             last_message_preview: Some("新会话已创建".to_string()),
             pending_approval: None,
+            runtime_session_ref: None,
             provider_id: input.provider_id,
             reasoning_effort: input.reasoning_effort,
         };
@@ -730,6 +817,7 @@ impl AppState {
             unread_count: 1,
             last_message_preview: Some(content.clone()),
             pending_approval: None,
+            runtime_session_ref: None,
             provider_id: None,
             reasoning_effort: None,
         };
@@ -1446,19 +1534,23 @@ impl AppState {
         session_id: &str,
         message_id: &str,
     ) -> Result<(), String> {
-        let content = {
+        let assistant_message = {
             let messages = self.messages.read().await;
             messages
                 .get(session_id)
                 .and_then(|items| items.iter().find(|item| item.id == message_id))
-                .map(|message| message.content.clone())
+                .cloned()
                 .ok_or_else(|| format!("unknown message: {message_id}"))?
         };
+        let content = assistant_message.content.clone();
 
         self.patch_session(session_id, SessionStatus::Idle, Some(content.clone()))
             .await;
         self.clear_interrupted(session_id).await;
         self.clear_pending_approval(session_id).await;
+        let _ = self
+            .event_tx
+            .send(SessionEvent::MessageCreated(assistant_message));
         let _ = self
             .event_tx
             .send(SessionEvent::SessionStatus(SessionStatusEvent {
@@ -1802,6 +1894,37 @@ impl AppState {
         }
     }
 
+    fn merge_messages(
+        provider_messages: Vec<ChatMessage>,
+        local_messages: Vec<ChatMessage>,
+    ) -> Vec<ChatMessage> {
+        let mut merged = provider_messages;
+        let mut seen_ids = merged
+            .iter()
+            .map(|message| message.id.clone())
+            .collect::<HashSet<_>>();
+
+        for local in &local_messages {
+            if let Some(existing) = merged.iter_mut().find(|message| message.id == local.id) {
+                if local.content.len() >= existing.content.len() {
+                    *existing = local.clone();
+                }
+                continue;
+            }
+
+            if seen_ids.insert(local.id.clone()) {
+                merged.push(local.clone());
+            }
+        }
+
+        merged.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        merged
+    }
+
     async fn latest_assistant_preview(&self, session_id: &str) -> Option<String> {
         self.messages
             .read()
@@ -2136,6 +2259,9 @@ impl AppState {
         mut local_session: SessionSummary,
         provider_session: SessionSummary,
     ) -> SessionSummary {
+        if local_session.runtime_session_ref.is_none() {
+            local_session.runtime_session_ref = provider_session.runtime_session_ref.clone();
+        }
         local_session.status =
             Self::preferred_session_status(local_session.status, provider_session.status);
 
@@ -2484,11 +2610,61 @@ fn message_title(content: &str) -> String {
 mod tests {
     use super::*;
     use crate::{
+        adapter::AgentProvider,
         bridge_settings::{AiApprovalSettings, BridgeSettingsInput},
-        models::{AUTO_PROVIDER_ID, AgentKind, ApiFormat, ModelProviderConfig, SessionSummary},
+        models::{
+            AUTO_PROVIDER_ID, AgentKind, ApiFormat, ChatMessage, MessageRole, ModelProviderConfig,
+            SessionSummary,
+        },
     };
+    use anyhow::Result;
+    use async_trait::async_trait;
     use chrono::Utc;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::{
+        collections::HashMap,
+        sync::Arc,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+    use tokio::sync::Mutex as TokioMutex;
+
+    struct TestMessageProvider {
+        messages: TokioMutex<HashMap<String, Vec<ChatMessage>>>,
+    }
+
+    impl TestMessageProvider {
+        fn new(messages: HashMap<String, Vec<ChatMessage>>) -> Self {
+            Self {
+                messages: TokioMutex::new(messages),
+            }
+        }
+
+        async fn set_messages(&self, session_id: impl Into<String>, messages: Vec<ChatMessage>) {
+            self.messages
+                .lock()
+                .await
+                .insert(session_id.into(), messages);
+        }
+    }
+
+    #[async_trait]
+    impl AgentProvider for TestMessageProvider {
+        async fn list_messages(&self, session_id: &str) -> Option<Vec<ChatMessage>> {
+            self.messages.lock().await.get(session_id).cloned()
+        }
+
+        async fn run_session(
+            &self,
+            _state: Arc<AppState>,
+            _session: SessionSummary,
+            _input: ChatMessage,
+            _system_prompt: Option<String>,
+            _reply: ChatMessage,
+            _provider_config: Option<ResolvedProviderConfig>,
+            _reasoning_effort: Option<crate::models::ReasoningEffort>,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
 
     fn test_path(prefix: &str) -> PathBuf {
         let unique = SystemTime::now()
@@ -2503,6 +2679,35 @@ mod tests {
         let runtime_path = test_path(&format!("{prefix}-runtime"));
         let metadata_path = test_path(&format!("{prefix}-metadata"));
         AppState::new_with_paths(settings_path, runtime_path, metadata_path).await
+    }
+
+    async fn test_state_with_providers(prefix: &str, providers: ProviderRegistry) -> AppState {
+        let settings_path = test_path(&format!("{prefix}-settings"));
+        let runtime_path = test_path(&format!("{prefix}-runtime"));
+        let metadata_path = test_path(&format!("{prefix}-metadata"));
+        AppState::new_with_paths_and_providers(
+            settings_path,
+            runtime_path,
+            metadata_path,
+            providers,
+        )
+        .await
+    }
+
+    fn test_message(
+        id: &str,
+        session_id: &str,
+        role: MessageRole,
+        content: &str,
+        created_at: chrono::DateTime<Utc>,
+    ) -> ChatMessage {
+        ChatMessage {
+            id: id.to_string(),
+            session_id: session_id.to_string(),
+            role,
+            content: content.to_string(),
+            created_at,
+        }
     }
 
     #[tokio::test]
@@ -2551,6 +2756,127 @@ mod tests {
             second.as_ref().map(|value| value.token.as_str()),
             Some(session.token.as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn list_messages_refreshes_provider_messages_even_with_cached_session_messages() {
+        let now = Utc::now();
+        let provider = Arc::new(TestMessageProvider::new(HashMap::new()));
+        let registry = ProviderRegistry::from_map(HashMap::from([(
+            AgentKind::Custom,
+            provider.clone() as Arc<dyn AgentProvider>,
+        )]));
+        let state = test_state_with_providers("refresh-messages", registry).await;
+        let project = state
+            .create_project(CreateProjectInput {
+                name: "Project".to_string(),
+                root_path: std::env::temp_dir().to_string_lossy().to_string(),
+            })
+            .await;
+        let session = state
+            .create_session(CreateSessionInput {
+                project_id: project.id,
+                title: Some("Session".to_string()),
+                agent: AgentKind::Custom,
+                brief_reply_mode: false,
+                provider_id: None,
+                reasoning_effort: None,
+            })
+            .await
+            .expect("session should be created");
+
+        provider
+            .set_messages(
+                session.id.clone(),
+                vec![
+                    test_message("u1", &session.id, MessageRole::User, "hello", now),
+                    test_message(
+                        "a1",
+                        &session.id,
+                        MessageRole::Assistant,
+                        "new remote reply",
+                        now + chrono::TimeDelta::seconds(1),
+                    ),
+                ],
+            )
+            .await;
+
+        state.messages.write().await.insert(
+            session.id.clone(),
+            vec![test_message(
+                "u1",
+                &session.id,
+                MessageRole::User,
+                "hello",
+                now,
+            )],
+        );
+
+        let messages = state
+            .list_messages(&session.id)
+            .await
+            .expect("messages should exist");
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].id, "a1");
+        assert_eq!(messages[1].content, "new remote reply");
+    }
+
+    #[tokio::test]
+    async fn list_messages_uses_provider_session_ref_for_remote_history() {
+        let now = Utc::now();
+        let provider = Arc::new(TestMessageProvider::new(HashMap::new()));
+        let registry = ProviderRegistry::from_map(HashMap::from([(
+            AgentKind::Codex,
+            provider.clone() as Arc<dyn AgentProvider>,
+        )]));
+        let state = test_state_with_providers("remote-provider-session-ref", registry).await;
+        let project = state
+            .create_project(CreateProjectInput {
+                name: "Project".to_string(),
+                root_path: std::env::temp_dir().to_string_lossy().to_string(),
+            })
+            .await;
+        let session = state
+            .create_session(CreateSessionInput {
+                project_id: project.id,
+                title: Some("Session".to_string()),
+                agent: AgentKind::Codex,
+                brief_reply_mode: false,
+                provider_id: None,
+                reasoning_effort: None,
+            })
+            .await
+            .expect("session should be created");
+
+        state
+            .set_provider_session_ref(&session.id, Some("codex-thread-1".to_string()))
+            .await;
+
+        provider
+            .set_messages(
+                "codex-thread-1",
+                vec![
+                    test_message("u1", "codex-thread-1", MessageRole::User, "hello", now),
+                    test_message(
+                        "a1",
+                        "codex-thread-1",
+                        MessageRole::Assistant,
+                        "latest remote reply",
+                        now + chrono::TimeDelta::seconds(1),
+                    ),
+                ],
+            )
+            .await;
+
+        let messages = state
+            .list_messages(&session.id)
+            .await
+            .expect("messages should exist");
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].session_id, "codex-thread-1");
+        assert_eq!(messages[1].content, "latest remote reply");
     }
 
     #[test]
@@ -2640,6 +2966,7 @@ mod tests {
                     unread_count: 0,
                     last_message_preview: Some("local".to_string()),
                     pending_approval: None,
+                    runtime_session_ref: None,
                     provider_id: None,
                     reasoning_effort: None,
                 },
@@ -2657,6 +2984,7 @@ mod tests {
                     unread_count: 0,
                     last_message_preview: Some("archived".to_string()),
                     pending_approval: None,
+                    runtime_session_ref: None,
                     provider_id: None,
                     reasoning_effort: None,
                 },
@@ -2674,6 +3002,7 @@ mod tests {
                     unread_count: 1,
                     last_message_preview: Some("provider".to_string()),
                     pending_approval: None,
+                    runtime_session_ref: Some(provider_session_id.clone()),
                     provider_id: None,
                     reasoning_effort: None,
                 },
@@ -2739,6 +3068,7 @@ mod tests {
             unread_count: 0,
             last_message_preview: None,
             pending_approval: None,
+            runtime_session_ref: None,
             provider_id: None,
             reasoning_effort: None,
         };
@@ -2785,6 +3115,120 @@ mod tests {
             .expect("session detail should exist");
 
         assert!(matches!(detail.session.status, SessionStatus::Interrupted));
+        assert_eq!(
+            detail.session.runtime_session_ref.as_deref(),
+            Some("codex-thread")
+        );
+    }
+
+    #[tokio::test]
+    async fn finish_assistant_message_broadcasts_complete_message_snapshot() {
+        let state = test_state("finish-assistant-snapshot").await;
+        let project = state
+            .create_project(CreateProjectInput {
+                name: "Project".to_string(),
+                root_path: std::env::temp_dir().to_string_lossy().to_string(),
+            })
+            .await;
+        let session = state
+            .create_session(CreateSessionInput {
+                project_id: project.id,
+                title: Some("Session".to_string()),
+                agent: AgentKind::Codex,
+                brief_reply_mode: false,
+                provider_id: None,
+                reasoning_effort: None,
+            })
+            .await
+            .expect("session should be created");
+        let assistant_message = ChatMessage {
+            id: "assistant-message".to_string(),
+            session_id: session.id.clone(),
+            role: MessageRole::Assistant,
+            content: String::new(),
+            created_at: Utc::now(),
+        };
+        state.push_message(assistant_message.clone()).await;
+        let mut events = state.subscribe();
+
+        state
+            .emit_message_delta(&session.id, &assistant_message.id, "hello ")
+            .await;
+        state
+            .emit_message_delta(&session.id, &assistant_message.id, "world")
+            .await;
+        state
+            .finish_assistant_message(&session.id, &assistant_message.id)
+            .await
+            .expect("assistant message should finish");
+
+        let mut saw_complete_message = false;
+        let mut saw_idle_status_after_complete_message = false;
+        for _ in 0..4 {
+            match events.recv().await.expect("event should be broadcast") {
+                SessionEvent::MessageCreated(message) if message.id == assistant_message.id => {
+                    assert_eq!(message.content, "hello world");
+                    saw_complete_message = true;
+                }
+                SessionEvent::SessionStatus(event)
+                    if event.session_id == session.id
+                        && matches!(event.status, SessionStatus::Idle)
+                        && saw_complete_message =>
+                {
+                    saw_idle_status_after_complete_message = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        assert!(saw_complete_message);
+        assert!(saw_idle_status_after_complete_message);
+    }
+
+    #[tokio::test]
+    async fn list_and_detail_expose_runtime_session_ref() {
+        let state = test_state("runtime-session-ref").await;
+        let project = state
+            .create_project(CreateProjectInput {
+                name: "Project".to_string(),
+                root_path: std::env::temp_dir().to_string_lossy().to_string(),
+            })
+            .await;
+        let session = state
+            .create_session(CreateSessionInput {
+                project_id: project.id,
+                title: Some("Session".to_string()),
+                agent: AgentKind::OpenCode,
+                brief_reply_mode: false,
+                provider_id: None,
+                reasoning_effort: None,
+            })
+            .await
+            .expect("session should be created");
+
+        state
+            .set_provider_session_ref(&session.id, Some("opencode-session-1".to_string()))
+            .await;
+
+        let listed = state.list_sessions().await;
+        let listed_session = listed
+            .into_iter()
+            .find(|item| item.id == session.id)
+            .expect("session should appear in list");
+        assert_eq!(
+            listed_session.runtime_session_ref.as_deref(),
+            Some("opencode-session-1")
+        );
+
+        let detail = state
+            .get_session(&session.id)
+            .await
+            .expect("session detail should exist");
+        assert_eq!(
+            detail.session.runtime_session_ref.as_deref(),
+            Some("opencode-session-1")
+        );
     }
 
     #[tokio::test]
@@ -2918,6 +3362,7 @@ mod tests {
                 unread_count: 0,
                 last_message_preview: None,
                 pending_approval: None,
+                runtime_session_ref: None,
                 provider_id: None,
                 reasoning_effort: None,
             })
@@ -3061,6 +3506,7 @@ mod tests {
             unread_count: 0,
             last_message_preview: None,
             pending_approval: None,
+            runtime_session_ref: None,
             provider_id: Some(AUTO_PROVIDER_ID.to_string()),
             reasoning_effort: None,
         };
@@ -3118,6 +3564,7 @@ mod tests {
             unread_count: 0,
             last_message_preview: None,
             pending_approval: None,
+            runtime_session_ref: None,
             provider_id: Some(AUTO_PROVIDER_ID.to_string()),
             reasoning_effort: None,
         };

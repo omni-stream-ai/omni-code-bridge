@@ -32,12 +32,12 @@ use crate::{
         AgentCommandsSummary, AgentInstallInput, AgentKind, AgentReadiness, AgentSummary, ApiError,
         ApiResponse, AppUpdateManifest, ApprovalDecisionInput, AudioSpeechStreamResponse,
         CancelSessionReplyResult, ClientAuthRequestInput, CreateProjectInput, CreateSessionInput,
-        FileCompletionItem, FileCompletionQuery, OpenAiAudioSpeechRequest, OpenAiErrorDetail,
-        OpenAiErrorResponse, OpenAiModel, OpenAiModelList, OpenAiTranscriptionResponse,
-        OpenAiVerboseTranscriptionResponse, OpenAiVerboseTranscriptionSegment,
-        RegisterPushDeviceInput, ReplySummary, SendMessageInput, SessionEvent,
-        SpeakerFilterSettingsInput, SpeechModelDownloadInput, SpeechModelKind, SpeechProfile,
-        SpeechProfileSelectionInput, SpeechVoiceSelectionInput, SummarizeReplyInput,
+        FileCompletionItem, FileCompletionQuery, MessageListPage, MessageListQuery,
+        OpenAiAudioSpeechRequest, OpenAiErrorDetail, OpenAiErrorResponse, OpenAiModel,
+        OpenAiModelList, OpenAiTranscriptionResponse, OpenAiVerboseTranscriptionResponse,
+        OpenAiVerboseTranscriptionSegment, RegisterPushDeviceInput, ReplySummary, SendMessageInput,
+        SessionEvent, SpeakerFilterSettingsInput, SpeechModelDownloadInput, SpeechModelKind,
+        SpeechProfile, SpeechProfileSelectionInput, SpeechVoiceSelectionInput, SummarizeReplyInput,
         TriggerClientMessageInput, UpdateSessionInput, UploadedFileResponse,
     },
     realtime, speaker,
@@ -1607,14 +1607,174 @@ async fn trigger_client_message(
 async fn list_messages(
     Path(id): Path<String>,
     headers: HeaderMap,
+    Query(query): Query<MessageListQuery>,
     State(state): State<Arc<AppState>>,
-) -> Result<Json<ApiResponse<Vec<crate::models::ChatMessage>>>, ApiError> {
+) -> Result<Json<ApiResponse<MessageListPage>>, ApiError> {
     authorize_request_status(&headers, &state).await?;
     let messages = state.list_messages(&id).await.ok_or(ApiError {
         status: StatusCode::NOT_FOUND,
         message: "session not found".to_string(),
     })?;
-    Ok(Json(ApiResponse { data: messages }))
+    let page = paginate_messages(messages, query)?;
+    Ok(Json(ApiResponse { data: page }))
+}
+
+fn paginate_messages(
+    messages: Vec<crate::models::ChatMessage>,
+    query: MessageListQuery,
+) -> Result<MessageListPage, ApiError> {
+    if query.before_id.is_some() && query.after_id.is_some() {
+        return Err(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            message: "before_id and after_id cannot be used together".to_string(),
+        });
+    }
+
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let count_mode = query
+        .count_mode
+        .unwrap_or(crate::models::MessageCountMode::All);
+    let mut start = 0usize;
+    let mut end = messages.len();
+
+    let has_cursor = query.before_id.is_some() || query.after_id.is_some();
+    let uses_after_cursor = query.after_id.is_some();
+
+    if let Some(before_id) = query.before_id {
+        end = messages
+            .iter()
+            .position(|message| message.id == before_id)
+            .ok_or(ApiError {
+                status: StatusCode::BAD_REQUEST,
+                message: format!("unknown before_id: {before_id}"),
+            })?;
+    }
+
+    if let Some(after_id) = query.after_id {
+        start = messages
+            .iter()
+            .position(|message| message.id == after_id)
+            .map(|index| index + 1)
+            .ok_or(ApiError {
+                status: StatusCode::BAD_REQUEST,
+                message: format!("unknown after_id: {after_id}"),
+            })?;
+    }
+
+    if start > end {
+        return Err(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            message: "after_id must refer to a message before before_id".to_string(),
+        });
+    }
+
+    let window_len = end.saturating_sub(start);
+    let (skip, take_len, has_more) = if matches!(count_mode, crate::models::MessageCountMode::All) {
+        let (skip, has_more) = if !has_cursor {
+            let skip = start + window_len.saturating_sub(limit);
+            (skip, skip > start)
+        } else {
+            (start, window_len > limit)
+        };
+        (skip, limit, has_more)
+    } else if !has_cursor {
+        let (skip, take_end) =
+            trailing_chat_window_bounds(&messages, start, end, limit, count_mode);
+        (skip, take_end.saturating_sub(skip), skip > start)
+    } else {
+        let take_end = forward_chat_window_end(&messages, start, end, limit, count_mode);
+        (start, take_end.saturating_sub(start), take_end < end)
+    };
+
+    let page_messages = messages
+        .into_iter()
+        .skip(skip)
+        .take(take_len)
+        .collect::<Vec<_>>();
+    let next_cursor = if has_more && uses_after_cursor {
+        page_messages.last().map(|message| message.id.clone())
+    } else if has_more {
+        page_messages.first().map(|message| message.id.clone())
+    } else {
+        None
+    };
+
+    Ok(MessageListPage {
+        messages: page_messages,
+        has_more,
+        next_cursor,
+    })
+}
+
+fn message_counts_toward_limit(
+    message: &crate::models::ChatMessage,
+    count_mode: crate::models::MessageCountMode,
+) -> bool {
+    match count_mode {
+        crate::models::MessageCountMode::All => true,
+        crate::models::MessageCountMode::Chat => matches!(
+            message.role,
+            crate::models::MessageRole::User | crate::models::MessageRole::Assistant
+        ),
+    }
+}
+
+fn trailing_chat_window_bounds(
+    messages: &[crate::models::ChatMessage],
+    start: usize,
+    end: usize,
+    limit: usize,
+    count_mode: crate::models::MessageCountMode,
+) -> (usize, usize) {
+    let mut counted = 0usize;
+    let mut latest_counted_index = None;
+    for index in (start..end).rev() {
+        if message_counts_toward_limit(&messages[index], count_mode) {
+            counted += 1;
+            latest_counted_index.get_or_insert(index);
+            if counted == limit {
+                let mut window_start = index;
+                while window_start > start
+                    && !message_counts_toward_limit(&messages[window_start - 1], count_mode)
+                {
+                    window_start -= 1;
+                }
+                let mut window_end = latest_counted_index.unwrap_or(index) + 1;
+                while window_end < end
+                    && !message_counts_toward_limit(&messages[window_end], count_mode)
+                {
+                    window_end += 1;
+                }
+                return (window_start, window_end);
+            }
+        }
+    }
+    (start, end)
+}
+
+fn forward_chat_window_end(
+    messages: &[crate::models::ChatMessage],
+    start: usize,
+    end: usize,
+    limit: usize,
+    count_mode: crate::models::MessageCountMode,
+) -> usize {
+    let mut counted = 0usize;
+    for index in start..end {
+        if message_counts_toward_limit(&messages[index], count_mode) {
+            counted += 1;
+            if counted == limit {
+                let mut window_end = index + 1;
+                while window_end < end
+                    && !message_counts_toward_limit(&messages[window_end], count_mode)
+                {
+                    window_end += 1;
+                }
+                return window_end;
+            }
+        }
+    }
+    end
 }
 
 async fn send_message(
@@ -2719,7 +2879,7 @@ mod tests {
         completion_search_scope, content_type_for_path, content_type_for_upload_name,
         encode_session_event, get_acp_agent_diagnostic, list_completion_items,
         normalize_completion_prefix, normalize_transcription_language,
-        normalize_transcription_response_format, resolve_path_within_root,
+        normalize_transcription_response_format, paginate_messages, resolve_path_within_root,
         sanitize_upload_file_name, sanitize_upload_lookup_id, transcription_response, uploads_dir,
         validate_speech_options, validate_transcription_options,
     };
@@ -2727,8 +2887,9 @@ mod tests {
         app_state::AppState,
         bridge_settings::{AiApprovalSettings, BridgeSettingsInput},
         models::{
-            AcpProfile, AcpServerConfig, AgentKind, AgentReadiness, ClientAuthRequestInput,
-            FileCompletionQuery, HeaderKeyValue, SessionEvent,
+            AcpProfile, AcpServerConfig, AgentKind, AgentReadiness, ChatMessage,
+            ClientAuthRequestInput, FileCompletionQuery, HeaderKeyValue, MessageListQuery,
+            MessageRole, SessionEvent,
         },
     };
     use axum::{
@@ -3083,6 +3244,7 @@ for line in sys.stdin:
             unread_count: 0,
             last_message_preview: Some("hello".to_string()),
             pending_approval: None,
+            runtime_session_ref: Some("thread-1".to_string()),
             provider_id: None,
             reasoning_effort: None,
         });
@@ -3115,6 +3277,213 @@ for line in sys.stdin:
 
         let opencode = agent_commands_summary(AgentKind::OpenCode);
         assert!(opencode.commands.is_empty());
+    }
+
+    fn test_message(id: &str, role: MessageRole, content: &str) -> ChatMessage {
+        ChatMessage {
+            id: id.to_string(),
+            session_id: "session".to_string(),
+            role,
+            content: content.to_string(),
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn list_messages_supports_limit_and_cursors() {
+        let messages = vec![
+            test_message("first", MessageRole::User, "first"),
+            test_message("second", MessageRole::Assistant, "second"),
+            test_message("third", MessageRole::User, "third"),
+        ];
+
+        let page = paginate_messages(
+            messages.clone(),
+            MessageListQuery {
+                limit: Some(2),
+                count_mode: None,
+                before_id: None,
+                after_id: None,
+            },
+        )
+        .expect("request should succeed");
+        assert_eq!(
+            page.messages
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["second", "third"]
+        );
+        assert!(page.has_more);
+        assert_eq!(page.next_cursor.as_deref(), Some("second"));
+
+        let page = paginate_messages(
+            messages.clone(),
+            MessageListQuery {
+                limit: Some(2),
+                count_mode: None,
+                before_id: Some("third".to_string()),
+                after_id: None,
+            },
+        )
+        .expect("before_id request should succeed");
+        assert_eq!(
+            page.messages
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+        assert!(!page.has_more);
+        assert_eq!(page.next_cursor, None);
+
+        let page = paginate_messages(
+            messages,
+            MessageListQuery {
+                limit: Some(1),
+                count_mode: None,
+                before_id: None,
+                after_id: Some("first".to_string()),
+            },
+        )
+        .expect("after_id request should succeed");
+        assert_eq!(
+            page.messages
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["second"]
+        );
+        assert!(page.has_more);
+        assert_eq!(page.next_cursor.as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn list_messages_default_page_includes_active_reply() {
+        let messages = vec![
+            test_message("old-user", MessageRole::User, "old"),
+            test_message("new-user", MessageRole::User, "new"),
+            test_message("active-reply", MessageRole::Assistant, "partial reply"),
+        ];
+
+        let page = paginate_messages(
+            messages,
+            MessageListQuery {
+                limit: Some(2),
+                count_mode: None,
+                before_id: None,
+                after_id: None,
+            },
+        )
+        .expect("request should succeed");
+
+        assert_eq!(
+            page.messages
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["new-user", "active-reply"]
+        );
+        assert!(page.has_more);
+        assert_eq!(page.next_cursor.as_deref(), Some("new-user"));
+        assert_eq!(page.messages[1].content, "partial reply");
+    }
+
+    #[test]
+    fn list_messages_rejects_invalid_cursor_combinations() {
+        let messages = vec![test_message("only", MessageRole::User, "only")];
+
+        let error = paginate_messages(
+            messages.clone(),
+            MessageListQuery {
+                limit: Some(10),
+                count_mode: None,
+                before_id: Some("a".to_string()),
+                after_id: Some("b".to_string()),
+            },
+        )
+        .expect_err("conflicting cursors should fail");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("cannot be used together"));
+
+        let error = paginate_messages(
+            messages,
+            MessageListQuery {
+                limit: Some(10),
+                count_mode: None,
+                before_id: Some("missing".to_string()),
+                after_id: None,
+            },
+        )
+        .expect_err("unknown before_id should fail");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("unknown before_id"));
+    }
+
+    #[test]
+    fn list_messages_chat_count_mode_ignores_system_messages_for_limit() {
+        let messages = vec![
+            test_message("user-1", MessageRole::User, "u1"),
+            test_message("assistant-1", MessageRole::Assistant, "a1"),
+            test_message("system-1", MessageRole::System, "s1"),
+            test_message("system-2", MessageRole::System, "s2"),
+            test_message("user-2", MessageRole::User, "u2"),
+            test_message("assistant-2", MessageRole::Assistant, "a2"),
+        ];
+
+        let page = paginate_messages(
+            messages,
+            MessageListQuery {
+                limit: Some(2),
+                count_mode: Some(crate::models::MessageCountMode::Chat),
+                before_id: None,
+                after_id: None,
+            },
+        )
+        .expect("chat count mode should succeed");
+
+        assert_eq!(
+            page.messages
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["system-1", "system-2", "user-2", "assistant-2"]
+        );
+        assert!(page.has_more);
+        assert_eq!(page.next_cursor.as_deref(), Some("system-1"));
+    }
+
+    #[test]
+    fn list_messages_chat_count_mode_keeps_trailing_system_messages_in_window() {
+        let messages = vec![
+            test_message("user-1", MessageRole::User, "u1"),
+            test_message("assistant-1", MessageRole::Assistant, "a1"),
+            test_message("user-2", MessageRole::User, "u2"),
+            test_message("assistant-2", MessageRole::Assistant, "a2"),
+            test_message("system-1", MessageRole::System, "s1"),
+            test_message("system-2", MessageRole::System, "s2"),
+        ];
+
+        let page = paginate_messages(
+            messages,
+            MessageListQuery {
+                limit: Some(2),
+                count_mode: Some(crate::models::MessageCountMode::Chat),
+                before_id: None,
+                after_id: None,
+            },
+        )
+        .expect("chat count mode should keep trailing system messages");
+
+        assert_eq!(
+            page.messages
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["user-2", "assistant-2", "system-1", "system-2"]
+        );
+        assert!(page.has_more);
+        assert_eq!(page.next_cursor.as_deref(), Some("user-2"));
     }
 
     #[tokio::test]

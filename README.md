@@ -63,6 +63,7 @@ Agent binary paths can be overridden with `ECHO_MATE_CODEX_BIN` and `ECHO_MATE_O
 | `POST /client/messages` | Push a message into a project/session flow |
 | `POST /devices/register` | Register a client device for push notifications |
 | `GET /files?path=...` | Return a file from a registered local project root |
+| `GET /sessions/{id}/messages` | List session messages; supports `limit`, `before_id`, `after_id` |
 | `GET /app-update/manifest` | APK update manifest |
 | `GET /app-update/apk` | Download latest APK |
 | `GET /speech`, `GET /speech/models` | Local speech model management |
@@ -74,6 +75,15 @@ Agent binary paths can be overridden with `ECHO_MATE_CODEX_BIN` and `ECHO_MATE_O
 | `GET /v1/models` | OpenAI-compatible model list |
 | `POST /v1/audio/transcriptions` | OpenAI-compatible ASR |
 | `POST /v1/audio/speech` | OpenAI-compatible TTS |
+
+`GET /sessions/{id}/messages` returns messages in stored order. Without a cursor it returns the
+latest page (`limit` defaults to `50` and is clamped to `1..=200`), so an in-progress assistant
+reply remains visible on the default page. `before_id` returns messages before a message id;
+`after_id` returns messages after a message id. `before_id` and `after_id` cannot be combined.
+Optional `count_mode=chat` makes `limit` count only `user` and `assistant` messages while still
+including interleaved `system` messages in the returned page. The response is
+`data: { messages, has_more, next_cursor }`; use `next_cursor` as the next
+`before_id` when paging older history, or as the next `after_id` when polling newer messages.
 
 ### Provider Selection
 

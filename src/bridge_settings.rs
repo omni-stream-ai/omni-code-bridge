@@ -452,7 +452,11 @@ mod tests {
             .await
             .err()
             .expect("invalid settings should fail to load");
-        assert!(error.to_string().contains("failed to parse bridge settings"));
+        assert!(
+            error
+                .to_string()
+                .contains("failed to parse bridge settings")
+        );
 
         let _ = tokio::fs::remove_file(path).await;
     }

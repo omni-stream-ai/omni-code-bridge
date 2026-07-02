@@ -108,6 +108,11 @@ impl ProviderRegistry {
         Self { providers }
     }
 
+    #[cfg(test)]
+    pub fn from_map(providers: HashMap<AgentKind, Arc<dyn AgentProvider>>) -> Self {
+        Self { providers }
+    }
+
     pub fn get(&self, kind: AgentKind) -> Option<Arc<dyn AgentProvider>> {
         self.providers.get(&kind).cloned()
     }
@@ -918,6 +923,7 @@ mod tests {
             unread_count: 0,
             last_message_preview: None,
             pending_approval: None,
+            runtime_session_ref: None,
             provider_id: None,
             reasoning_effort: None,
         };
@@ -6584,8 +6590,15 @@ async fn handle_kiro_client_method_request(
             state.secret_store().delete(&key).await?;
             send_json_rpc_response(writer, request_id, serde_json::json!({})).await
         }
-        _ => send_json_rpc_error(writer, request_id, -32601, &format!("Method not found: {method}"))
-            .await,
+        _ => {
+            send_json_rpc_error(
+                writer,
+                request_id,
+                -32601,
+                &format!("Method not found: {method}"),
+            )
+            .await
+        }
     }
 }
 
@@ -8284,7 +8297,7 @@ fn opencode_session_summary(value: &Value) -> Option<SessionSummary> {
         .unwrap_or("opencode session")
         .to_string();
     Some(SessionSummary {
-        id,
+        id: id.clone(),
         project_id: crate::session_store::project_id_for_path(directory),
         title: title.clone(),
         agent: AgentKind::OpenCode,
@@ -8294,6 +8307,7 @@ fn opencode_session_summary(value: &Value) -> Option<SessionSummary> {
         unread_count: 0,
         last_message_preview: Some(title),
         pending_approval: None,
+        runtime_session_ref: Some(id),
         provider_id: None,
         reasoning_effort: None,
     })
@@ -9257,21 +9271,21 @@ async fn probe_kiro_acp_handshake(server: &crate::models::AcpServerConfig) -> Ac
             &mut stdin,
             &mut next_request_id,
             "initialize",
-        serde_json::json!({
-            "protocolVersion": 1,
-            "clientCapabilities": {
-                "fs": {
-                    "readTextFile": true,
-                    "writeTextFile": true
+            serde_json::json!({
+                "protocolVersion": 1,
+                "clientCapabilities": {
+                    "fs": {
+                        "readTextFile": true,
+                        "writeTextFile": true
+                    },
+                    "terminal": true,
+                    "secretStorage": true
                 },
-                "terminal": true,
-                "secretStorage": true
-            },
-            "clientInfo": {
-                "name": "omni-code-bridge-diagnostic",
-                "version": env!("CARGO_PKG_VERSION")
-            }
-        }),
+                "clientInfo": {
+                    "name": "omni-code-bridge-diagnostic",
+                    "version": env!("CARGO_PKG_VERSION")
+                }
+            }),
         )
         .await?;
         wait_for_kiro_json_rpc_response(
@@ -9382,7 +9396,9 @@ async fn probe_kiro_acp_handshake(server: &crate::models::AcpServerConfig) -> Ac
                 if kiro_acp_turn_end(params) {
                     continue;
                 }
-            } else if value.get("method").and_then(Value::as_str) == Some("session/request_permission") {
+            } else if value.get("method").and_then(Value::as_str)
+                == Some("session/request_permission")
+            {
                 let request_id = value
                     .get("id")
                     .and_then(jsonrpc_id_to_string)

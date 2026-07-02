@@ -165,6 +165,50 @@ pub fn load_session_messages(path: &Path) -> Option<SessionMessages> {
                     pending.blocks.push(text);
                 }
             }
+            "response_item"
+                if payload.get("type").and_then(Value::as_str) == Some("function_call") =>
+            {
+                flush_pending_assistant(
+                    &mut messages,
+                    &session_id.clone().unwrap_or_default(),
+                    &mut pending_assistant,
+                );
+                if let Some(content) = render_codex_function_call(payload) {
+                    messages.push(ChatMessage {
+                        id: format!(
+                            "{}-system-{}",
+                            session_id.as_deref().unwrap_or("unknown"),
+                            messages.len()
+                        ),
+                        session_id: session_id.clone().unwrap_or_default(),
+                        role: MessageRole::System,
+                        content,
+                        created_at: timestamp,
+                    });
+                }
+            }
+            "response_item"
+                if payload.get("type").and_then(Value::as_str) == Some("function_call_output") =>
+            {
+                flush_pending_assistant(
+                    &mut messages,
+                    &session_id.clone().unwrap_or_default(),
+                    &mut pending_assistant,
+                );
+                if let Some(content) = render_codex_function_call_output(payload) {
+                    messages.push(ChatMessage {
+                        id: format!(
+                            "{}-system-{}",
+                            session_id.as_deref().unwrap_or("unknown"),
+                            messages.len()
+                        ),
+                        session_id: session_id.clone().unwrap_or_default(),
+                        role: MessageRole::System,
+                        content,
+                        created_at: timestamp,
+                    });
+                }
+            }
             _ => {}
         }
     }
@@ -457,7 +501,7 @@ fn parse_session_summary_file(path: &Path) -> Option<ParsedSessionSummaryRecord>
             git_status: None,
         },
         session: SessionSummary {
-            id: session_id,
+            id: session_id.clone(),
             project_id,
             title: session_title,
             agent: AgentKind::Codex,
@@ -467,6 +511,7 @@ fn parse_session_summary_file(path: &Path) -> Option<ParsedSessionSummaryRecord>
             unread_count: 0,
             last_message_preview: last_preview,
             pending_approval: None,
+            runtime_session_ref: Some(session_id),
             provider_id: None,
             reasoning_effort: None,
         },
@@ -581,6 +626,56 @@ fn extract_assistant_text(payload: &Value) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
+fn render_codex_function_call(payload: &Value) -> Option<String> {
+    let name = payload
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("tool");
+    let call_id = payload
+        .get("call_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let arguments = payload
+        .get("arguments")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    let mut content = format!("[tool:{name}]");
+    if let Some(call_id) = call_id {
+        content.push_str(&format!(" call_id={call_id}"));
+    }
+    if let Some(arguments) = arguments {
+        content.push('\n');
+        content.push_str(arguments);
+    }
+    Some(content)
+}
+
+fn render_codex_function_call_output(payload: &Value) -> Option<String> {
+    let output = payload
+        .get("output")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let call_id = payload
+        .get("call_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    let mut content = "[tool:output]".to_string();
+    if let Some(call_id) = call_id {
+        content.push_str(&format!(" call_id={call_id}"));
+    }
+    content.push('\n');
+    content.push_str(output);
+    Some(content)
+}
+
 fn sessions_root() -> PathBuf {
     std::env::var("ECHO_MATE_CODEX_SESSIONS_DIR")
         .map(PathBuf::from)
@@ -652,6 +747,36 @@ mod tests {
         assert_eq!(messages[0].content, "hello codex");
         assert_eq!(messages[1].role, MessageRole::Assistant);
         assert_eq!(messages[1].content, "hello user");
+    }
+
+    #[test]
+    fn load_session_messages_parses_codex_tool_items_as_system_messages() {
+        let file = temp_jsonl_file(
+            "codex-session-tools",
+            &[
+                r#"{"timestamp":"2026-05-01T00:00:00Z","type":"session_meta","payload":{"id":"codex-tools","cwd":"/tmp/project"}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"run pwd"}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:02Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"pwd\"}","call_id":"call-1"}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":"Chunk ID: abc\nOutput:\n/tmp/project"}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:04Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:05Z","type":"event_msg","payload":{"type":"task_complete"}}"#,
+            ],
+        );
+
+        let messages = load_session_messages(&file)
+            .expect("codex archive should parse")
+            .messages;
+
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].role, MessageRole::User);
+        assert_eq!(messages[1].role, MessageRole::System);
+        assert!(messages[1].content.starts_with("[tool:exec_command]"));
+        assert!(messages[1].content.contains(r#"{"cmd":"pwd"}"#));
+        assert_eq!(messages[2].role, MessageRole::System);
+        assert!(messages[2].content.starts_with("[tool:output]"));
+        assert!(messages[2].content.contains("/tmp/project"));
+        assert_eq!(messages[3].role, MessageRole::Assistant);
+        assert_eq!(messages[3].content, "done");
     }
 
     #[test]

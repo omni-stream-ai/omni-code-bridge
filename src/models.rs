@@ -203,6 +203,9 @@ pub struct SessionSummary {
     pub last_message_preview: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_approval: Option<ApprovalRequest>,
+    /// Runtime/provider-native session or thread id used to resume the upstream agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_session_ref: Option<String>,
     /// Default provider for this session (references provider config id)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
@@ -255,6 +258,33 @@ pub struct ChatMessage {
     pub role: MessageRole,
     pub content: String,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageListQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count_mode: Option<MessageCountMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageCountMode {
+    All,
+    Chat,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageListPage {
+    pub messages: Vec<ChatMessage>,
+    pub has_more: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
