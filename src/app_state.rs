@@ -636,7 +636,10 @@ impl AppState {
             .await
             .unwrap_or_else(|| session_id.to_string());
         let cached = self.messages.read().await.get(session_id).cloned();
-        let provider_messages = provider.list_messages(&provider_session_id).await;
+        let provider_messages = provider
+            .list_messages(&provider_session_id)
+            .await
+            .map(|messages| Self::normalize_messages_for_session(messages, session_id));
 
         match (cached, provider_messages) {
             (Some(local), Some(remote)) => {
@@ -648,7 +651,13 @@ impl AppState {
                 Some(merged)
             }
             (Some(local), None) => Some(local),
-            (None, Some(remote)) => Some(remote),
+            (None, Some(remote)) => {
+                self.messages
+                    .write()
+                    .await
+                    .insert(session_id.to_string(), remote.clone());
+                Some(remote)
+            }
             (None, None) => None,
         }
     }
@@ -1317,27 +1326,28 @@ impl AppState {
     }
 
     pub async fn cancel_turn(&self, session_id: &str) -> Result<bool, String> {
+        let canonical_session_id = self.resolve_session_id(session_id).await;
         let session_snapshot = self
-            .find_session(session_id)
+            .find_session(&canonical_session_id)
             .await
             .ok_or_else(|| format!("unknown session: {session_id}"))?;
+        let runtime_session_ref = self.provider_session_ref(&canonical_session_id).await;
         let stale_running_without_runtime = matches!(
             session_snapshot.status,
             SessionStatus::Running | SessionStatus::AwaitingApproval
         );
-        let (abort_handle, cancel_tx, should_interrupt) = {
+        let (abort_handle, cancel_tx, should_interrupt, should_try_provider_cancel) = {
             let mut runtime = self.runtime.lock().await;
-            let runtime_existed = runtime.contains_key(session_id);
             let entry = runtime
-                .entry(session_id.to_string())
+                .entry(canonical_session_id.clone())
                 .or_insert_with(SessionRuntimeState::default);
             let abort_handle = entry.turn_abort.take();
             let cancel_tx = entry.cancel_tx.take();
             let had_active_turn = entry.turn_in_flight || abort_handle.is_some();
             let had_detached_running = Self::is_detached_running(entry);
-            let should_interrupt = had_active_turn
-                || had_detached_running
-                || (!runtime_existed && stale_running_without_runtime);
+            let should_interrupt =
+                had_active_turn || had_detached_running || stale_running_without_runtime;
+            let should_try_provider_cancel = runtime_session_ref.is_some() && !had_active_turn;
             entry.turn_in_flight = false;
             entry.approval_tx = None;
             entry.pending_approval = None;
@@ -1355,7 +1365,12 @@ impl AppState {
                     self.runtime_store_path.display()
                 );
             }
-            (abort_handle, cancel_tx, should_interrupt)
+            (
+                abort_handle,
+                cancel_tx,
+                should_interrupt,
+                should_try_provider_cancel,
+            )
         };
 
         if let Some(cancel_tx) = cancel_tx {
@@ -1367,22 +1382,34 @@ impl AppState {
             abort_handle.abort();
         }
 
-        if should_interrupt {
+        let provider_cancelled = if should_try_provider_cancel {
+            match self.provider_for_agent(session_snapshot.agent) {
+                Some(provider) => provider
+                    .cancel_session(&canonical_session_id, runtime_session_ref.as_deref())
+                    .await
+                    .map_err(|error| error.to_string())?,
+                None => false,
+            }
+        } else {
+            false
+        };
+
+        if should_interrupt || provider_cancelled {
             let preview = self
-                .latest_assistant_preview(session_id)
+                .latest_assistant_preview(&canonical_session_id)
                 .await
                 .or(Some("本次运行已中断，可继续发送消息恢复。".to_string()));
-            self.patch_session(session_id, SessionStatus::Interrupted, preview)
+            self.patch_session(&canonical_session_id, SessionStatus::Interrupted, preview)
                 .await;
             let _ = self
                 .event_tx
                 .send(SessionEvent::SessionStatus(SessionStatusEvent {
-                    session_id: session_id.to_string(),
+                    session_id: canonical_session_id.clone(),
                     status: SessionStatus::Interrupted,
                     error_message: None,
                 }));
         }
-        Ok(should_interrupt)
+        Ok(should_interrupt || provider_cancelled)
     }
 
     pub async fn submit_approval(
@@ -1674,6 +1701,26 @@ impl AppState {
         provider.default_runtime_ref(session_id).await
     }
 
+    async fn resolve_session_id(&self, session_id: &str) -> String {
+        if self.sessions.read().await.contains_key(session_id) {
+            return session_id.to_string();
+        }
+
+        let runtime = self.runtime.lock().await;
+        if let Some(local_session_id) = runtime.iter().find_map(|(candidate_id, state)| {
+            (state.provider_session_ref.as_deref() == Some(session_id))
+                .then(|| candidate_id.clone())
+        }) {
+            drop(runtime);
+            if self.sessions.read().await.contains_key(&local_session_id) {
+                return local_session_id;
+            }
+            return session_id.to_string();
+        }
+
+        session_id.to_string()
+    }
+
     async fn update_runtime_state<F>(&self, session_id: &str, update: F)
     where
         F: FnOnce(&mut SessionRuntimeState),
@@ -1880,13 +1927,24 @@ impl AppState {
     /// pre-seed it from the provider's archive so that later `list_messages`
     /// calls don't shadow the historical conversation.
     async fn ensure_inbox_seeded(&self, session_id: &str, agent: AgentKind) {
-        if self.messages.read().await.contains_key(session_id) {
+        if self
+            .messages
+            .read()
+            .await
+            .get(session_id)
+            .is_some_and(|messages| !messages.is_empty())
+        {
             return;
         }
         let Some(provider) = self.provider_for_agent(agent) else {
             return;
         };
-        if let Some(existing) = provider.list_messages(session_id).await {
+        let provider_session_id = self
+            .provider_session_ref(session_id)
+            .await
+            .unwrap_or_else(|| session_id.to_string());
+        if let Some(existing) = provider.list_messages(&provider_session_id).await {
+            let existing = Self::normalize_messages_for_session(existing, session_id);
             self.messages
                 .write()
                 .await
@@ -1923,6 +1981,19 @@ impl AppState {
                 .then_with(|| a.id.cmp(&b.id))
         });
         merged
+    }
+
+    fn normalize_messages_for_session(
+        messages: Vec<ChatMessage>,
+        session_id: &str,
+    ) -> Vec<ChatMessage> {
+        messages
+            .into_iter()
+            .map(|mut message| {
+                message.session_id = session_id.to_string();
+                message
+            })
+            .collect()
     }
 
     async fn latest_assistant_preview(&self, session_id: &str) -> Option<String> {
@@ -2628,14 +2699,25 @@ mod tests {
     use tokio::sync::Mutex as TokioMutex;
 
     struct TestMessageProvider {
+        sessions: TokioMutex<HashMap<String, SessionSummary>>,
         messages: TokioMutex<HashMap<String, Vec<ChatMessage>>>,
+        cancelled: TokioMutex<Vec<(String, Option<String>)>>,
     }
 
     impl TestMessageProvider {
         fn new(messages: HashMap<String, Vec<ChatMessage>>) -> Self {
             Self {
+                sessions: TokioMutex::new(HashMap::new()),
                 messages: TokioMutex::new(messages),
+                cancelled: TokioMutex::new(Vec::new()),
             }
+        }
+
+        async fn set_session(&self, session: SessionSummary) {
+            self.sessions
+                .lock()
+                .await
+                .insert(session.id.clone(), session);
         }
 
         async fn set_messages(&self, session_id: impl Into<String>, messages: Vec<ChatMessage>) {
@@ -2644,12 +2726,32 @@ mod tests {
                 .await
                 .insert(session_id.into(), messages);
         }
+
+        async fn cancelled_sessions(&self) -> Vec<(String, Option<String>)> {
+            self.cancelled.lock().await.clone()
+        }
     }
 
     #[async_trait]
     impl AgentProvider for TestMessageProvider {
+        async fn list_sessions(&self) -> HashMap<String, SessionSummary> {
+            self.sessions.lock().await.clone()
+        }
+
         async fn list_messages(&self, session_id: &str) -> Option<Vec<ChatMessage>> {
             self.messages.lock().await.get(session_id).cloned()
+        }
+
+        async fn cancel_session(
+            &self,
+            session_id: &str,
+            runtime_session_ref: Option<&str>,
+        ) -> Result<bool> {
+            self.cancelled.lock().await.push((
+                session_id.to_string(),
+                runtime_session_ref.map(str::to_string),
+            ));
+            Ok(true)
         }
 
         async fn run_session(
@@ -2873,10 +2975,217 @@ mod tests {
             .list_messages(&session.id)
             .await
             .expect("messages should exist");
+        let cached = state
+            .messages
+            .read()
+            .await
+            .get(&session.id)
+            .cloned()
+            .expect("messages should be cached");
 
         assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].session_id, "codex-thread-1");
+        assert!(
+            messages
+                .iter()
+                .all(|message| message.session_id == session.id)
+        );
         assert_eq!(messages[1].content, "latest remote reply");
+        assert_eq!(cached.len(), messages.len());
+        assert!(
+            cached
+                .iter()
+                .all(|message| message.session_id == session.id)
+        );
+        assert_eq!(cached[1].content, "latest remote reply");
+    }
+
+    #[tokio::test]
+    async fn list_messages_keeps_distinct_remote_and_local_messages_without_identity_mapping() {
+        let now = Utc::now();
+        let provider = Arc::new(TestMessageProvider::new(HashMap::new()));
+        let registry = ProviderRegistry::from_map(HashMap::from([(
+            AgentKind::Codex,
+            provider.clone() as Arc<dyn AgentProvider>,
+        )]));
+        let state = test_state_with_providers("merge-equivalent-messages", registry).await;
+        let project = state
+            .create_project(CreateProjectInput {
+                name: "Project".to_string(),
+                root_path: std::env::temp_dir().to_string_lossy().to_string(),
+            })
+            .await;
+        let session = state
+            .create_session(CreateSessionInput {
+                project_id: project.id,
+                title: Some("Session".to_string()),
+                agent: AgentKind::Codex,
+                brief_reply_mode: false,
+                provider_id: None,
+                reasoning_effort: None,
+            })
+            .await
+            .expect("session should be created");
+
+        state
+            .set_provider_session_ref(&session.id, Some("codex-thread-1".to_string()))
+            .await;
+
+        provider
+            .set_messages(
+                "codex-thread-1",
+                vec![
+                    test_message(
+                        "remote-user",
+                        "codex-thread-1",
+                        MessageRole::User,
+                        "Repeat me once",
+                        now,
+                    ),
+                    test_message(
+                        "remote-assistant",
+                        "codex-thread-1",
+                        MessageRole::Assistant,
+                        "Only one assistant bubble",
+                        now + chrono::TimeDelta::seconds(1),
+                    ),
+                ],
+            )
+            .await;
+
+        state.messages.write().await.insert(
+            session.id.clone(),
+            vec![
+                test_message(
+                    "local-user",
+                    &session.id,
+                    MessageRole::User,
+                    "Repeat me once",
+                    now + chrono::TimeDelta::seconds(2),
+                ),
+                test_message(
+                    "local-assistant",
+                    &session.id,
+                    MessageRole::Assistant,
+                    "Only one assistant bubble",
+                    now + chrono::TimeDelta::seconds(3),
+                ),
+            ],
+        );
+
+        let messages = state
+            .list_messages(&session.id)
+            .await
+            .expect("messages should exist");
+
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].id, "remote-user");
+        assert_eq!(messages[1].id, "remote-assistant");
+        assert_eq!(messages[2].id, "local-user");
+        assert_eq!(messages[3].id, "local-assistant");
+        assert!(
+            messages
+                .iter()
+                .all(|message| message.session_id == session.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn send_message_ignores_client_message_id_for_server_message_identity() {
+        let state = Arc::new(test_state("client-message-id").await);
+        let project = state
+            .create_project(CreateProjectInput {
+                name: "Project".to_string(),
+                root_path: std::env::temp_dir().to_string_lossy().to_string(),
+            })
+            .await;
+        let session = state
+            .create_session(CreateSessionInput {
+                project_id: project.id,
+                title: Some("Session".to_string()),
+                agent: AgentKind::Custom,
+                brief_reply_mode: false,
+                provider_id: None,
+                reasoning_effort: None,
+            })
+            .await
+            .expect("session should be created");
+
+        let (user_message, echoed_reply) = state
+            .send_message(
+                &session.id,
+                SendMessageInput {
+                    content: "hello".to_string(),
+                    input_mode: InputMode::Text,
+                    system_prompt: None,
+                    client_message_id: Some("local-user-123".to_string()),
+                    provider_id: None,
+                    reasoning_effort: None,
+                },
+            )
+            .await
+            .expect("message should send");
+
+        assert_ne!(user_message.id, "local-user-123");
+        assert_eq!(echoed_reply.id, user_message.id);
+    }
+
+    #[tokio::test]
+    async fn ensure_inbox_seeded_uses_provider_session_ref_and_normalizes_messages() {
+        let now = Utc::now();
+        let provider = Arc::new(TestMessageProvider::new(HashMap::new()));
+        let registry = ProviderRegistry::from_map(HashMap::from([(
+            AgentKind::Codex,
+            provider.clone() as Arc<dyn AgentProvider>,
+        )]));
+        let state = test_state_with_providers("seed-provider-session-ref", registry).await;
+        let project = state
+            .create_project(CreateProjectInput {
+                name: "Project".to_string(),
+                root_path: std::env::temp_dir().to_string_lossy().to_string(),
+            })
+            .await;
+        let session = state
+            .create_session(CreateSessionInput {
+                project_id: project.id,
+                title: Some("Session".to_string()),
+                agent: AgentKind::Codex,
+                brief_reply_mode: false,
+                provider_id: None,
+                reasoning_effort: None,
+            })
+            .await
+            .expect("session should be created");
+
+        state
+            .set_provider_session_ref(&session.id, Some("codex-thread-1".to_string()))
+            .await;
+
+        provider
+            .set_messages(
+                "codex-thread-1",
+                vec![test_message(
+                    "u1",
+                    "codex-thread-1",
+                    MessageRole::User,
+                    "hello",
+                    now,
+                )],
+            )
+            .await;
+
+        state
+            .ensure_inbox_seeded(&session.id, AgentKind::Codex)
+            .await;
+
+        let cached = state
+            .messages
+            .read()
+            .await
+            .get(&session.id)
+            .cloned()
+            .expect("messages should be seeded");
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].session_id, session.id);
     }
 
     #[test]
@@ -3457,6 +3766,130 @@ mod tests {
 
         assert!(cancelled);
         assert!(matches!(detail.session.status, SessionStatus::Interrupted));
+    }
+
+    #[tokio::test]
+    async fn cancel_turn_resolves_provider_session_ref_to_local_session() {
+        let now = Utc::now();
+        let provider = Arc::new(TestMessageProvider::new(HashMap::new()));
+        let registry = ProviderRegistry::from_map(HashMap::from([(
+            AgentKind::Codex,
+            provider.clone() as Arc<dyn AgentProvider>,
+        )]));
+        let state = test_state_with_providers("cancel-provider-ref", registry).await;
+        let project = state
+            .create_project(CreateProjectInput {
+                name: "Project".to_string(),
+                root_path: std::env::temp_dir().to_string_lossy().to_string(),
+            })
+            .await;
+        let session = state
+            .create_session(CreateSessionInput {
+                project_id: project.id,
+                title: Some("Session".to_string()),
+                agent: AgentKind::Codex,
+                brief_reply_mode: false,
+                provider_id: None,
+                reasoning_effort: None,
+            })
+            .await
+            .expect("session should be created");
+
+        state
+            .patch_session(
+                &session.id,
+                SessionStatus::Running,
+                Some("running".to_string()),
+            )
+            .await;
+        state
+            .set_provider_session_ref(&session.id, Some("codex-thread".to_string()))
+            .await;
+        provider
+            .set_session(SessionSummary {
+                id: "codex-thread".to_string(),
+                project_id: session.project_id.clone(),
+                title: "Provider thread".to_string(),
+                agent: AgentKind::Codex,
+                brief_reply_mode: false,
+                status: SessionStatus::Running,
+                updated_at: Utc::now(),
+                unread_count: 0,
+                last_message_preview: Some("provider running".to_string()),
+                pending_approval: None,
+                runtime_session_ref: None,
+                provider_id: None,
+                reasoning_effort: None,
+            })
+            .await;
+        state.messages.write().await.insert(
+            session.id.clone(),
+            vec![test_message(
+                "a1",
+                &session.id,
+                MessageRole::Assistant,
+                "latest",
+                now,
+            )],
+        );
+
+        let cancelled = state
+            .cancel_turn("codex-thread")
+            .await
+            .expect("cancel should resolve provider session ref");
+        let detail = state
+            .get_session(&session.id)
+            .await
+            .expect("session detail should exist");
+
+        assert!(cancelled);
+        assert!(matches!(detail.session.status, SessionStatus::Interrupted));
+    }
+
+    #[tokio::test]
+    async fn cancel_turn_falls_back_to_provider_cancel_when_runtime_missing() {
+        let provider = Arc::new(TestMessageProvider::new(HashMap::new()));
+        let registry = ProviderRegistry::from_map(HashMap::from([(
+            AgentKind::Codex,
+            provider.clone() as Arc<dyn AgentProvider>,
+        )]));
+        let state = test_state_with_providers("cancel-provider-fallback", registry).await;
+        let project = state
+            .create_project(CreateProjectInput {
+                name: "Project".to_string(),
+                root_path: std::env::temp_dir().to_string_lossy().to_string(),
+            })
+            .await;
+        let session = state
+            .create_session(CreateSessionInput {
+                project_id: project.id,
+                title: Some("Session".to_string()),
+                agent: AgentKind::Codex,
+                brief_reply_mode: false,
+                provider_id: None,
+                reasoning_effort: None,
+            })
+            .await
+            .expect("session should be created");
+
+        state
+            .patch_session(&session.id, SessionStatus::Idle, Some("idle".to_string()))
+            .await;
+        state
+            .set_provider_session_ref(&session.id, Some("codex-thread".to_string()))
+            .await;
+        state.finish_turn(&session.id).await;
+
+        let cancelled = state
+            .cancel_turn(&session.id)
+            .await
+            .expect("provider fallback cancel should succeed");
+
+        assert!(cancelled);
+        assert_eq!(
+            provider.cancelled_sessions().await,
+            vec![(session.id.clone(), Some("codex-thread".to_string()))]
+        );
     }
 
     #[tokio::test]

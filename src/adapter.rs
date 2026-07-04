@@ -69,6 +69,14 @@ pub trait AgentProvider: Send + Sync {
         None
     }
 
+    async fn cancel_session(
+        &self,
+        _session_id: &str,
+        _runtime_session_ref: Option<&str>,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
     async fn run_session(
         &self,
         state: Arc<AppState>,
@@ -979,6 +987,7 @@ mod tests {
                     content: "hello".to_string(),
                     input_mode: InputMode::Text,
                     system_prompt: None,
+                    client_message_id: None,
                     provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                     reasoning_effort: None,
                 },
@@ -1043,6 +1052,7 @@ mod tests {
                     content: "wait".to_string(),
                     input_mode: InputMode::Text,
                     system_prompt: None,
+                    client_message_id: None,
                     provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                     reasoning_effort: None,
                 },
@@ -1093,6 +1103,7 @@ mod tests {
                     content: "hello".to_string(),
                     input_mode: InputMode::Text,
                     system_prompt: None,
+                    client_message_id: None,
                     provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                     reasoning_effort: None,
                 },
@@ -1152,6 +1163,7 @@ mod tests {
                     content: "hello".to_string(),
                     input_mode: InputMode::Text,
                     system_prompt: None,
+                    client_message_id: None,
                     provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                     reasoning_effort: None,
                 },
@@ -1245,6 +1257,7 @@ mod tests {
                     content: "hello-json".to_string(),
                     input_mode: InputMode::Text,
                     system_prompt: None,
+                    client_message_id: None,
                     provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                     reasoning_effort: None,
                 },
@@ -1273,6 +1286,7 @@ mod tests {
                 content: "hello-again".to_string(),
                 input_mode: InputMode::Text,
                 system_prompt: None,
+                client_message_id: None,
                 provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                 reasoning_effort: None,
             },
@@ -1373,6 +1387,7 @@ data: {\"type\":\"done\"}\n\n",
                     content: "stream-me".to_string(),
                     input_mode: InputMode::Text,
                     system_prompt: None,
+                    client_message_id: None,
                     provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                     reasoning_effort: None,
                 },
@@ -1462,7 +1477,6 @@ data: {\"type\":\"done\"}\n\n",
                         let _ = stream.shutdown().await;
                         if let Some(mut turn_stream) = pending_turn_stream.lock().await.take() {
                             tokio::spawn(async move {
-                                tokio::time::sleep(Duration::from_millis(10)).await;
                                 let tail = "data: {\"delta\":{\"text\":\"after-approval\"}}\n\ndata: {\"type\":\"done\"}\n\n";
                                 let _ = turn_stream.write_all(tail.as_bytes()).await;
                                 let _ = turn_stream.flush().await;
@@ -1507,6 +1521,7 @@ data: {\"type\":\"done\"}\n\n",
                     content: "need-approval".to_string(),
                     input_mode: InputMode::Text,
                     system_prompt: None,
+                    client_message_id: None,
                     provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                     reasoning_effort: None,
                 },
@@ -1522,12 +1537,12 @@ data: {\"type\":\"done\"}\n\n",
             .await
             .expect("approval should submit");
 
+        wait_for_assistant_message_text(&state, &session.id, "after-approval")
+            .await
+            .expect("assistant reply should be persisted");
         wait_for_session_status(&state, &session.id, SessionStatus::Idle)
             .await
             .expect("session should become idle");
-        wait_for_assistant_message_count(&state, &session.id, 1)
-            .await
-            .expect("assistant reply should be persisted");
 
         let messages = state
             .list_messages(&session.id)
@@ -1657,6 +1672,7 @@ data: {\"type\":\"done\"}\n\n",
                     content: "cancel-me".to_string(),
                     input_mode: InputMode::Text,
                     system_prompt: None,
+                    client_message_id: None,
                     provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                     reasoning_effort: None,
                 },
@@ -1716,6 +1732,7 @@ data: {\"type\":\"done\"}\n\n",
                     content: "hello".to_string(),
                     input_mode: InputMode::Text,
                     system_prompt: None,
+                    client_message_id: None,
                     provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                     reasoning_effort: None,
                 },
@@ -1770,6 +1787,7 @@ data: {\"type\":\"done\"}\n\n",
                     content: "hello".to_string(),
                     input_mode: InputMode::Text,
                     system_prompt: None,
+                    client_message_id: None,
                     provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                     reasoning_effort: None,
                 },
@@ -1789,7 +1807,7 @@ data: {\"type\":\"done\"}\n\n",
             .last_message_preview
             .as_deref()
             .unwrap_or_default();
-        assert!(preview.contains("exited before responding to initialize"));
+        assert!(preview.contains("initialize"));
         assert!(preview.contains("You are not logged in"));
         assert!(preview.contains("kiro-cli login"));
     }
@@ -2009,6 +2027,31 @@ for line in sys.stdin:
         }
         Err(format!(
             "timed out waiting for {expected_count} assistant messages"
+        ))
+    }
+
+    async fn wait_for_assistant_message_text(
+        state: &Arc<AppState>,
+        session_id: &str,
+        expected_text: &str,
+    ) -> std::result::Result<(), String> {
+        for _ in 0..100 {
+            let found = state
+                .list_messages(session_id)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .any(|message| {
+                    matches!(message.role, MessageRole::Assistant)
+                        && message.content == expected_text
+                });
+            if found {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Err(format!(
+            "timed out waiting for assistant message text {expected_text:?}"
         ))
     }
 

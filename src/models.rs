@@ -265,18 +265,9 @@ pub struct MessageListQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub count_mode: Option<MessageCountMode>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub before_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MessageCountMode {
-    All,
-    Chat,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -393,6 +384,8 @@ pub struct SendMessageInput {
     pub input_mode: InputMode,
     #[serde(default)]
     pub system_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_message_id: Option<String>,
     /// Override provider for this message.
     /// Omit to avoid bridge-side provider resolution; use "AUTO" to enable auto-selection.
     #[serde(default, skip_serializing_if = "Option::is_none")]

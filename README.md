@@ -80,8 +80,8 @@ Agent binary paths can be overridden with `ECHO_MATE_CODEX_BIN` and `ECHO_MATE_O
 latest page (`limit` defaults to `50` and is clamped to `1..=200`), so an in-progress assistant
 reply remains visible on the default page. `before_id` returns messages before a message id;
 `after_id` returns messages after a message id. `before_id` and `after_id` cannot be combined.
-Optional `count_mode=chat` makes `limit` count only `user` and `assistant` messages while still
-including interleaved `system` messages in the returned page. The response is
+`limit` counts display messages: each `user` message counts as one, and each contiguous agent reply
+segment counts as one even when it contains multiple `assistant`/`system` messages. The response is
 `data: { messages, has_more, next_cursor }`; use `next_cursor` as the next
 `before_id` when paging older history, or as the next `after_id` when polling newer messages.
 

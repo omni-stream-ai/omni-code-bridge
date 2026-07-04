@@ -1631,34 +1631,31 @@ fn paginate_messages(
     }
 
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
-    let count_mode = query
-        .count_mode
-        .unwrap_or(crate::models::MessageCountMode::All);
     let mut start = 0usize;
     let mut end = messages.len();
 
-    let has_cursor = query.before_id.is_some() || query.after_id.is_some();
     let uses_after_cursor = query.after_id.is_some();
 
     if let Some(before_id) = query.before_id {
-        end = messages
+        let cursor_index = messages
             .iter()
             .position(|message| message.id == before_id)
             .ok_or(ApiError {
                 status: StatusCode::BAD_REQUEST,
                 message: format!("unknown before_id: {before_id}"),
             })?;
+        end = message_unit_start(&messages, cursor_index);
     }
 
     if let Some(after_id) = query.after_id {
-        start = messages
+        let cursor_index = messages
             .iter()
             .position(|message| message.id == after_id)
-            .map(|index| index + 1)
             .ok_or(ApiError {
                 status: StatusCode::BAD_REQUEST,
                 message: format!("unknown after_id: {after_id}"),
             })?;
+        start = message_unit_end(&messages, cursor_index, end);
     }
 
     if start > end {
@@ -1668,22 +1665,12 @@ fn paginate_messages(
         });
     }
 
-    let window_len = end.saturating_sub(start);
-    let (skip, take_len, has_more) = if matches!(count_mode, crate::models::MessageCountMode::All) {
-        let (skip, has_more) = if !has_cursor {
-            let skip = start + window_len.saturating_sub(limit);
-            (skip, skip > start)
-        } else {
-            (start, window_len > limit)
-        };
-        (skip, limit, has_more)
-    } else if !has_cursor {
-        let (skip, take_end) =
-            trailing_chat_window_bounds(&messages, start, end, limit, count_mode);
-        (skip, take_end.saturating_sub(skip), skip > start)
-    } else {
-        let take_end = forward_chat_window_end(&messages, start, end, limit, count_mode);
+    let (skip, take_len, has_more) = if uses_after_cursor {
+        let take_end = forward_message_window_end(&messages, start, end, limit);
         (start, take_end.saturating_sub(start), take_end < end)
+    } else {
+        let (skip, take_end) = trailing_message_window_bounds(&messages, start, end, limit);
+        (skip, take_end.saturating_sub(skip), skip > start)
     };
 
     let page_messages = messages
@@ -1706,75 +1693,87 @@ fn paginate_messages(
     })
 }
 
-fn message_counts_toward_limit(
-    message: &crate::models::ChatMessage,
-    count_mode: crate::models::MessageCountMode,
-) -> bool {
-    match count_mode {
-        crate::models::MessageCountMode::All => true,
-        crate::models::MessageCountMode::Chat => matches!(
-            message.role,
-            crate::models::MessageRole::User | crate::models::MessageRole::Assistant
-        ),
-    }
+fn is_user_message(message: &crate::models::ChatMessage) -> bool {
+    matches!(message.role, crate::models::MessageRole::User)
 }
 
-fn trailing_chat_window_bounds(
-    messages: &[crate::models::ChatMessage],
-    start: usize,
-    end: usize,
-    limit: usize,
-    count_mode: crate::models::MessageCountMode,
-) -> (usize, usize) {
-    let mut counted = 0usize;
-    let mut latest_counted_index = None;
-    for index in (start..end).rev() {
-        if message_counts_toward_limit(&messages[index], count_mode) {
-            counted += 1;
-            latest_counted_index.get_or_insert(index);
-            if counted == limit {
-                let mut window_start = index;
-                while window_start > start
-                    && !message_counts_toward_limit(&messages[window_start - 1], count_mode)
-                {
-                    window_start -= 1;
-                }
-                let mut window_end = latest_counted_index.unwrap_or(index) + 1;
-                while window_end < end
-                    && !message_counts_toward_limit(&messages[window_end], count_mode)
-                {
-                    window_end += 1;
-                }
-                return (window_start, window_end);
-            }
-        }
+fn message_unit_start(messages: &[crate::models::ChatMessage], index: usize) -> usize {
+    if is_user_message(&messages[index]) {
+        return index;
     }
-    (start, end)
+
+    let mut start = index;
+    while start > 0 && !is_user_message(&messages[start - 1]) {
+        start -= 1;
+    }
+    start
 }
 
-fn forward_chat_window_end(
+fn message_unit_end(
     messages: &[crate::models::ChatMessage],
-    start: usize,
-    end: usize,
-    limit: usize,
-    count_mode: crate::models::MessageCountMode,
+    index: usize,
+    max_end: usize,
 ) -> usize {
-    let mut counted = 0usize;
-    for index in start..end {
-        if message_counts_toward_limit(&messages[index], count_mode) {
-            counted += 1;
-            if counted == limit {
-                let mut window_end = index + 1;
-                while window_end < end
-                    && !message_counts_toward_limit(&messages[window_end], count_mode)
-                {
-                    window_end += 1;
-                }
-                return window_end;
-            }
-        }
+    if is_user_message(&messages[index]) {
+        return index + 1;
+    }
+
+    let mut end = index + 1;
+    while end < max_end && !is_user_message(&messages[end]) {
+        end += 1;
     }
     end
+}
+
+fn previous_message_unit_start(
+    messages: &[crate::models::ChatMessage],
+    start: usize,
+    before: usize,
+) -> usize {
+    let mut unit_start = before - 1;
+    if is_user_message(&messages[unit_start]) {
+        return unit_start;
+    }
+    while unit_start > start && !is_user_message(&messages[unit_start - 1]) {
+        unit_start -= 1;
+    }
+    unit_start
+}
+
+fn trailing_message_window_bounds(
+    messages: &[crate::models::ChatMessage],
+    start: usize,
+    end: usize,
+    limit: usize,
+) -> (usize, usize) {
+    let mut counted = 0usize;
+    let mut window_start = end;
+    while window_start > start && counted < limit {
+        window_start = previous_message_unit_start(messages, start, window_start);
+        counted += 1;
+    }
+    (window_start, end)
+}
+
+fn forward_message_window_end(
+    messages: &[crate::models::ChatMessage],
+    start: usize,
+    end: usize,
+    limit: usize,
+) -> usize {
+    let mut counted = 0usize;
+    let mut window_end = start;
+    while window_end < end && counted < limit {
+        if is_user_message(&messages[window_end]) {
+            window_end += 1;
+        } else {
+            while window_end < end && !is_user_message(&messages[window_end]) {
+                window_end += 1;
+            }
+        }
+        counted += 1;
+    }
+    window_end
 }
 
 async fn send_message(
@@ -3301,7 +3300,6 @@ for line in sys.stdin:
             messages.clone(),
             MessageListQuery {
                 limit: Some(2),
-                count_mode: None,
                 before_id: None,
                 after_id: None,
             },
@@ -3321,7 +3319,6 @@ for line in sys.stdin:
             messages.clone(),
             MessageListQuery {
                 limit: Some(2),
-                count_mode: None,
                 before_id: Some("third".to_string()),
                 after_id: None,
             },
@@ -3341,7 +3338,6 @@ for line in sys.stdin:
             messages,
             MessageListQuery {
                 limit: Some(1),
-                count_mode: None,
                 before_id: None,
                 after_id: Some("first".to_string()),
             },
@@ -3370,7 +3366,6 @@ for line in sys.stdin:
             messages,
             MessageListQuery {
                 limit: Some(2),
-                count_mode: None,
                 before_id: None,
                 after_id: None,
             },
@@ -3390,6 +3385,37 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn list_messages_before_id_returns_adjacent_previous_page() {
+        let messages = vec![
+            test_message("first", MessageRole::User, "first"),
+            test_message("second", MessageRole::Assistant, "second"),
+            test_message("third", MessageRole::User, "third"),
+            test_message("fourth", MessageRole::Assistant, "fourth"),
+            test_message("fifth", MessageRole::User, "fifth"),
+        ];
+
+        let page = paginate_messages(
+            messages,
+            MessageListQuery {
+                limit: Some(2),
+                before_id: Some("fifth".to_string()),
+                after_id: None,
+            },
+        )
+        .expect("before_id request should succeed");
+
+        assert_eq!(
+            page.messages
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["third", "fourth"]
+        );
+        assert!(page.has_more);
+        assert_eq!(page.next_cursor.as_deref(), Some("third"));
+    }
+
+    #[test]
     fn list_messages_rejects_invalid_cursor_combinations() {
         let messages = vec![test_message("only", MessageRole::User, "only")];
 
@@ -3397,7 +3423,6 @@ for line in sys.stdin:
             messages.clone(),
             MessageListQuery {
                 limit: Some(10),
-                count_mode: None,
                 before_id: Some("a".to_string()),
                 after_id: Some("b".to_string()),
             },
@@ -3410,7 +3435,6 @@ for line in sys.stdin:
             messages,
             MessageListQuery {
                 limit: Some(10),
-                count_mode: None,
                 before_id: Some("missing".to_string()),
                 after_id: None,
             },
@@ -3421,7 +3445,7 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn list_messages_chat_count_mode_ignores_system_messages_for_limit() {
+    fn list_messages_limit_counts_agent_reply_segment_as_one_message() {
         let messages = vec![
             test_message("user-1", MessageRole::User, "u1"),
             test_message("assistant-1", MessageRole::Assistant, "a1"),
@@ -3435,26 +3459,25 @@ for line in sys.stdin:
             messages,
             MessageListQuery {
                 limit: Some(2),
-                count_mode: Some(crate::models::MessageCountMode::Chat),
                 before_id: None,
                 after_id: None,
             },
         )
-        .expect("chat count mode should succeed");
+        .expect("request should succeed");
 
         assert_eq!(
             page.messages
                 .iter()
                 .map(|message| message.id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["system-1", "system-2", "user-2", "assistant-2"]
+            vec!["user-2", "assistant-2"]
         );
         assert!(page.has_more);
-        assert_eq!(page.next_cursor.as_deref(), Some("system-1"));
+        assert_eq!(page.next_cursor.as_deref(), Some("user-2"));
     }
 
     #[test]
-    fn list_messages_chat_count_mode_keeps_trailing_system_messages_in_window() {
+    fn list_messages_limit_keeps_system_messages_in_agent_reply_segment() {
         let messages = vec![
             test_message("user-1", MessageRole::User, "u1"),
             test_message("assistant-1", MessageRole::Assistant, "a1"),
@@ -3468,12 +3491,11 @@ for line in sys.stdin:
             messages,
             MessageListQuery {
                 limit: Some(2),
-                count_mode: Some(crate::models::MessageCountMode::Chat),
                 before_id: None,
                 after_id: None,
             },
         )
-        .expect("chat count mode should keep trailing system messages");
+        .expect("request should keep trailing system messages");
 
         assert_eq!(
             page.messages
@@ -3484,6 +3506,42 @@ for line in sys.stdin:
         );
         assert!(page.has_more);
         assert_eq!(page.next_cursor.as_deref(), Some("user-2"));
+    }
+
+    #[test]
+    fn list_messages_before_id_inside_agent_reply_does_not_split_segment() {
+        let messages = vec![
+            test_message("user-1", MessageRole::User, "u1"),
+            test_message("assistant-1", MessageRole::Assistant, "a1"),
+            test_message("system-1", MessageRole::System, "s1"),
+            test_message("system-2", MessageRole::System, "s2"),
+            test_message("user-2", MessageRole::User, "u2"),
+            test_message("assistant-2", MessageRole::Assistant, "a2"),
+            test_message("system-3", MessageRole::System, "s3"),
+            test_message("system-4", MessageRole::System, "s4"),
+            test_message("assistant-3", MessageRole::Assistant, "a3"),
+            test_message("system-5", MessageRole::System, "s5"),
+        ];
+
+        let page = paginate_messages(
+            messages,
+            MessageListQuery {
+                limit: Some(2),
+                before_id: Some("system-5".to_string()),
+                after_id: None,
+            },
+        )
+        .expect("before_id should not split agent reply segments");
+
+        assert_eq!(
+            page.messages
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["assistant-1", "system-1", "system-2", "user-2"]
+        );
+        assert!(page.has_more);
+        assert_eq!(page.next_cursor.as_deref(), Some("assistant-1"));
     }
 
     #[tokio::test]

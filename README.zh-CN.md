@@ -79,8 +79,8 @@ Agent 二进制路径可以通过 `ECHO_MATE_CODEX_BIN` 和 `ECHO_MATE_OPENCODE_
 `GET /sessions/{id}/messages` 按存储顺序返回消息。未传 cursor 时返回最新一页：
 `limit` 默认 `50`，并限制在 `1..=200`，因此正在生成中的 assistant 回复会保留在默认页。
 `before_id` 返回某条消息之前的消息；`after_id` 返回某条消息之后的消息。
-`before_id` 和 `after_id` 不能同时使用。可选 `count_mode=chat` 会让 `limit`
-只统计 `user` 和 `assistant` 消息，但仍返回夹在窗口里的 `system` 消息。响应为
+`before_id` 和 `after_id` 不能同时使用。`limit` 按展示消息计数：每条 `user`
+消息算一条，连续的 agent 回复段算一条，即使其中包含多条 `assistant`/`system` 消息。响应为
 `data: { messages, has_more, next_cursor }`；
 向上翻历史时把 `next_cursor` 作为下一次请求的 `before_id`，轮询新消息时把它作为
 下一次请求的 `after_id`。
