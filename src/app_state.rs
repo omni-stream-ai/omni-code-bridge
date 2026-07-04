@@ -723,6 +723,7 @@ impl AppState {
             runtime_session_ref: None,
             provider_id: input.provider_id,
             reasoning_effort: input.reasoning_effort,
+            model: None,
         };
 
         self.sessions
@@ -829,6 +830,7 @@ impl AppState {
             runtime_session_ref: None,
             provider_id: None,
             reasoning_effort: None,
+            model: None,
         };
         let message = ChatMessage {
             id: Uuid::new_v4().to_string(),
@@ -924,25 +926,31 @@ impl AppState {
                     .filter(|p| p.enabled)
                     .filter(|p| is_format_compatible(&p.format))
                     .min_by_key(|p| p.priority)
-                    .map(|p| ResolvedProviderConfig {
-                        base_url: p.base_url.clone(),
-                        api_key: p.api_key.clone(),
-                        model: p.model.clone(),
-                        format: p.format,
-                        acp_profile: None,
-                        provider_id: Some(p.id.clone()),
-                        extra_headers: Vec::new(),
-                        acp_command: None,
-                        acp_args: Vec::new(),
-                        acp_env: Vec::new(),
-                        opencode_provider_name: match p.format {
-                            ApiFormat::AnthropicMessages => {
-                                Some("omni-bridge-anthropic".to_string())
-                            }
-                            ApiFormat::Codex => Some("omni-bridge-codex".to_string()),
-                            ApiFormat::Acp => Some("omni-bridge-acp".to_string()),
-                            _ => Some("omni-bridge".to_string()),
-                        },
+                    .map(|p| {
+                        let mut config = ResolvedProviderConfig {
+                            base_url: p.base_url.clone(),
+                            api_key: p.api_key.clone(),
+                            model: p.model.clone(),
+                            format: p.format,
+                            acp_profile: None,
+                            provider_id: Some(p.id.clone()),
+                            extra_headers: Vec::new(),
+                            acp_command: None,
+                            acp_args: Vec::new(),
+                            acp_env: Vec::new(),
+                            opencode_provider_name: match p.format {
+                                ApiFormat::AnthropicMessages => {
+                                    Some("omni-bridge-anthropic".to_string())
+                                }
+                                ApiFormat::Codex => Some("omni-bridge-codex".to_string()),
+                                ApiFormat::Acp => Some("omni-bridge-acp".to_string()),
+                                _ => Some("omni-bridge".to_string()),
+                            },
+                        };
+                        if let Some(model) = &session.model {
+                            config.model = Some(model.clone());
+                        }
+                        config
                     })
             };
 
@@ -952,26 +960,32 @@ impl AppState {
                 .iter()
                 .filter(|server| server.enabled)
                 .min_by_key(|server| server.priority)
-                .map(|server| ResolvedProviderConfig {
-                    base_url: server.endpoint.clone().unwrap_or_default(),
-                    api_key: server.auth_token.clone(),
-                    model: server.default_model.clone(),
-                    format: ApiFormat::Acp,
-                    acp_profile: Some(server.profile),
-                    provider_id: Some(server.id.clone()),
-                    extra_headers: server
-                        .headers
-                        .iter()
-                        .map(|header| (header.key.clone(), header.value.clone()))
-                        .collect(),
-                    acp_command: server.command.clone(),
-                    acp_args: server.args.clone(),
-                    acp_env: server
-                        .env
-                        .iter()
-                        .map(|entry| (entry.key.clone(), entry.value.clone()))
-                        .collect(),
-                    opencode_provider_name: Some("omni-bridge-acp".to_string()),
+                .map(|server| {
+                    let mut config = ResolvedProviderConfig {
+                        base_url: server.endpoint.clone().unwrap_or_default(),
+                        api_key: server.auth_token.clone(),
+                        model: server.default_model.clone(),
+                        format: ApiFormat::Acp,
+                        acp_profile: Some(server.profile),
+                        provider_id: Some(server.id.clone()),
+                        extra_headers: server
+                            .headers
+                            .iter()
+                            .map(|header| (header.key.clone(), header.value.clone()))
+                            .collect(),
+                        acp_command: server.command.clone(),
+                        acp_args: server.args.clone(),
+                        acp_env: server
+                            .env
+                            .iter()
+                            .map(|entry| (entry.key.clone(), entry.value.clone()))
+                            .collect(),
+                        opencode_provider_name: Some("omni-bridge-acp".to_string()),
+                    };
+                    if let Some(model) = &session.model {
+                        config.model = Some(model.clone());
+                    }
+                    config
                 })
         };
 
@@ -987,35 +1001,44 @@ impl AppState {
                         .acp_servers
                         .iter()
                         .find(|server| server.id == provider_id)
-                        .map(|server| ResolvedProviderConfig {
-                            base_url: server.endpoint.clone().unwrap_or_default(),
-                            api_key: server.auth_token.clone(),
-                            model: server.default_model.clone(),
-                            format: ApiFormat::Acp,
-                            acp_profile: Some(server.profile),
-                            provider_id: Some(server.id.clone()),
-                            extra_headers: server
-                                .headers
-                                .iter()
-                                .map(|header| (header.key.clone(), header.value.clone()))
-                                .collect(),
-                            acp_command: server.command.clone(),
-                            acp_args: server.args.clone(),
-                            acp_env: server
-                                .env
-                                .iter()
-                                .map(|entry| (entry.key.clone(), entry.value.clone()))
-                                .collect(),
-                            opencode_provider_name: Some("omni-bridge-acp".to_string()),
+                        .map(|server| {
+                            let mut config = ResolvedProviderConfig {
+                                base_url: server.endpoint.clone().unwrap_or_default(),
+                                api_key: server.auth_token.clone(),
+                                model: server.default_model.clone(),
+                                format: ApiFormat::Acp,
+                                acp_profile: Some(server.profile),
+                                provider_id: Some(server.id.clone()),
+                                extra_headers: server
+                                    .headers
+                                    .iter()
+                                    .map(|header| (header.key.clone(), header.value.clone()))
+                                    .collect(),
+                                acp_command: server.command.clone(),
+                                acp_args: server.args.clone(),
+                                acp_env: server
+                                    .env
+                                    .iter()
+                                    .map(|entry| (entry.key.clone(), entry.value.clone()))
+                                    .collect(),
+                                opencode_provider_name: Some("omni-bridge-acp".to_string()),
+                            };
+                            if let Some(model) = &session.model {
+                                config.model = Some(model.clone());
+                            }
+                            config
                         })
                     {
                         return Some(config);
                     }
                 }
-                if let Some(config) = self
+                if let Some(mut config) = self
                     .find_provider_by_id(&provider_id, agent, &settings)
                     .await
                 {
+                    if let Some(model) = &session.model {
+                        config.model = Some(model.clone());
+                    }
                     eprintln!(
                         "[provider] resolved explicit provider: base_url={} model={:?} format={:?}",
                         config.base_url, config.model, config.format
@@ -2044,6 +2067,7 @@ impl AppState {
         session_id: &str,
         provider_id: Option<Option<String>>,
         reasoning_effort: Option<Option<crate::models::ReasoningEffort>>,
+        model: Option<Option<String>>,
     ) -> Result<SessionSummary, String> {
         let mut sessions = self.sessions.write().await;
         let mut session = sessions.remove(session_id);
@@ -2057,6 +2081,9 @@ impl AppState {
         }
         if let Some(reasoning_effort) = reasoning_effort {
             current.reasoning_effort = reasoning_effort;
+        }
+        if let Some(model) = model {
+            current.model = model;
         }
         current.updated_at = Utc::now();
         let project_id = current.project_id.clone();
@@ -3278,6 +3305,7 @@ mod tests {
                     runtime_session_ref: None,
                     provider_id: None,
                     reasoning_effort: None,
+                    model: None,
                 },
             ),
             (
@@ -3296,6 +3324,7 @@ mod tests {
                     runtime_session_ref: None,
                     provider_id: None,
                     reasoning_effort: None,
+                    model: None,
                 },
             ),
             (
@@ -3314,6 +3343,7 @@ mod tests {
                     runtime_session_ref: Some(provider_session_id.clone()),
                     provider_id: None,
                     reasoning_effort: None,
+                    model: None,
                 },
             ),
         ]);
@@ -3380,6 +3410,7 @@ mod tests {
             runtime_session_ref: None,
             provider_id: None,
             reasoning_effort: None,
+            model: None,
         };
 
         let resolved = state.resolve_provider_config(&session, &None).await;
@@ -3674,6 +3705,7 @@ mod tests {
                 runtime_session_ref: None,
                 provider_id: None,
                 reasoning_effort: None,
+                model: None,
             })
             .await;
 
@@ -3820,6 +3852,7 @@ mod tests {
                 runtime_session_ref: None,
                 provider_id: None,
                 reasoning_effort: None,
+                model: None,
             })
             .await;
         state.messages.write().await.insert(
@@ -3942,6 +3975,7 @@ mod tests {
             runtime_session_ref: None,
             provider_id: Some(AUTO_PROVIDER_ID.to_string()),
             reasoning_effort: None,
+            model: None,
         };
 
         let resolved = state.resolve_provider_config(&session, &None).await;
@@ -4000,6 +4034,7 @@ mod tests {
             runtime_session_ref: None,
             provider_id: Some(AUTO_PROVIDER_ID.to_string()),
             reasoning_effort: None,
+            model: None,
         };
 
         let resolved = state

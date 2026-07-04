@@ -8353,6 +8353,7 @@ fn opencode_session_summary(value: &Value) -> Option<SessionSummary> {
         runtime_session_ref: Some(id),
         provider_id: None,
         reasoning_effort: None,
+        model: None,
     })
 }
 

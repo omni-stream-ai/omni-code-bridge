@@ -554,6 +554,7 @@ fn parse_session_summary_file(path: &Path) -> Option<ParsedSessionSummaryRecord>
             runtime_session_ref: Some(session_id),
             provider_id: None,
             reasoning_effort: None,
+            model: None,
         },
         session_file: path.to_path_buf(),
     })

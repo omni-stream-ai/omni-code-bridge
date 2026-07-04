@@ -212,6 +212,9 @@ pub struct SessionSummary {
     /// Default reasoning effort for this session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Default model override for this session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -276,6 +279,9 @@ pub struct MessageListPage {
     pub has_more: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+    /// Cursor message that should remain visually anchored after applying this page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -313,6 +319,14 @@ pub struct UpdateSessionInput {
         deserialize_with = "deserialize_patch_value"
     )]
     pub reasoning_effort: Option<Option<ReasoningEffort>>,
+    /// Update the session-level model override.
+    /// `Some(name)` sets the model, and `None` clears the override.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_patch_value"
+    )]
+    pub model: Option<Option<String>>,
 }
 
 fn deserialize_patch_value<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>

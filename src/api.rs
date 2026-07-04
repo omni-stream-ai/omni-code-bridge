@@ -1690,6 +1690,7 @@ fn paginate_messages(
         messages: page_messages,
         has_more,
         next_cursor,
+        anchor_id: None,
     })
 }
 
@@ -1831,7 +1832,12 @@ async fn update_session(
 ) -> Result<impl IntoResponse, ApiError> {
     authorize_request(&headers, &state).await?;
     let session = state
-        .update_session_settings(&id, input.provider_id, input.reasoning_effort)
+        .update_session_settings(
+            &id,
+            input.provider_id,
+            input.reasoning_effort,
+            input.model,
+        )
         .await
         .map_err(|err| ApiError {
             status: StatusCode::NOT_FOUND,
@@ -3246,6 +3252,7 @@ for line in sys.stdin:
             runtime_session_ref: Some("thread-1".to_string()),
             provider_id: None,
             reasoning_effort: None,
+            model: None,
         });
 
         let (name, body) = encode_session_event(&event).expect("snapshot should encode");
