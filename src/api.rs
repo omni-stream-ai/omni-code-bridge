@@ -1690,7 +1690,6 @@ fn paginate_messages(
         messages: page_messages,
         has_more,
         next_cursor,
-        anchor_id: None,
     })
 }
 

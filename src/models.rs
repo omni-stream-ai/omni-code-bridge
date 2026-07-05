@@ -279,9 +279,6 @@ pub struct MessageListPage {
     pub has_more: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
-    /// Cursor message that should remain visually anchored after applying this page.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub anchor_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
