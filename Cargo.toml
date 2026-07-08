@@ -1,6 +1,6 @@
 [package]
 name = "omni-code-bridge"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 description = "Rust bridge for Omni Code that connects mobile clients to local coding agents"
 license = "MIT"
@@ -30,6 +30,7 @@ tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tower-http = { version = "0.6", features = ["cors"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+agent-client-protocol = "1.2.0"
 
 [dev-dependencies]
 tokio-tungstenite = "0.29"

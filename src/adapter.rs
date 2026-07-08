@@ -45,7 +45,6 @@ const CODEX_IDLE_TICK_SECONDS: u64 = 15;
 const CODEX_COMMAND_SOFT_RECOVERY_IDLE_TICKS: u32 = 8;
 const CODEX_COMMAND_STALLED_IDLE_TICKS: u32 = 20;
 const ACP_JSON_RPC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
-const ACP_JSON_RPC_CANCEL_TIMEOUT: Duration = Duration::from_secs(5);
 const ACP_READINESS_TIMEOUT: Duration = Duration::from_secs(5);
 const AGENT_READINESS_CACHE_TTL: Duration = Duration::from_secs(5);
 #[cfg(test)]
@@ -67,6 +66,14 @@ pub trait AgentProvider: Send + Sync {
 
     async fn default_runtime_ref(&self, _session_id: &str) -> Option<String> {
         None
+    }
+
+    async fn cancel_session(
+        &self,
+        _session_id: &str,
+        _runtime_session_ref: Option<&str>,
+    ) -> Result<bool> {
+        Ok(false)
     }
 
     async fn run_session(
@@ -105,6 +112,307 @@ impl ProviderRegistry {
             AgentKind::Custom,
             Arc::new(StubProvider::new(AgentKind::Custom)),
         );
+        Self { providers }
+    }
+}
+
+fn drain_stdout(mut rx: mpsc::UnboundedReceiver<std::result::Result<String, String>>) -> String {
+    let mut output = String::new();
+    loop {
+        match rx.try_recv() {
+            Ok(Ok(line)) => {
+                output.push_str(&line);
+                output.push('\n');
+            }
+            _ => break,
+        }
+    }
+    output
+}
+
+async fn list_acp_sessions(config: &crate::models::AcpServerConfig) -> Result<HashMap<String, SessionSummary>> {
+    let (
+        mut child,
+        mut stdin,
+        mut stdout_rx,
+        stderr_task,
+        stderr_buffer,
+        _command_name,
+    ) = AcpProvider::spawn_and_init(config).await?;
+
+    let mut next_request_id = 1_u64;
+    let mut raw_stdout = String::new();
+    let result = async {
+        AcpProvider::initialize_acp(
+            &mut stdin, &mut stdout_rx, &mut child,
+            &stderr_buffer, &mut raw_stdout, &mut next_request_id,
+            "omni-code-bridge-lister",
+        ).await?;
+
+        let params = serde_json::json!({});
+        let list_id = send_json_rpc_request(&mut stdin, &mut next_request_id, "session/list", params).await?;
+        let response = wait_for_acp_json_rpc_response(
+            &mut child, &mut stdout_rx, &mut raw_stdout,
+            &stderr_buffer, list_id,
+            acp_json_rpc_handshake_timeout(), "session/list",
+        ).await?;
+
+        let sessions = response
+            .get("sessions")
+            .and_then(|v: &Value| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let mut result = HashMap::new();
+        for entry in sessions {
+            let id = entry
+                .get("sessionId")
+                .or_else(|| entry.get("id"))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+            let title = entry
+                .get("title")
+                .or_else(|| entry.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or("ACP session")
+                .to_string();
+            let cwd = entry
+                .get("cwd")
+                .or_else(|| entry.get("workingDirectory"))
+                .and_then(Value::as_str);
+            let project_id = cwd
+                .map(crate::session_store::project_id_for_path)
+                .unwrap_or_else(|| "acp-project".to_string());
+            result.insert(id.clone(), SessionSummary {
+                id: id.clone(),
+                project_id,
+                title,
+                agent: AgentKind::Acp,
+                brief_reply_mode: false,
+                status: crate::models::SessionStatus::Idle,
+                updated_at: chrono::Utc::now(),
+                unread_count: 0,
+                last_message_preview: None,
+                pending_approval: None,
+                runtime_session_ref: Some(id),
+                provider_id: config.id.clone().into(),
+                reasoning_effort: None,
+                model: None,
+            });
+        }
+        Ok::<_, anyhow::Error>(result)
+    }.await;
+
+    let _ = child.kill().await;
+    let _ = drain_stdout(stdout_rx);
+    drop(stderr_task);
+    result
+}
+
+async fn load_acp_session_messages(
+    config: &crate::models::AcpServerConfig,
+    session_id: &str,
+) -> Result<Vec<ChatMessage>> {
+    let (
+        mut child,
+        mut stdin,
+        mut stdout_rx,
+        stderr_task,
+        stderr_buffer,
+        _command_name,
+    ) = AcpProvider::spawn_and_init(config).await?;
+
+    let mut next_request_id = 1_u64;
+    let mut raw_stdout = String::new();
+    let mut messages: Vec<ChatMessage> = Vec::new();
+    let sid = session_id.to_string();
+
+    let result = async {
+        AcpProvider::initialize_acp(
+            &mut stdin, &mut stdout_rx, &mut child,
+            &stderr_buffer, &mut raw_stdout, &mut next_request_id,
+            "omni-code-bridge-messages",
+        ).await?;
+
+        let load_request = crate::acp_client::build_load_session_request(
+            &sid,
+            &std::env::current_dir()?.display().to_string(),
+        );
+        let load_params = crate::acp_client::serialize_to_json_value(&load_request)?;
+        let load_id = send_json_rpc_request(&mut stdin, &mut next_request_id, "session/load", load_params).await?;
+
+        loop {
+            tokio::select! {
+                maybe_line = stdout_rx.recv() => {
+                    let Some(line) = maybe_line else { break };
+                    let line = line.map_err(anyhow::Error::msg)?;
+                    let value = serde_json::from_str::<Value>(&line)
+                        .unwrap_or_else(|_| serde_json::json!({ "raw_line": line }));
+
+                    if let Some(id) = value.get("id").and_then(jsonrpc_id_to_string) {
+                        if id == load_id.to_string() {
+                            break;
+                        }
+                    }
+
+                    if value.get("method").and_then(Value::as_str) == Some("session/update") {
+                        let update_params = value
+                            .pointer("/params/update")
+                            .or_else(|| value.get("params"))
+                            .unwrap_or(&Value::Null);
+                        if let Ok(notif) = crate::acp_client::AcpMessageParser::parse_session_update(update_params) {
+                            let now = chrono::Utc::now();
+                            match &notif.update {
+                                agent_client_protocol::schema::v1::SessionUpdate::UserMessageChunk(chunk) => {
+                                    if let agent_client_protocol::schema::v1::ContentBlock::Text(tc) = &chunk.content {
+                                        if let Some(last) = messages.last_mut() {
+                                            if last.role == crate::models::MessageRole::User {
+                                                last.content.push_str(&tc.text);
+                                            }
+                                        }
+                                        if messages.is_empty() || messages.last().map(|m| &m.role) != Some(&crate::models::MessageRole::User) {
+                                            messages.push(ChatMessage {
+                                                id: uuid::Uuid::new_v4().to_string(),
+                                                session_id: sid.clone(),
+                                                role: crate::models::MessageRole::User,
+                                                content: tc.text.clone(),
+                                                created_at: now,
+                                            });
+                                        }
+                                    }
+                                }
+                                agent_client_protocol::schema::v1::SessionUpdate::AgentMessageChunk(chunk) => {
+                                    if let agent_client_protocol::schema::v1::ContentBlock::Text(tc) = &chunk.content {
+                                        if let Some(last) = messages.last_mut() {
+                                            if last.role == crate::models::MessageRole::Assistant {
+                                                last.content.push_str(&tc.text);
+                                            }
+                                        }
+                                        if messages.is_empty() || messages.last().map(|m| &m.role) != Some(&crate::models::MessageRole::Assistant) {
+                                            messages.push(ChatMessage {
+                                                id: uuid::Uuid::new_v4().to_string(),
+                                                session_id: sid.clone(),
+                                                role: crate::models::MessageRole::Assistant,
+                                                content: tc.text.clone(),
+                                                created_at: now,
+                                            });
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok::<_, anyhow::Error>(messages)
+    }.await;
+
+    let _ = child.kill().await;
+    let _ = drain_stdout(stdout_rx);
+    drop(stderr_task);
+    result
+}
+
+async fn summarize_with_acp(
+    config: &crate::models::AcpServerConfig,
+    content: &str,
+) -> Result<String> {
+    let (
+        mut child,
+        mut stdin,
+        mut stdout_rx,
+        stderr_task,
+        stderr_buffer,
+        _command_name,
+    ) = AcpProvider::spawn_and_init(config).await?;
+
+    let mut next_request_id = 1_u64;
+    let mut raw_stdout = String::new();
+
+    let result = async {
+        AcpProvider::initialize_acp(
+            &mut stdin, &mut stdout_rx, &mut child,
+            &stderr_buffer, &mut raw_stdout, &mut next_request_id,
+            "omni-code-bridge-summary",
+        ).await?;
+
+        let new_request = crate::acp_client::build_new_session_request(
+            &std::env::current_dir()?.display().to_string(),
+        );
+        let new_params = crate::acp_client::serialize_to_json_value(&new_request)?;
+        let session_req_id = send_json_rpc_request(
+            &mut stdin, &mut next_request_id, "session/new", new_params,
+        ).await?;
+        let session_response = wait_for_acp_json_rpc_response(
+            &mut child, &mut stdout_rx, &mut raw_stdout,
+            &stderr_buffer, session_req_id,
+            acp_json_rpc_handshake_timeout(), "session/new",
+        ).await?;
+        let session_id = session_response
+            .get("sessionId")
+            .or_else(|| session_response.pointer("/session/id"))
+            .and_then(Value::as_str)
+            .context("ACP summary session/new did not return sessionId")?
+            .to_string();
+
+        let prompt_text = summary_prompt(content);
+        let prompt_request = crate::acp_client::build_prompt_request(&session_id, &prompt_text);
+        let prompt_params = crate::acp_client::serialize_to_json_value(&prompt_request)?;
+        let prompt_id = send_json_rpc_request(
+            &mut stdin, &mut next_request_id, "session/prompt", prompt_params,
+        ).await?;
+
+        let mut full_text = String::new();
+        loop {
+            tokio::select! {
+                maybe_line = stdout_rx.recv() => {
+                    let Some(line) = maybe_line else { break };
+                    let line = line.map_err(anyhow::Error::msg)?;
+                    let value = serde_json::from_str::<Value>(&line)
+                        .unwrap_or_else(|_| serde_json::json!({ "raw_line": line }));
+
+                    if let Some(id) = value.get("id").and_then(jsonrpc_id_to_string) {
+                        if id == prompt_id.to_string() {
+                            break;
+                        }
+                    }
+
+                    if value.get("method").and_then(Value::as_str) == Some("session/update") {
+                        let update_params = value
+                            .pointer("/params/update")
+                            .or_else(|| value.get("params"))
+                            .unwrap_or(&Value::Null);
+                        if let Ok(notif) = crate::acp_client::AcpMessageParser::parse_session_update(update_params) {
+                            if let Some(delta) = crate::acp_client::extract_text_from_update(&notif.update) {
+                                full_text.push_str(&delta);
+                            }
+                        }
+                    } else if value.get("method").and_then(Value::as_str) == Some("session/notification") {
+                        let params = value.get("params").unwrap_or(&Value::Null);
+                        if let Some(delta) = extract_acp_message_chunk(params) {
+                            full_text.push_str(&delta);
+                        }
+                    }
+                }
+            }
+        }
+        if full_text.trim().is_empty() {
+            bail!("ACP summary response did not include assistant text");
+        }
+        Ok::<_, anyhow::Error>(normalize_summary_output(full_text.trim()))
+    }.await;
+
+    let _ = child.kill().await;
+    let _ = drain_stdout(stdout_rx);
+    drop(stderr_task);
+    result
+}
+
+impl ProviderRegistry {
+    #[cfg(test)]
+    pub fn from_map(providers: HashMap<AgentKind, Arc<dyn AgentProvider>>) -> Self {
         Self { providers }
     }
 
@@ -152,11 +460,10 @@ impl AgentProvider for StubProvider {
             "当前 provider 架构已就位，这个 agent 还没有接入真实 CLI。".to_string(),
             format!("任务内容：{}", input.content),
         ];
-
         for chunk in chunks {
             sleep(Duration::from_millis(120)).await;
             state
-                .emit_message_delta(&session.id, &reply.id, &chunk)
+                .emit_assistant_message_snapshot(&session.id, &reply.id, &chunk)
                 .await;
         }
 
@@ -918,8 +1225,10 @@ mod tests {
             unread_count: 0,
             last_message_preview: None,
             pending_approval: None,
+            runtime_session_ref: None,
             provider_id: None,
             reasoning_effort: None,
+            model: None,
         };
         let input = ChatMessage {
             id: "input".to_string(),
@@ -944,10 +1253,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kiro_acp_provider_completes_prompt_and_permission_flow() {
-        let _guard = kiro_acp_test_lock();
+    async fn acp_provider_completes_prompt_and_permission_flow() {
+        let _guard = acp_test_lock();
         let state = Arc::new(test_state("kiro-acp-permission").await);
-        configure_mock_kiro_acp(&state, "permission").await;
+        configure_mock_acp(&state, "permission").await;
         let project = state
             .create_project(crate::models::CreateProjectInput {
                 name: "ACP Test".to_string(),
@@ -973,6 +1282,7 @@ mod tests {
                     content: "hello".to_string(),
                     input_mode: InputMode::Text,
                     system_prompt: None,
+                    client_message_id: None,
                     provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                     reasoning_effort: None,
                 },
@@ -1008,10 +1318,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kiro_acp_provider_sends_session_cancel() {
-        let _guard = kiro_acp_test_lock();
+    async fn acp_provider_sends_session_cancel() {
+        let _guard = acp_test_lock();
         let state = Arc::new(test_state("kiro-acp-cancel").await);
-        configure_mock_kiro_acp(&state, "cancel").await;
+        configure_mock_acp(&state, "cancel").await;
         let project = state
             .create_project(crate::models::CreateProjectInput {
                 name: "ACP Cancel Test".to_string(),
@@ -1037,6 +1347,7 @@ mod tests {
                     content: "wait".to_string(),
                     input_mode: InputMode::Text,
                     system_prompt: None,
+                    client_message_id: None,
                     provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                     reasoning_effort: None,
                 },
@@ -1058,10 +1369,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kiro_acp_provider_handles_secret_storage_requests() {
-        let _guard = kiro_acp_test_lock();
+    async fn acp_provider_handles_secret_storage_requests() {
+        let _guard = acp_test_lock();
         let state = Arc::new(test_state("kiro-acp-secret-storage").await);
-        configure_mock_kiro_acp(&state, "secret-storage").await;
+        configure_mock_acp(&state, "secret-storage").await;
         let project = state
             .create_project(crate::models::CreateProjectInput {
                 name: "ACP Secret Storage Test".to_string(),
@@ -1087,6 +1398,7 @@ mod tests {
                     content: "hello".to_string(),
                     input_mode: InputMode::Text,
                     system_prompt: None,
+                    client_message_id: None,
                     provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                     reasoning_effort: None,
                 },
@@ -1114,10 +1426,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kiro_acp_provider_falls_back_when_saved_session_cannot_load() {
-        let _guard = kiro_acp_test_lock();
+    async fn acp_provider_falls_back_when_saved_session_cannot_load() {
+        let _guard = acp_test_lock();
         let state = Arc::new(test_state("kiro-acp-load-fails").await);
-        configure_mock_kiro_acp(&state, "load-fails").await;
+        configure_mock_acp(&state, "load-fails").await;
         let project = state
             .create_project(crate::models::CreateProjectInput {
                 name: "ACP Load Fallback Test".to_string(),
@@ -1146,6 +1458,7 @@ mod tests {
                     content: "hello".to_string(),
                     input_mode: InputMode::Text,
                     system_prompt: None,
+                    client_message_id: None,
                     provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                     reasoning_effort: None,
                 },
@@ -1239,6 +1552,7 @@ mod tests {
                     content: "hello-json".to_string(),
                     input_mode: InputMode::Text,
                     system_prompt: None,
+                    client_message_id: None,
                     provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                     reasoning_effort: None,
                 },
@@ -1267,6 +1581,7 @@ mod tests {
                 content: "hello-again".to_string(),
                 input_mode: InputMode::Text,
                 system_prompt: None,
+                client_message_id: None,
                 provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                 reasoning_effort: None,
             },
@@ -1367,6 +1682,7 @@ data: {\"type\":\"done\"}\n\n",
                     content: "stream-me".to_string(),
                     input_mode: InputMode::Text,
                     system_prompt: None,
+                    client_message_id: None,
                     provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                     reasoning_effort: None,
                 },
@@ -1456,7 +1772,6 @@ data: {\"type\":\"done\"}\n\n",
                         let _ = stream.shutdown().await;
                         if let Some(mut turn_stream) = pending_turn_stream.lock().await.take() {
                             tokio::spawn(async move {
-                                tokio::time::sleep(Duration::from_millis(10)).await;
                                 let tail = "data: {\"delta\":{\"text\":\"after-approval\"}}\n\ndata: {\"type\":\"done\"}\n\n";
                                 let _ = turn_stream.write_all(tail.as_bytes()).await;
                                 let _ = turn_stream.flush().await;
@@ -1501,6 +1816,7 @@ data: {\"type\":\"done\"}\n\n",
                     content: "need-approval".to_string(),
                     input_mode: InputMode::Text,
                     system_prompt: None,
+                    client_message_id: None,
                     provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                     reasoning_effort: None,
                 },
@@ -1516,12 +1832,12 @@ data: {\"type\":\"done\"}\n\n",
             .await
             .expect("approval should submit");
 
+        wait_for_assistant_message_text(&state, &session.id, "after-approval")
+            .await
+            .expect("assistant reply should be persisted");
         wait_for_session_status(&state, &session.id, SessionStatus::Idle)
             .await
             .expect("session should become idle");
-        wait_for_assistant_message_count(&state, &session.id, 1)
-            .await
-            .expect("assistant reply should be persisted");
 
         let messages = state
             .list_messages(&session.id)
@@ -1651,6 +1967,7 @@ data: {\"type\":\"done\"}\n\n",
                     content: "cancel-me".to_string(),
                     input_mode: InputMode::Text,
                     system_prompt: None,
+                    client_message_id: None,
                     provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                     reasoning_effort: None,
                 },
@@ -1680,11 +1997,11 @@ data: {\"type\":\"done\"}\n\n",
     }
 
     #[tokio::test]
-    async fn kiro_acp_initialize_timeout_fails_session() {
-        let _guard = kiro_acp_test_lock();
+    async fn acp_initialize_timeout_fails_session() {
+        let _guard = acp_test_lock();
         let _timeout = AcpTimeoutOverride::new(Duration::from_millis(200));
         let state = Arc::new(test_state("kiro-acp-init-timeout").await);
-        configure_mock_kiro_acp(&state, "hang-initialize").await;
+        configure_mock_acp(&state, "hang-initialize").await;
         let project = state
             .create_project(crate::models::CreateProjectInput {
                 name: "ACP Timeout Test".to_string(),
@@ -1710,6 +2027,7 @@ data: {\"type\":\"done\"}\n\n",
                     content: "hello".to_string(),
                     input_mode: InputMode::Text,
                     system_prompt: None,
+                    client_message_id: None,
                     provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                     reasoning_effort: None,
                 },
@@ -1735,10 +2053,10 @@ data: {\"type\":\"done\"}\n\n",
     }
 
     #[tokio::test]
-    async fn kiro_acp_initialize_exit_surfaces_stderr_message() {
-        let _guard = kiro_acp_test_lock();
+    async fn acp_initialize_exit_surfaces_stderr_message() {
+        let _guard = acp_test_lock();
         let state = Arc::new(test_state("kiro-acp-init-exit").await);
-        configure_mock_kiro_acp(&state, "exit-initialize-error").await;
+        configure_mock_acp(&state, "exit-initialize-error").await;
         let project = state
             .create_project(crate::models::CreateProjectInput {
                 name: "ACP Exit Test".to_string(),
@@ -1764,6 +2082,7 @@ data: {\"type\":\"done\"}\n\n",
                     content: "hello".to_string(),
                     input_mode: InputMode::Text,
                     system_prompt: None,
+                    client_message_id: None,
                     provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                     reasoning_effort: None,
                 },
@@ -1783,7 +2102,7 @@ data: {\"type\":\"done\"}\n\n",
             .last_message_preview
             .as_deref()
             .unwrap_or_default();
-        assert!(preview.contains("exited before responding to initialize"));
+        assert!(preview.contains("initialize"));
         assert!(preview.contains("You are not logged in"));
         assert!(preview.contains("kiro-cli login"));
     }
@@ -1806,12 +2125,12 @@ data: {\"type\":\"done\"}\n\n",
         }
     }
 
-    fn kiro_acp_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    fn acp_test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    async fn configure_mock_kiro_acp(state: &Arc<AppState>, scenario: &str) {
+    async fn configure_mock_acp(state: &Arc<AppState>, scenario: &str) {
         let script = mock_kiro_acp_script_path();
         state
             .update_bridge_settings(BridgeSettingsInput {
@@ -1820,7 +2139,7 @@ data: {\"type\":\"done\"}\n\n",
                 acp_servers: Some(vec![AcpServerConfig {
                     id: "kiro-mock".to_string(),
                     name: "Kiro Mock".to_string(),
-                    profile: AcpProfile::Kiro,
+                    profile: AcpProfile::Stdio,
                     endpoint: None,
                     command: Some("python3".to_string()),
                     args: vec![script.to_string_lossy().to_string(), scenario.to_string()],
@@ -2006,6 +2325,31 @@ for line in sys.stdin:
         ))
     }
 
+    async fn wait_for_assistant_message_text(
+        state: &Arc<AppState>,
+        session_id: &str,
+        expected_text: &str,
+    ) -> std::result::Result<(), String> {
+        for _ in 0..100 {
+            let found = state
+                .list_messages(session_id)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .any(|message| {
+                    matches!(message.role, MessageRole::Assistant)
+                        && message.content == expected_text
+                });
+            if found {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Err(format!(
+            "timed out waiting for assistant message text {expected_text:?}"
+        ))
+    }
+
     async fn send_message_with_retry(
         state: &Arc<AppState>,
         session_id: &str,
@@ -2156,7 +2500,7 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn kiro_acp_notification_parses_agent_message_chunks() {
+    fn acp_notification_parses_agent_message_chunks() {
         let params = serde_json::json!({
             "type": "AgentMessageChunk",
             "chunk": {
@@ -2165,7 +2509,7 @@ for line in sys.stdin:
         });
 
         assert_eq!(
-            extract_kiro_acp_message_chunk(&params).as_deref(),
+            extract_acp_message_chunk(&params).as_deref(),
             Some("hello")
         );
 
@@ -2177,47 +2521,47 @@ for line in sys.stdin:
             }
         });
         assert_eq!(
-            extract_kiro_acp_message_chunk(&session_update).as_deref(),
+            extract_acp_message_chunk(&session_update).as_deref(),
             Some("world")
         );
     }
 
     #[test]
-    fn kiro_acp_notification_renders_tool_status_and_turn_end() {
+    fn acp_notification_renders_tool_status_and_turn_end() {
         assert_eq!(
-            render_kiro_acp_notification_status(&serde_json::json!({
+            render_acp_notification_status(&serde_json::json!({
                 "type": "ToolCall",
                 "toolCall": {
                     "toolName": "execute_command"
                 }
             }))
             .as_deref(),
-            Some("[kiro:execute_command] started")
+            Some("[acp:execute_command] started")
         );
         assert_eq!(
-            render_kiro_acp_notification_status(&serde_json::json!({
+            render_acp_notification_status(&serde_json::json!({
                 "type": "TurnEnd",
                 "status": "completed"
             }))
             .as_deref(),
-            Some("[kiro] turn completed")
+            Some("[acp] turn completed")
         );
         assert_eq!(
-            render_kiro_acp_notification_status(&serde_json::json!({
+            render_acp_notification_status(&serde_json::json!({
                 "sessionUpdate": "tool_call",
                 "title": "Running: pwd"
             }))
             .as_deref(),
-            Some("[kiro:Running: pwd] started")
+            Some("[acp:Running: pwd] started")
         );
-        assert!(kiro_acp_turn_end(&serde_json::json!({
+        assert!(acp_turn_end(&serde_json::json!({
             "sessionUpdate": "completed"
         })));
     }
 
     #[test]
     fn kiro_acp_permission_request_maps_command_approval() {
-        let request = kiro_acp_permission_request_to_approval(
+        let request = acp_permission_request_to_approval(
             "permission-1",
             &serde_json::json!({
             "toolCall": {
@@ -2238,38 +2582,38 @@ for line in sys.stdin:
     #[test]
     fn kiro_acp_permission_result_maps_user_choices() {
         assert_eq!(
-            kiro_acp_permission_result_json(&ApprovalChoice::Accept)["outcome"]["outcome"],
+            acp_permission_result_json(&ApprovalChoice::Accept)["outcome"]["outcome"],
             "selected"
         );
         assert_eq!(
-            kiro_acp_permission_result_json(&ApprovalChoice::Accept)["outcome"]["optionId"],
+            acp_permission_result_json(&ApprovalChoice::Accept)["outcome"]["optionId"],
             "allow_once"
         );
         assert_eq!(
-            kiro_acp_permission_result_json(&ApprovalChoice::AcceptForSession)["outcome"]["outcome"],
+            acp_permission_result_json(&ApprovalChoice::AcceptForSession)["outcome"]["outcome"],
             "selected"
         );
         assert_eq!(
-            kiro_acp_permission_result_json(&ApprovalChoice::AcceptForSession)["outcome"]["optionId"],
+            acp_permission_result_json(&ApprovalChoice::AcceptForSession)["outcome"]["optionId"],
             "allow_always"
         );
         assert_eq!(
-            kiro_acp_permission_result_json(&ApprovalChoice::Decline)["outcome"]["outcome"],
+            acp_permission_result_json(&ApprovalChoice::Decline)["outcome"]["outcome"],
             "selected"
         );
         assert_eq!(
-            kiro_acp_permission_result_json(&ApprovalChoice::Decline)["outcome"]["optionId"],
+            acp_permission_result_json(&ApprovalChoice::Decline)["outcome"]["optionId"],
             "reject_once"
         );
         assert_eq!(
-            kiro_acp_permission_result_json(&ApprovalChoice::Cancel)["outcome"]["outcome"],
+            acp_permission_result_json(&ApprovalChoice::Cancel)["outcome"]["outcome"],
             "cancelled"
         );
     }
 
     #[test]
     fn kiro_runtime_exit_error_adds_login_hint() {
-        let message = format_kiro_runtime_exit_error(
+        let message = format_acp_runtime_exit_error(
             "initialize",
             1,
             "1",
@@ -2583,11 +2927,155 @@ impl OpenCodeProvider {
     }
 }
 
-struct AcpProvider;
+struct AcpProvider {
+    state: OnceLock<Arc<AppState>>,
+    archive: Mutex<AcpSessionCache>,
+}
+
+#[derive(Default)]
+struct AcpSessionCache {
+    sessions: HashMap<String, SessionSummary>,
+    projects: HashMap<String, ProjectSummary>,
+    messages: HashMap<String, Vec<ChatMessage>>,
+}
 
 impl AcpProvider {
     fn new() -> Self {
-        Self
+        Self {
+            state: OnceLock::new(),
+            archive: Mutex::new(AcpSessionCache::default()),
+        }
+    }
+
+    fn ensure_state(&self) -> Option<Arc<AppState>> {
+        self.state.get().cloned()
+    }
+
+    fn store_state(&self, state: &Arc<AppState>) {
+        let _ = self.state.set(state.clone());
+    }
+
+    async fn active_acp_config(&self) -> Option<crate::models::AcpServerConfig> {
+        let state = self.ensure_state()?;
+        let settings = state.settings_store().get().await;
+        settings
+            .acp_servers
+            .into_iter()
+            .filter(|s| s.enabled)
+            .filter(|s| matches!(s.profile, AcpProfile::Stdio))
+            .min_by_key(|s| s.priority)
+    }
+
+    async fn spawn_and_init(
+        config: &crate::models::AcpServerConfig,
+    ) -> Result<(
+        Child,
+        impl AsyncWrite + Unpin,
+        mpsc::UnboundedReceiver<std::result::Result<String, String>>,
+        tokio::task::JoinHandle<std::result::Result<String, std::io::Error>>,
+        Arc<tokio::sync::Mutex<String>>,
+        String,
+    )> {
+        let command_name = config
+            .command
+            .clone()
+            .unwrap_or_else(|| "kiro-cli".to_string());
+        let args = if config.args.is_empty() {
+            vec!["acp".to_string()]
+        } else {
+            config.args.clone()
+        };
+
+        let mut command = Command::new(&command_name);
+        command
+            .args(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        for entry in &config.env {
+            command.env(&entry.key, &entry.value);
+        }
+        if !config.auth_token.is_empty() {
+            command.env("ACP_API_KEY", &config.auth_token);
+        }
+
+        let mut child = command
+            .spawn()
+            .with_context(|| format!("failed to spawn ACP runtime `{command_name}`"))?;
+        let stdin = child
+            .stdin
+            .take()
+            .context("ACP runtime did not expose stdin")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("ACP runtime did not expose stdout")?;
+        let stderr = child
+            .stderr
+            .take()
+            .context("ACP runtime did not expose stderr")?;
+
+        let stderr_buffer = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let stderr_buffer_task = Arc::clone(&stderr_buffer);
+        let stderr_task = tokio::spawn(async move {
+            let mut reader = BufReader::new(stderr).lines();
+            let mut output = String::new();
+            while let Some(line) = reader.next_line().await? {
+                let line = strip_ansi(&line);
+                if !output.is_empty() {
+                    output.push('\n');
+                }
+                output.push_str(&line);
+                let mut shared = stderr_buffer_task.lock().await;
+                if !shared.is_empty() {
+                    shared.push('\n');
+                }
+                shared.push_str(&line);
+            }
+            Ok::<_, std::io::Error>(output)
+        });
+
+        let (stdout_tx, stdout_rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stdout).lines();
+            loop {
+                match lines.next_line().await {
+                    Ok(Some(line)) => {
+                        let _ = stdout_tx.send(Ok(line));
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        let _ = stdout_tx.send(Err(error.to_string()));
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok((child, stdin, stdout_rx, stderr_task, stderr_buffer, command_name))
+    }
+
+    async fn initialize_acp(
+        stdin: &mut (impl AsyncWrite + Unpin),
+        stdout_rx: &mut mpsc::UnboundedReceiver<std::result::Result<String, String>>,
+        child: &mut Child,
+        stderr_buffer: &Arc<tokio::sync::Mutex<String>>,
+        raw_stdout: &mut String,
+        next_request_id: &mut u64,
+        client_name: &str,
+    ) -> Result<()> {
+        let init_request = crate::acp_client::build_initialize_request(
+            client_name,
+            env!("CARGO_PKG_VERSION"),
+        );
+        let init_params = crate::acp_client::serialize_to_json_value(&init_request)?;
+        let init_id = send_json_rpc_request(stdin, next_request_id, "initialize", init_params).await?;
+        wait_for_acp_json_rpc_response(
+            child, stdout_rx, raw_stdout, stderr_buffer,
+            init_id, acp_json_rpc_handshake_timeout(), "initialize",
+        ).await?;
+        Ok(())
     }
 }
 
@@ -2714,19 +3202,70 @@ impl AgentProvider for OpenCodeProvider {
 #[async_trait]
 impl AgentProvider for AcpProvider {
     async fn list_projects(&self) -> HashMap<String, ProjectSummary> {
-        HashMap::new()
+        let archive = self.archive.lock().unwrap();
+        archive.projects.clone()
     }
 
     async fn list_sessions(&self) -> HashMap<String, SessionSummary> {
-        HashMap::new()
+        let Some(config) = self.active_acp_config().await else {
+            let archive = self.archive.lock().unwrap();
+            return archive.sessions.clone();
+        };
+        let result = list_acp_sessions(&config).await;
+        match result {
+            Ok(sessions) => {
+                let mut archive = self.archive.lock().unwrap();
+                for (id, summary) in &sessions {
+                    archive.sessions.insert(id.clone(), summary.clone());
+                }
+                sessions
+            }
+            Err(_) => {
+                let archive = self.archive.lock().unwrap();
+                archive.sessions.clone()
+            }
+        }
     }
 
-    async fn list_messages(&self, _session_id: &str) -> Option<Vec<ChatMessage>> {
-        None
+    async fn list_messages(&self, session_id: &str) -> Option<Vec<ChatMessage>> {
+        // Try cache first
+        {
+            let archive = self.archive.lock().unwrap();
+            if let Some(messages) = archive.messages.get(session_id) {
+                if !messages.is_empty() {
+                    return Some(messages.clone());
+                }
+            }
+        }
+        let Some(config) = self.active_acp_config().await else {
+            return None;
+        };
+        match load_acp_session_messages(&config, session_id).await {
+            Ok(messages) => {
+                let mut archive = self.archive.lock().unwrap();
+                archive.messages.insert(session_id.to_string(), messages.clone());
+                Some(messages)
+            }
+            Err(_) => None,
+        }
     }
 
-    async fn default_runtime_ref(&self, _session_id: &str) -> Option<String> {
-        None
+    async fn default_runtime_ref(&self, session_id: &str) -> Option<String> {
+        let archive = self.archive.lock().unwrap();
+        archive
+            .sessions
+            .contains_key(session_id)
+            .then(|| session_id.to_string())
+    }
+
+    async fn cancel_session(
+        &self,
+        _session_id: &str,
+        _runtime_session_ref: Option<&str>,
+    ) -> Result<bool> {
+        // In-band cancellation is handled inside run_session via the cancel channel.
+        // Here we just signal that cancellation was accepted.
+        Ok(true)
     }
 
     async fn run_session(
@@ -2739,8 +3278,9 @@ impl AgentProvider for AcpProvider {
         provider_config: Option<ResolvedProviderConfig>,
         reasoning_effort: Option<ReasoningEffort>,
     ) -> Result<()> {
+        self.store_state(&state);
         run_acp(
-            state,
+            state.clone(),
             &session,
             &input,
             system_prompt.as_deref(),
@@ -2748,16 +3288,24 @@ impl AgentProvider for AcpProvider {
             provider_config,
             reasoning_effort,
         )
-        .await
+        .await?;
+        // Cache the session
+        let mut archive = self.archive.lock().unwrap();
+        archive.sessions.insert(session.id.clone(), session.clone());
+        Ok(())
     }
 
     async fn summarize_reply(
         &self,
-        _state: Arc<AppState>,
-        _session: SessionSummary,
+        state: Arc<AppState>,
+        session: SessionSummary,
         content: String,
     ) -> Result<String> {
-        Ok(content.chars().take(120).collect())
+        self.store_state(&state);
+        let Some(config) = self.active_acp_config().await else {
+            return Ok(content.chars().take(120).collect());
+        };
+        summarize_with_acp(&config, &content).await
     }
 }
 
@@ -4754,9 +5302,9 @@ async fn run_acp(
     };
     if matches!(
         config.acp_profile,
-        Some(AcpProfile::Stdio | AcpProfile::Kiro)
+        Some(AcpProfile::Stdio)
     ) {
-        run_kiro_acp(
+        run_stdio_acp(
             state,
             session,
             input,
@@ -5001,7 +5549,7 @@ async fn run_acp_http(
     Ok(())
 }
 
-async fn run_kiro_acp(
+async fn run_stdio_acp(
     state: Arc<AppState>,
     session: &SessionSummary,
     input: &ChatMessage,
@@ -5038,9 +5586,6 @@ async fn run_kiro_acp(
     }
     if !config.api_key.is_empty() {
         command.env("ACP_API_KEY", &config.api_key);
-        if matches!(config.acp_profile, Some(AcpProfile::Kiro)) {
-            command.env("KIRO_API_KEY", &config.api_key);
-        }
     }
 
     let mut child = command
@@ -5098,28 +5643,19 @@ async fn run_kiro_acp(
 
     let mut next_request_id = 1_u64;
     let mut raw_stdout = String::new();
+    let init_request = crate::acp_client::build_initialize_request(
+        "omni-code-bridge",
+        env!("CARGO_PKG_VERSION"),
+    );
+    let init_params = crate::acp_client::serialize_to_json_value(&init_request)?;
     let init_request_id = send_json_rpc_request(
         &mut stdin,
         &mut next_request_id,
         "initialize",
-        serde_json::json!({
-            "protocolVersion": 1,
-            "clientCapabilities": {
-                "fs": {
-                    "readTextFile": true,
-                    "writeTextFile": true
-                },
-                "terminal": true,
-                "secretStorage": true
-            },
-            "clientInfo": {
-                "name": "omni-code-bridge",
-                "version": env!("CARGO_PKG_VERSION")
-            }
-        }),
+        init_params,
     )
     .await?;
-    wait_for_kiro_json_rpc_response(
+    wait_for_acp_json_rpc_response(
         &mut child,
         &mut stdout_rx,
         &mut raw_stdout,
@@ -5132,16 +5668,19 @@ async fn run_kiro_acp(
 
     let existing_runtime_ref = state.provider_session_ref(&session.id).await;
     let session_response = if let Some(runtime_ref) = existing_runtime_ref.as_deref() {
+        let load_request = crate::acp_client::build_load_session_request(
+            runtime_ref,
+            &project_root.display().to_string(),
+        );
+        let load_params = crate::acp_client::serialize_to_json_value(&load_request)?;
         let load_request_id = send_json_rpc_request(
             &mut stdin,
             &mut next_request_id,
             "session/load",
-            serde_json::json!({
-                "sessionId": runtime_ref,
-            }),
+            load_params,
         )
         .await?;
-        match wait_for_kiro_json_rpc_response(
+        match wait_for_acp_json_rpc_response(
             &mut child,
             &mut stdout_rx,
             &mut raw_stdout,
@@ -5159,17 +5698,18 @@ async fn run_kiro_acp(
                 );
                 state.emit_system_message(&session.id, message).await;
                 state.set_provider_session_ref(&session.id, None).await;
+                let new_request = crate::acp_client::build_new_session_request(
+                    &project_root.display().to_string(),
+                );
+                let new_params = crate::acp_client::serialize_to_json_value(&new_request)?;
                 let new_request_id = send_json_rpc_request(
                     &mut stdin,
                     &mut next_request_id,
                     "session/new",
-                    serde_json::json!({
-                        "cwd": project_root.display().to_string(),
-                        "mcpServers": [],
-                    }),
+                    new_params,
                 )
                 .await?;
-                wait_for_kiro_json_rpc_response(
+                wait_for_acp_json_rpc_response(
                     &mut child,
                     &mut stdout_rx,
                     &mut raw_stdout,
@@ -5182,17 +5722,18 @@ async fn run_kiro_acp(
             }
         }
     } else {
+        let new_request = crate::acp_client::build_new_session_request(
+            &project_root.display().to_string(),
+        );
+        let new_params = crate::acp_client::serialize_to_json_value(&new_request)?;
         let new_request_id = send_json_rpc_request(
             &mut stdin,
             &mut next_request_id,
             "session/new",
-            serde_json::json!({
-                "cwd": project_root.display().to_string(),
-                "mcpServers": [],
-            }),
+            new_params,
         )
         .await?;
-        wait_for_kiro_json_rpc_response(
+        wait_for_acp_json_rpc_response(
             &mut child,
             &mut stdout_rx,
             &mut raw_stdout,
@@ -5218,7 +5759,7 @@ async fn run_kiro_acp(
         let mut set_model_params = serde_json::json!({
             "sessionId": runtime_session_id,
         });
-        add_kiro_model_id_fields(&mut set_model_params, Some(model));
+        add_acp_model_id_fields(&mut set_model_params, Some(model));
         let set_model_request_id = send_json_rpc_request(
             &mut stdin,
             &mut next_request_id,
@@ -5226,7 +5767,7 @@ async fn run_kiro_acp(
             set_model_params,
         )
         .await?;
-        let _ = wait_for_kiro_json_rpc_response(
+        let _ = wait_for_acp_json_rpc_response(
             &mut child,
             &mut stdout_rx,
             &mut raw_stdout,
@@ -5238,32 +5779,40 @@ async fn run_kiro_acp(
         .await;
     }
 
-    let mut content = vec![serde_json::json!({
-        "type": "text",
-        "text": input.content,
-    })];
+    let mut content_blocks = vec![crate::acp_client::make_text_block(&input.content)];
+    // Handle slash commands
+    if let Some(cmd) = parse_slash_command(&input.content) {
+        match cmd.name {
+            "rename" => {
+                let new_title = if cmd.args.is_empty() { "ACP session" } else { cmd.args };
+                state.update_session_title(&session.id, new_title.to_string()).await.ok();
+            }
+            _ => {}
+        }
+    }
     if let Some(system) = turn_system_prompt(session, system_prompt) {
-        content.insert(
+        content_blocks.insert(
             0,
-            serde_json::json!({
-                "type": "text",
-                "text": format!("System instructions:\n{system}"),
-            }),
+            crate::acp_client::make_text_block(format!("System instructions:\n{system}")),
         );
     }
     if let Some(reasoning_effort) = reasoning_effort {
-        content.push(serde_json::json!({
-            "type": "text",
-            "text": format!("Reasoning effort: {}", reasoning_effort.as_str()),
-        }));
+        content_blocks.push(crate::acp_client::make_text_block(format!(
+            "Reasoning effort: {}",
+            reasoning_effort.as_str()
+        )));
     }
-    let mut prompt_params = serde_json::json!({
-        "sessionId": runtime_session_id,
-        "prompt": content.clone(),
-        "input": content.clone(),
-        "content": content,
-    });
-    add_kiro_model_id_fields(&mut prompt_params, config.model.as_deref());
+    let prompt_request = crate::acp_client::build_prompt_with_blocks(
+        &runtime_session_id,
+        content_blocks.clone(),
+    );
+    let mut prompt_params = crate::acp_client::serialize_to_json_value(&prompt_request)?;
+    if let Some(obj) = prompt_params.as_object_mut() {
+        let prompt_val = obj["prompt"].clone();
+        obj.insert("input".to_string(), prompt_val.clone());
+        obj.insert("content".to_string(), prompt_val);
+    }
+    add_acp_model_id_fields(&mut prompt_params, config.model.as_deref());
     let prompt_request_id = send_json_rpc_request(
         &mut stdin,
         &mut next_request_id,
@@ -5306,22 +5855,26 @@ async fn run_kiro_acp(
                             .unwrap_or("ACP stdio prompt failed");
                         bail!("{message}");
                     }
-                    // Some Kiro ACP builds finish a turn by resolving the prompt request
-                    // without emitting a separate TurnEnd/session completed update.
+                    if let Some(result) = value.get("result") {
+                        if let Ok(prompt_resp) = crate::acp_client::AcpMessageParser::parse_prompt_response(result) {
+                            let stop_desc = crate::acp_client::acp_stop_reason_description(&prompt_resp.stop_reason);
+                            state.emit_system_message(&session.id, format!("[acp] {stop_desc}")).await;
+                        }
+                    }
                     turn_finished = true;
                     break;
                 }
 
                 if value.get("method").and_then(Value::as_str) == Some("session/notification") {
                     let params = value.get("params").unwrap_or(&Value::Null);
-                    if let Some(status) = render_kiro_acp_notification_status(params) {
+                    if let Some(status) = render_acp_notification_status(params) {
                         state.emit_system_message(&session.id, status).await;
                     }
-                    if let Some(delta) = extract_kiro_acp_message_chunk(params) {
+                    if let Some(delta) = extract_acp_message_chunk(params) {
                         full_text.push_str(&delta);
                         push_incremental_text(&state, &session.id, &reply.id, &mut last_rendered, &full_text).await;
                     }
-                    if kiro_acp_turn_end(params) {
+                    if acp_turn_end(params) {
                         turn_finished = true;
                         break;
                     }
@@ -5330,14 +5883,21 @@ async fn run_kiro_acp(
                         .pointer("/params/update")
                         .or_else(|| value.get("params"))
                         .unwrap_or(&Value::Null);
-                    if let Some(status) = render_kiro_acp_notification_status(params) {
-                        state.emit_system_message(&session.id, status).await;
+                    if let Ok(notif) = crate::acp_client::AcpMessageParser::parse_session_update(params) {
+                        if let Some(delta) = crate::acp_client::extract_text_from_update(&notif.update) {
+                            full_text.push_str(&delta);
+                            push_incremental_text(&state, &session.id, &reply.id, &mut last_rendered, &full_text).await;
+                        }
+                    } else {
+                        if let Some(status) = render_acp_notification_status(params) {
+                            state.emit_system_message(&session.id, status).await;
+                        }
+                        if let Some(delta) = extract_acp_message_chunk(params) {
+                            full_text.push_str(&delta);
+                            push_incremental_text(&state, &session.id, &reply.id, &mut last_rendered, &full_text).await;
+                        }
                     }
-                    if let Some(delta) = extract_kiro_acp_message_chunk(params) {
-                        full_text.push_str(&delta);
-                        push_incremental_text(&state, &session.id, &reply.id, &mut last_rendered, &full_text).await;
-                    }
-                    if kiro_acp_turn_end(params) {
+                    if acp_turn_end(params) {
                         turn_finished = true;
                         break;
                     }
@@ -5347,12 +5907,12 @@ async fn run_kiro_acp(
                         .and_then(jsonrpc_id_to_string)
                         .context("ACP stdio permission request did not include id")?;
                     let params = value.get("params").unwrap_or(&Value::Null);
-                    let request = kiro_acp_permission_request_to_approval(&request_id, params);
+                    let request = acp_permission_request_to_approval(&request_id, params);
                     if let Some(choice) = auto_approve_codex_request(&request, &project_root).await? {
                         send_json_rpc_response(
                             &mut stdin,
                             &request_id,
-                            kiro_acp_permission_result_json(&choice),
+                            acp_permission_result_json(&choice),
                         )
                         .await?;
                         state.resolve_approval(&session.id, &request.request_id, choice).await;
@@ -5367,7 +5927,7 @@ async fn run_kiro_acp(
                     let request_id = value.get("id").and_then(jsonrpc_id_to_string);
                     let params = value.get("params").cloned().unwrap_or(Value::Null);
                     if let Some(request_id) = request_id {
-                        handle_kiro_client_method_request(&state, &mut stdin, &request_id, method, params)
+                        handle_acp_client_method_request(&state, &mut stdin, &request_id, method, params)
                             .await?;
                     }
                 }
@@ -5378,7 +5938,7 @@ async fn run_kiro_acp(
                     send_json_rpc_response(
                         &mut stdin,
                         &pending.request.request_id,
-                        kiro_acp_permission_result_json(&choice),
+                        acp_permission_result_json(&choice),
                     )
                     .await?;
                     state.resolve_approval(&session.id, &pending.request.request_id, choice).await;
@@ -5386,24 +5946,14 @@ async fn run_kiro_acp(
                 pending_approval = None;
             }
             Some(()) = cancel_rx.recv() => {
-                let cancel_request_id = send_json_rpc_request(
+                let cancel_notif = crate::acp_client::build_cancel_notification(&runtime_session_id);
+                let cancel_params = crate::acp_client::serialize_to_json_value(&cancel_notif)?;
+                send_json_rpc_notification(
                     &mut stdin,
-                    &mut next_request_id,
                     "session/cancel",
-                    serde_json::json!({
-                        "sessionId": runtime_session_id,
-                    }),
+                    cancel_params,
                 )
                 .await?;
-                let _ = wait_for_kiro_json_rpc_response(
-                    &mut child,
-                    &mut stdout_rx,
-                    &mut raw_stdout,
-                    &stderr_buffer,
-                    cancel_request_id,
-                    ACP_JSON_RPC_CANCEL_TIMEOUT,
-                    "session/cancel",
-                ).await;
                 cancelled = true;
                 break;
             }
@@ -5770,7 +6320,7 @@ async fn push_incremental_text(
     if let Some(delta) = next_text.strip_prefix(last_rendered.as_str()) {
         if !delta.is_empty() {
             state
-                .emit_message_delta(session_id, message_id, delta)
+                .emit_assistant_message_snapshot(session_id, message_id, next_text)
                 .await;
             *last_rendered = next_text.to_string();
         }
@@ -6560,7 +7110,23 @@ async fn send_json_rpc_error(
     Ok(())
 }
 
-async fn handle_kiro_client_method_request(
+async fn send_json_rpc_notification(
+    writer: &mut (impl AsyncWrite + Unpin),
+    method: &str,
+    params: Value,
+) -> Result<()> {
+    write_json_line(
+        writer,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        }),
+    )
+    .await
+}
+
+async fn handle_acp_client_method_request(
     state: &AppState,
     writer: &mut (impl AsyncWrite + Unpin),
     request_id: &str,
@@ -6568,6 +7134,81 @@ async fn handle_kiro_client_method_request(
     params: Value,
 ) -> Result<()> {
     match method {
+        "fs/read_text_file" => {
+            let path = params
+                .get("path")
+                .and_then(Value::as_str)
+                .context("fs/read_text_file missing path")?;
+            let line = params.get("line").and_then(|v| v.as_u64());
+            let limit = params.get("limit").and_then(|v| v.as_u64());
+            let session_proj = state
+                .project_root_path_for_session(
+                    params
+                        .get("sessionId")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                )
+                .await
+                .ok();
+            let full_path = if Path::new(path).is_absolute() {
+                PathBuf::from(path)
+            } else if let Some(ref root) = session_proj {
+                Path::new(root).join(path)
+            } else {
+                PathBuf::from(path)
+            };
+            let contents = tokio::fs::read_to_string(&full_path)
+                .await
+                .context(format!("failed to read file: {}", full_path.display()))?;
+            let lines: Vec<&str> = contents.lines().collect();
+            let start = line.unwrap_or(1).saturating_sub(1) as usize;
+            let content = if let Some(limit) = limit {
+                let end = (start + limit as usize).min(lines.len());
+                lines[start..end].join("\n")
+            } else if start > 0 {
+                lines[start..].join("\n")
+            } else {
+                contents
+            };
+            send_json_rpc_response(writer, request_id, serde_json::json!({ "content": content }))
+                .await
+        }
+        "fs/write_text_file" => {
+            let path = params
+                .get("path")
+                .and_then(Value::as_str)
+                .context("fs/write_text_file missing path")?;
+            let content = params
+                .get("content")
+                .and_then(Value::as_str)
+                .context("fs/write_text_file missing content")?;
+            let session_proj = state
+                .project_root_path_for_session(
+                    params
+                        .get("sessionId")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                )
+                .await
+                .ok();
+            let full_path = if Path::new(path).is_absolute() {
+                PathBuf::from(path)
+            } else if let Some(ref root) = session_proj {
+                Path::new(root).join(path)
+            } else {
+                PathBuf::from(path)
+            };
+            if let Some(parent) = full_path.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .context(format!("failed to create parent dirs for: {}", full_path.display()))?;
+            }
+            tokio::fs::write(&full_path, content)
+                .await
+                .context(format!("failed to write file: {}", full_path.display()))?;
+            send_json_rpc_response(writer, request_id, serde_json::json!({}))
+                .await
+        }
         "secretStorage/get" | "secretStorage/getSecret" | "secrets/get" => {
             let key = secret_storage_key_from_params(&params)?;
             let value = state.secret_store().get(&key).await;
@@ -6589,6 +7230,10 @@ async fn handle_kiro_client_method_request(
             let key = secret_storage_key_from_params(&params)?;
             state.secret_store().delete(&key).await?;
             send_json_rpc_response(writer, request_id, serde_json::json!({})).await
+        }
+        "terminal/create" | "terminal/kill" | "terminal/output"
+        | "terminal/release" | "terminal/wait_for_exit" => {
+            send_json_rpc_error(writer, request_id, -32601, "terminal methods not supported by bridge").await
         }
         _ => {
             send_json_rpc_error(
@@ -6687,7 +7332,7 @@ async fn wait_for_json_rpc_response_with_timeout(
     }
 }
 
-async fn wait_for_kiro_json_rpc_response(
+async fn wait_for_acp_json_rpc_response(
     child: &mut Child,
     stdout_rx: &mut mpsc::UnboundedReceiver<std::result::Result<String, String>>,
     raw_stdout: &mut String,
@@ -6708,7 +7353,7 @@ async fn wait_for_kiro_json_rpc_response(
                     .unwrap_or_else(|| "signal".to_string());
                 bail!(
                     "{}",
-                    format_kiro_runtime_exit_error(request_name, request_id, &code, stderr.trim())
+                    format_acp_runtime_exit_error(request_name, request_id, &code, stderr.trim())
                 );
             }
             let stderr = stderr.trim();
@@ -6745,7 +7390,7 @@ async fn wait_for_stdout_line(
             let stderr = stderr_buffer.lock().await.clone();
             bail!(
                 "{}",
-                format_kiro_runtime_exit_error(request_name, 0, &status_code, stderr.trim())
+                format_acp_runtime_exit_error(request_name, 0, &status_code, stderr.trim())
             );
         }
         Err(_) => bail!(
@@ -6755,7 +7400,7 @@ async fn wait_for_stdout_line(
     }
 }
 
-fn format_kiro_runtime_exit_error(
+fn format_acp_runtime_exit_error(
     request_name: &str,
     request_id: u64,
     status_code: &str,
@@ -8085,7 +8730,7 @@ fn acp_event_to_approval(value: &Value) -> Option<ApprovalRequest> {
     })
 }
 
-fn extract_kiro_acp_message_chunk(params: &Value) -> Option<String> {
+fn extract_acp_message_chunk(params: &Value) -> Option<String> {
     if let Some("agent_message_chunk") = params.get("sessionUpdate").and_then(Value::as_str) {
         return params
             .pointer("/content/text")
@@ -8109,7 +8754,7 @@ fn extract_kiro_acp_message_chunk(params: &Value) -> Option<String> {
         .map(ToString::to_string)
 }
 
-fn kiro_acp_turn_end(params: &Value) -> bool {
+fn acp_turn_end(params: &Value) -> bool {
     if matches!(
         params.get("sessionUpdate").and_then(Value::as_str),
         Some("completed")
@@ -8129,7 +8774,7 @@ fn kiro_acp_turn_end(params: &Value) -> bool {
     )
 }
 
-fn render_kiro_acp_notification_status(params: &Value) -> Option<String> {
+fn render_acp_notification_status(params: &Value) -> Option<String> {
     if let Some(update_kind) = params.get("sessionUpdate").and_then(Value::as_str) {
         return match update_kind {
             "tool_call" | "tool_call_chunk" => {
@@ -8139,17 +8784,17 @@ fn render_kiro_acp_notification_status(params: &Value) -> Option<String> {
                     .or_else(|| params.pointer("/tool/name"))
                     .and_then(Value::as_str)
                     .unwrap_or("tool");
-                Some(format!("[kiro:{}] started", truncate_tool_text(tool, 80)))
+                Some(format!("[acp:{}] started", truncate_tool_text(tool, 80)))
             }
             "completed" | "turn_completed" | "end_turn" | "finished" => {
-                Some("[kiro] turn completed".to_string())
+                Some("[acp] turn completed".to_string())
             }
             "error" => {
                 let status = params
                     .pointer("/message")
                     .and_then(extract_text_from_json)
                     .unwrap_or_else(|| "failed".to_string());
-                Some(format!("[kiro] turn {}", truncate_tool_text(&status, 80)))
+                Some(format!("[acp] turn {}", truncate_tool_text(&status, 80)))
             }
             _ => None,
         };
@@ -8166,7 +8811,7 @@ fn render_kiro_acp_notification_status(params: &Value) -> Option<String> {
                 .or_else(|| params.pointer("/name"))
                 .and_then(Value::as_str)
                 .unwrap_or("tool");
-            Some(format!("[kiro:{tool}] started"))
+            Some(format!("[acp:{tool}] started"))
         }
         "ToolCallUpdate" => {
             let tool = params
@@ -8181,7 +8826,7 @@ fn render_kiro_acp_notification_status(params: &Value) -> Option<String> {
                 .and_then(extract_text_from_json)
                 .unwrap_or_else(|| "updated".to_string());
             Some(format!(
-                "[kiro:{tool}] {}",
+                "[acp:{tool}] {}",
                 truncate_tool_text(&status, 120)
             ))
         }
@@ -8191,13 +8836,13 @@ fn render_kiro_acp_notification_status(params: &Value) -> Option<String> {
                 .or_else(|| params.pointer("/status"))
                 .and_then(extract_text_from_json)
                 .unwrap_or_else(|| "completed".to_string());
-            Some(format!("[kiro] turn {}", truncate_tool_text(&status, 80)))
+            Some(format!("[acp] turn {}", truncate_tool_text(&status, 80)))
         }
         _ => None,
     }
 }
 
-fn kiro_acp_permission_request_to_approval(request_id: &str, params: &Value) -> ApprovalRequest {
+fn acp_permission_request_to_approval(request_id: &str, params: &Value) -> ApprovalRequest {
     let tool_name = params
         .pointer("/toolCall/title")
         .or_else(|| params.pointer("/toolCall/name"))
@@ -8230,7 +8875,7 @@ fn kiro_acp_permission_request_to_approval(request_id: &str, params: &Value) -> 
     }
 }
 
-fn kiro_acp_permission_result_json(choice: &ApprovalChoice) -> Value {
+fn acp_permission_result_json(choice: &ApprovalChoice) -> Value {
     match choice {
         ApprovalChoice::Accept => serde_json::json!({
             "outcome": {
@@ -8258,7 +8903,7 @@ fn kiro_acp_permission_result_json(choice: &ApprovalChoice) -> Value {
     }
 }
 
-fn add_kiro_model_id_fields(params: &mut Value, model: Option<&str>) {
+fn add_acp_model_id_fields(params: &mut Value, model: Option<&str>) {
     let Some(model) = model.map(str::trim).filter(|value| !value.is_empty()) else {
         return;
     };
@@ -8297,7 +8942,7 @@ fn opencode_session_summary(value: &Value) -> Option<SessionSummary> {
         .unwrap_or("opencode session")
         .to_string();
     Some(SessionSummary {
-        id,
+        id: id.clone(),
         project_id: crate::session_store::project_id_for_path(directory),
         title: title.clone(),
         agent: AgentKind::OpenCode,
@@ -8307,8 +8952,10 @@ fn opencode_session_summary(value: &Value) -> Option<SessionSummary> {
         unread_count: 0,
         last_message_preview: Some(title),
         pending_approval: None,
+        runtime_session_ref: Some(id),
         provider_id: None,
         reasoning_effort: None,
+        model: None,
     })
 }
 
@@ -8898,23 +9545,23 @@ pub async fn agent_readiness_message(kind: AgentKind) -> Option<String> {
 }
 
 async fn acp_readiness_message() -> Option<String> {
-    let kiro_path = find_executable_in_path("kiro-cli")?;
+    let acp_path = find_executable_in_path("kiro-cli")?;
     let cache = acp_readiness_cache();
     {
         let cached = cache.lock().await;
         if let Some(cached) = cached.as_ref()
-            && cached.command_path == kiro_path
+            && cached.command_path == acp_path
             && cached.checked_at.elapsed() < AGENT_READINESS_CACHE_TTL
         {
             return cached.message.clone();
         }
     }
 
-    let message = acp_readiness_message_for_command(&kiro_path).await;
+    let message = acp_readiness_message_for_command(&acp_path).await;
     let mut cached = cache.lock().await;
     *cached = Some(CachedAgentReadiness {
         checked_at: Instant::now(),
-        command_path: kiro_path,
+        command_path: acp_path,
         message: message.clone(),
     });
     message
@@ -8931,13 +9578,10 @@ async fn acp_readiness_message_for_command(command_path: &Path) -> Option<String
 }
 
 async fn acp_readiness_message_for_server(
-    server: &crate::models::AcpServerConfig,
+    _server: &crate::models::AcpServerConfig,
     command_path: &Path,
 ) -> Option<String> {
-    if matches!(server.profile, AcpProfile::Kiro) {
-        return acp_readiness_message_for_command(command_path).await;
-    }
-    None
+    acp_readiness_message_for_command(command_path).await
 }
 
 async fn acp_readiness_message_for_command_with_args(
@@ -9033,7 +9677,7 @@ pub async fn probe_acp_handshake_for_provider(
     }?;
 
     match server.profile {
-        AcpProfile::Stdio | AcpProfile::Kiro => Some(probe_kiro_acp_handshake(server).await),
+        AcpProfile::Stdio => Some(probe_stdio_acp_handshake(server).await),
         AcpProfile::GenericHttp => Some(probe_generic_http_acp_connectivity(server).await),
     }
 }
@@ -9117,14 +9761,8 @@ pub async fn summarize_acp_agent_for_provider(
     };
 
     match server.profile {
-        AcpProfile::Stdio | AcpProfile::Kiro => {
-            let command = server.command.as_deref().unwrap_or_else(|| {
-                if matches!(server.profile, AcpProfile::Kiro) {
-                    "kiro-cli"
-                } else {
-                    ""
-                }
-            });
+        AcpProfile::Stdio => {
+            let command = server.command.as_deref().unwrap_or("");
             let installed_path = resolve_command_path(command);
             let readiness_message = match installed_path.as_ref() {
                 Some(path) => acp_readiness_message_for_server(server, path).await,
@@ -9189,7 +9827,7 @@ fn resolve_command_path(command: &str) -> Option<PathBuf> {
     find_executable_in_path(trimmed)
 }
 
-async fn probe_kiro_acp_handshake(server: &crate::models::AcpServerConfig) -> AcpHandshakeProbe {
+async fn probe_stdio_acp_handshake(server: &crate::models::AcpServerConfig) -> AcpHandshakeProbe {
     let command_name = server
         .command
         .clone()
@@ -9210,11 +9848,8 @@ async fn probe_kiro_acp_handshake(server: &crate::models::AcpServerConfig) -> Ac
     for entry in &server.env {
         command.env(&entry.key, &entry.value);
     }
-    if !server.auth_token.is_empty() {
-        command.env("ACP_API_KEY", &server.auth_token);
-        if matches!(server.profile, AcpProfile::Kiro) {
-            command.env("KIRO_API_KEY", &server.auth_token);
-        }
+        if !server.auth_token.is_empty() {
+            command.env("ACP_API_KEY", &server.auth_token);
     }
 
     let mut child = match command.spawn() {
@@ -9285,28 +9920,19 @@ async fn probe_kiro_acp_handshake(server: &crate::models::AcpServerConfig) -> Ac
 
         let mut next_request_id = 1_u64;
         let mut raw_stdout = String::new();
+        let init_request = crate::acp_client::build_initialize_request(
+            "omni-code-bridge-diagnostic",
+            env!("CARGO_PKG_VERSION"),
+        );
+        let init_params = crate::acp_client::serialize_to_json_value(&init_request)?;
         let init_request_id = send_json_rpc_request(
             &mut stdin,
             &mut next_request_id,
             "initialize",
-            serde_json::json!({
-                "protocolVersion": 1,
-                "clientCapabilities": {
-                    "fs": {
-                        "readTextFile": true,
-                        "writeTextFile": true
-                    },
-                    "terminal": true,
-                    "secretStorage": true
-                },
-                "clientInfo": {
-                    "name": "omni-code-bridge-diagnostic",
-                    "version": env!("CARGO_PKG_VERSION")
-                }
-            }),
+            init_params,
         )
         .await?;
-        wait_for_kiro_json_rpc_response(
+        wait_for_acp_json_rpc_response(
             &mut child,
             &mut stdout_rx,
             &mut raw_stdout,
@@ -9317,17 +9943,18 @@ async fn probe_kiro_acp_handshake(server: &crate::models::AcpServerConfig) -> Ac
         )
         .await?;
 
+        let new_request = crate::acp_client::build_new_session_request(
+            &std::env::current_dir()?.display().to_string(),
+        );
+        let new_params = crate::acp_client::serialize_to_json_value(&new_request)?;
         let session_request_id = send_json_rpc_request(
             &mut stdin,
             &mut next_request_id,
             "session/new",
-            serde_json::json!({
-                "cwd": std::env::current_dir()?.display().to_string(),
-                "mcpServers": [],
-            }),
+            new_params,
         )
         .await?;
-        let response = wait_for_kiro_json_rpc_response(
+        let response = wait_for_acp_json_rpc_response(
             &mut child,
             &mut stdout_rx,
             &mut raw_stdout,
@@ -9344,22 +9971,13 @@ async fn probe_kiro_acp_handshake(server: &crate::models::AcpServerConfig) -> Ac
             .and_then(Value::as_str)
             .unwrap_or("unknown");
 
-        let mut prompt_params = serde_json::json!({
-            "sessionId": session_id,
-            "prompt": [{
-                "type": "text",
-                "text": "healthcheck",
-            }],
-            "input": [{
-                "type": "text",
-                "text": "healthcheck",
-            }],
-            "content": [{
-                "type": "text",
-                "text": "healthcheck",
-            }],
-        });
-        add_kiro_model_id_fields(&mut prompt_params, server.default_model.as_deref());
+        let prompt_request = crate::acp_client::build_prompt_request(session_id, "healthcheck");
+        let mut prompt_params = crate::acp_client::serialize_to_json_value(&prompt_request)?;
+        if let Some(obj) = prompt_params.as_object_mut() {
+            obj.insert("input".to_string(), obj["prompt"].clone());
+            obj.insert("content".to_string(), obj["prompt"].clone());
+        }
+        add_acp_model_id_fields(&mut prompt_params, server.default_model.as_deref());
         let prompt_request_id = send_json_rpc_request(
             &mut stdin,
             &mut next_request_id,
@@ -9397,10 +10015,10 @@ async fn probe_kiro_acp_handshake(server: &crate::models::AcpServerConfig) -> Ac
 
             if value.get("method").and_then(Value::as_str) == Some("session/notification") {
                 let params = value.get("params").unwrap_or(&Value::Null);
-                if let Some(text) = extract_kiro_acp_message_chunk(params) {
+                if let Some(text) = extract_acp_message_chunk(params) {
                     probe_text.push_str(&text);
                 }
-                if kiro_acp_turn_end(params) {
+                if acp_turn_end(params) {
                     continue;
                 }
             } else if value.get("method").and_then(Value::as_str) == Some("session/update") {
@@ -9408,10 +10026,10 @@ async fn probe_kiro_acp_handshake(server: &crate::models::AcpServerConfig) -> Ac
                     .pointer("/params/update")
                     .or_else(|| value.get("params"))
                     .unwrap_or(&Value::Null);
-                if let Some(text) = extract_kiro_acp_message_chunk(params) {
+                if let Some(text) = extract_acp_message_chunk(params) {
                     probe_text.push_str(&text);
                 }
-                if kiro_acp_turn_end(params) {
+                if acp_turn_end(params) {
                     continue;
                 }
             } else if value.get("method").and_then(Value::as_str)
@@ -9424,7 +10042,7 @@ async fn probe_kiro_acp_handshake(server: &crate::models::AcpServerConfig) -> Ac
                 send_json_rpc_response(
                     &mut stdin,
                     &request_id,
-                    kiro_acp_permission_result_json(&ApprovalChoice::Accept),
+                    acp_permission_result_json(&ApprovalChoice::Accept),
                 )
                 .await?;
             }

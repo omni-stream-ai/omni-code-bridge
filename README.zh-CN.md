@@ -63,6 +63,7 @@ Agent 二进制路径可以通过 `ECHO_MATE_CODEX_BIN` 和 `ECHO_MATE_OPENCODE_
 | `POST /client/messages` | 向项目/会话流程推送消息 |
 | `POST /devices/register` | 注册客户端设备以接收推送 |
 | `GET /files?path=...` | 返回已登记本地项目目录中的文件 |
+| `GET /sessions/{id}/messages` | 列出会话消息；支持 `limit`、`before_id`、`after_id` |
 | `GET /app-update/manifest` | APK 更新 manifest |
 | `GET /app-update/apk` | 下载最新 APK |
 | `GET /speech`, `GET /speech/models` | 本地语音模型管理 |
@@ -74,6 +75,15 @@ Agent 二进制路径可以通过 `ECHO_MATE_CODEX_BIN` 和 `ECHO_MATE_OPENCODE_
 | `GET /v1/models` | OpenAI 兼容模型列表 |
 | `POST /v1/audio/transcriptions` | OpenAI 兼容 ASR |
 | `POST /v1/audio/speech` | OpenAI 兼容 TTS |
+
+`GET /sessions/{id}/messages` 按存储顺序返回消息。未传 cursor 时返回最新一页：
+`limit` 默认 `50`，并限制在 `1..=200`，因此正在生成中的 assistant 回复会保留在默认页。
+`before_id` 返回某条消息之前的消息；`after_id` 返回某条消息之后的消息。
+`before_id` 和 `after_id` 不能同时使用。`limit` 按展示消息计数：每条 `user`
+消息算一条，连续的 agent 回复段算一条，即使其中包含多条 `assistant`/`system` 消息。响应为
+`data: { messages, has_more, next_cursor }`；
+向上翻历史时把 `next_cursor` 作为下一次请求的 `before_id`，轮询新消息时把它作为
+下一次请求的 `after_id`。
 
 ### Provider 选择
 

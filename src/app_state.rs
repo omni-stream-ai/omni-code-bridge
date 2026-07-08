@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
@@ -21,6 +21,7 @@ use crate::{
     bridge_settings::{BridgeSettings, BridgeSettingsStore},
     client_auth_store::ClientAuthStore,
     device_store::{load_device_registrations, save_device_registrations},
+    message_projection::MessageProjection,
     models::{
         AUTO_PROVIDER_ID, AgentErrorEvent, AgentKind, ApiFormat, ApprovalChoice, ApprovalRequest,
         ApprovalRequestEvent, ApprovalResolvedEvent, ChatMessage, ClientAuthRecord,
@@ -245,6 +246,57 @@ impl AppState {
             ),
             event_tx,
             providers: ProviderRegistry::new(),
+            settings: BridgeSettingsStore::load_from_path(settings_path).await,
+            speech: Arc::new(SpeechService::load().await),
+            client_auth: ClientAuthStore::load().await,
+            secret_store: SecretStore::load().await,
+            push: PushService::new(),
+            tts_stream_sessions: Mutex::new(HashMap::new()),
+            runtime_store_path,
+            session_metadata_store_path,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn new_with_paths_and_providers(
+        settings_path: PathBuf,
+        runtime_store_path: PathBuf,
+        session_metadata_store_path: PathBuf,
+        providers: ProviderRegistry,
+    ) -> Self {
+        let (event_tx, _) = broadcast::channel(256);
+        let persisted_runtime = load_persisted_runtime(&runtime_store_path).await;
+        let persisted_metadata =
+            load_persisted_session_metadata(&session_metadata_store_path).await;
+        Self {
+            projects: RwLock::new(HashMap::new()),
+            sessions: RwLock::new(HashMap::new()),
+            session_title_overrides: RwLock::new(
+                persisted_metadata
+                    .sessions
+                    .into_iter()
+                    .filter_map(|(session_id, entry)| {
+                        entry
+                            .title
+                            .map(|title| title.trim().to_string())
+                            .filter(|title| !title.is_empty())
+                            .map(|title| (session_id, title))
+                    })
+                    .collect(),
+            ),
+            messages: RwLock::new(HashMap::new()),
+            devices: RwLock::new(load_device_registrations()),
+            list_cache: Mutex::new(None),
+            runtime: Mutex::new(
+                persisted_runtime
+                    .into_iter()
+                    .map(|(session_id, value)| {
+                        (session_id, SessionRuntimeState::from_persisted(value))
+                    })
+                    .collect(),
+            ),
+            event_tx,
+            providers,
             settings: BridgeSettingsStore::load_from_path(settings_path).await,
             speech: Arc::new(SpeechService::load().await),
             client_auth: ClientAuthStore::load().await,
@@ -493,18 +545,30 @@ impl AppState {
         &self,
         mut sessions: Vec<SessionSummary>,
     ) -> Vec<SessionSummary> {
+        let local_session_ids = self
+            .sessions
+            .read()
+            .await
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
         let runtime = self.runtime.lock().await;
         for session in &mut sessions {
-            Self::apply_runtime_overlay(session, runtime.get(&session.id));
+            Self::apply_runtime_overlay(
+                session,
+                runtime.get(&session.id),
+                local_session_ids.contains(&session.id),
+            );
         }
         sessions
     }
 
     async fn with_runtime_approval(&self, mut session: SessionSummary) -> SessionSummary {
         session = self.overlay_persisted_session_title(session).await;
+        let is_local_session = self.sessions.read().await.contains_key(&session.id);
         let runtime = self.runtime.lock().await;
         let session_id = session.id.clone();
-        Self::apply_runtime_overlay(&mut session, runtime.get(&session_id));
+        Self::apply_runtime_overlay(&mut session, runtime.get(&session_id), is_local_session);
         session
     }
 
@@ -534,8 +598,15 @@ impl AppState {
             .cloned()
     }
 
-    fn apply_runtime_overlay(session: &mut SessionSummary, runtime: Option<&SessionRuntimeState>) {
+    fn apply_runtime_overlay(
+        session: &mut SessionSummary,
+        runtime: Option<&SessionRuntimeState>,
+        is_local_session: bool,
+    ) {
         session.pending_approval = runtime.and_then(|entry| entry.pending_approval.clone());
+        session.runtime_session_ref = runtime
+            .and_then(|entry| entry.provider_session_ref.clone())
+            .or_else(|| (!is_local_session).then(|| session.id.clone()));
         if session.pending_approval.is_some() {
             session.status = SessionStatus::AwaitingApproval;
         } else if runtime.map(Self::is_recoverable_runtime).unwrap_or(false)
@@ -559,12 +630,37 @@ impl AppState {
     }
 
     pub async fn list_messages(&self, session_id: &str) -> Option<Vec<ChatMessage>> {
-        if let Some(messages) = self.messages.read().await.get(session_id).cloned() {
-            return Some(messages);
-        }
         let session = self.find_session(session_id).await?;
         let provider = self.provider_for_agent(session.agent)?;
-        provider.list_messages(session_id).await
+        let provider_session_id = self
+            .provider_session_ref(session_id)
+            .await
+            .unwrap_or_else(|| session_id.to_string());
+        let provider_messages = provider
+            .list_messages(&provider_session_id)
+            .await
+            .map(|messages| MessageProjection::normalize_provider(session_id, messages));
+        let cached = self.messages.read().await.get(session_id).cloned();
+
+        match (cached, provider_messages) {
+            (Some(local), Some(remote)) => {
+                let merged = MessageProjection::from_sources(session_id, remote, local);
+                self.messages
+                    .write()
+                    .await
+                    .insert(session_id.to_string(), merged.clone());
+                Some(merged)
+            }
+            (Some(local), None) => Some(local),
+            (None, Some(remote)) => {
+                self.messages
+                    .write()
+                    .await
+                    .insert(session_id.to_string(), remote.clone());
+                Some(remote)
+            }
+            (None, None) => None,
+        }
     }
 
     pub async fn get_session(&self, session_id: &str) -> Option<SessionDetail> {
@@ -625,8 +721,10 @@ impl AppState {
             unread_count: 0,
             last_message_preview: Some("新会话已创建".to_string()),
             pending_approval: None,
+            runtime_session_ref: None,
             provider_id: input.provider_id,
             reasoning_effort: input.reasoning_effort,
+            model: None,
         };
 
         self.sessions
@@ -730,8 +828,10 @@ impl AppState {
             unread_count: 1,
             last_message_preview: Some(content.clone()),
             pending_approval: None,
+            runtime_session_ref: None,
             provider_id: None,
             reasoning_effort: None,
+            model: None,
         };
         let message = ChatMessage {
             id: Uuid::new_v4().to_string(),
@@ -827,25 +927,31 @@ impl AppState {
                     .filter(|p| p.enabled)
                     .filter(|p| is_format_compatible(&p.format))
                     .min_by_key(|p| p.priority)
-                    .map(|p| ResolvedProviderConfig {
-                        base_url: p.base_url.clone(),
-                        api_key: p.api_key.clone(),
-                        model: p.model.clone(),
-                        format: p.format,
-                        acp_profile: None,
-                        provider_id: Some(p.id.clone()),
-                        extra_headers: Vec::new(),
-                        acp_command: None,
-                        acp_args: Vec::new(),
-                        acp_env: Vec::new(),
-                        opencode_provider_name: match p.format {
-                            ApiFormat::AnthropicMessages => {
-                                Some("omni-bridge-anthropic".to_string())
-                            }
-                            ApiFormat::Codex => Some("omni-bridge-codex".to_string()),
-                            ApiFormat::Acp => Some("omni-bridge-acp".to_string()),
-                            _ => Some("omni-bridge".to_string()),
-                        },
+                    .map(|p| {
+                        let mut config = ResolvedProviderConfig {
+                            base_url: p.base_url.clone(),
+                            api_key: p.api_key.clone(),
+                            model: p.model.clone(),
+                            format: p.format,
+                            acp_profile: None,
+                            provider_id: Some(p.id.clone()),
+                            extra_headers: Vec::new(),
+                            acp_command: None,
+                            acp_args: Vec::new(),
+                            acp_env: Vec::new(),
+                            opencode_provider_name: match p.format {
+                                ApiFormat::AnthropicMessages => {
+                                    Some("omni-bridge-anthropic".to_string())
+                                }
+                                ApiFormat::Codex => Some("omni-bridge-codex".to_string()),
+                                ApiFormat::Acp => Some("omni-bridge-acp".to_string()),
+                                _ => Some("omni-bridge".to_string()),
+                            },
+                        };
+                        if let Some(model) = &session.model {
+                            config.model = Some(model.clone());
+                        }
+                        config
                     })
             };
 
@@ -855,26 +961,32 @@ impl AppState {
                 .iter()
                 .filter(|server| server.enabled)
                 .min_by_key(|server| server.priority)
-                .map(|server| ResolvedProviderConfig {
-                    base_url: server.endpoint.clone().unwrap_or_default(),
-                    api_key: server.auth_token.clone(),
-                    model: server.default_model.clone(),
-                    format: ApiFormat::Acp,
-                    acp_profile: Some(server.profile),
-                    provider_id: Some(server.id.clone()),
-                    extra_headers: server
-                        .headers
-                        .iter()
-                        .map(|header| (header.key.clone(), header.value.clone()))
-                        .collect(),
-                    acp_command: server.command.clone(),
-                    acp_args: server.args.clone(),
-                    acp_env: server
-                        .env
-                        .iter()
-                        .map(|entry| (entry.key.clone(), entry.value.clone()))
-                        .collect(),
-                    opencode_provider_name: Some("omni-bridge-acp".to_string()),
+                .map(|server| {
+                    let mut config = ResolvedProviderConfig {
+                        base_url: server.endpoint.clone().unwrap_or_default(),
+                        api_key: server.auth_token.clone(),
+                        model: server.default_model.clone(),
+                        format: ApiFormat::Acp,
+                        acp_profile: Some(server.profile),
+                        provider_id: Some(server.id.clone()),
+                        extra_headers: server
+                            .headers
+                            .iter()
+                            .map(|header| (header.key.clone(), header.value.clone()))
+                            .collect(),
+                        acp_command: server.command.clone(),
+                        acp_args: server.args.clone(),
+                        acp_env: server
+                            .env
+                            .iter()
+                            .map(|entry| (entry.key.clone(), entry.value.clone()))
+                            .collect(),
+                        opencode_provider_name: Some("omni-bridge-acp".to_string()),
+                    };
+                    if let Some(model) = &session.model {
+                        config.model = Some(model.clone());
+                    }
+                    config
                 })
         };
 
@@ -890,35 +1002,44 @@ impl AppState {
                         .acp_servers
                         .iter()
                         .find(|server| server.id == provider_id)
-                        .map(|server| ResolvedProviderConfig {
-                            base_url: server.endpoint.clone().unwrap_or_default(),
-                            api_key: server.auth_token.clone(),
-                            model: server.default_model.clone(),
-                            format: ApiFormat::Acp,
-                            acp_profile: Some(server.profile),
-                            provider_id: Some(server.id.clone()),
-                            extra_headers: server
-                                .headers
-                                .iter()
-                                .map(|header| (header.key.clone(), header.value.clone()))
-                                .collect(),
-                            acp_command: server.command.clone(),
-                            acp_args: server.args.clone(),
-                            acp_env: server
-                                .env
-                                .iter()
-                                .map(|entry| (entry.key.clone(), entry.value.clone()))
-                                .collect(),
-                            opencode_provider_name: Some("omni-bridge-acp".to_string()),
+                        .map(|server| {
+                            let mut config = ResolvedProviderConfig {
+                                base_url: server.endpoint.clone().unwrap_or_default(),
+                                api_key: server.auth_token.clone(),
+                                model: server.default_model.clone(),
+                                format: ApiFormat::Acp,
+                                acp_profile: Some(server.profile),
+                                provider_id: Some(server.id.clone()),
+                                extra_headers: server
+                                    .headers
+                                    .iter()
+                                    .map(|header| (header.key.clone(), header.value.clone()))
+                                    .collect(),
+                                acp_command: server.command.clone(),
+                                acp_args: server.args.clone(),
+                                acp_env: server
+                                    .env
+                                    .iter()
+                                    .map(|entry| (entry.key.clone(), entry.value.clone()))
+                                    .collect(),
+                                opencode_provider_name: Some("omni-bridge-acp".to_string()),
+                            };
+                            if let Some(model) = &session.model {
+                                config.model = Some(model.clone());
+                            }
+                            config
                         })
                     {
                         return Some(config);
                     }
                 }
-                if let Some(config) = self
+                if let Some(mut config) = self
                     .find_provider_by_id(&provider_id, agent, &settings)
                     .await
                 {
+                    if let Some(model) = &session.model {
+                        config.model = Some(model.clone());
+                    }
                     eprintln!(
                         "[provider] resolved explicit provider: base_url={} model={:?} format={:?}",
                         config.base_url, config.model, config.format
@@ -1229,27 +1350,28 @@ impl AppState {
     }
 
     pub async fn cancel_turn(&self, session_id: &str) -> Result<bool, String> {
+        let canonical_session_id = self.resolve_session_id(session_id).await;
         let session_snapshot = self
-            .find_session(session_id)
+            .find_session(&canonical_session_id)
             .await
             .ok_or_else(|| format!("unknown session: {session_id}"))?;
+        let runtime_session_ref = self.provider_session_ref(&canonical_session_id).await;
         let stale_running_without_runtime = matches!(
             session_snapshot.status,
             SessionStatus::Running | SessionStatus::AwaitingApproval
         );
-        let (abort_handle, cancel_tx, should_interrupt) = {
+        let (abort_handle, cancel_tx, should_interrupt, should_try_provider_cancel) = {
             let mut runtime = self.runtime.lock().await;
-            let runtime_existed = runtime.contains_key(session_id);
             let entry = runtime
-                .entry(session_id.to_string())
+                .entry(canonical_session_id.clone())
                 .or_insert_with(SessionRuntimeState::default);
             let abort_handle = entry.turn_abort.take();
             let cancel_tx = entry.cancel_tx.take();
             let had_active_turn = entry.turn_in_flight || abort_handle.is_some();
             let had_detached_running = Self::is_detached_running(entry);
-            let should_interrupt = had_active_turn
-                || had_detached_running
-                || (!runtime_existed && stale_running_without_runtime);
+            let should_interrupt =
+                had_active_turn || had_detached_running || stale_running_without_runtime;
+            let should_try_provider_cancel = runtime_session_ref.is_some() && !had_active_turn;
             entry.turn_in_flight = false;
             entry.approval_tx = None;
             entry.pending_approval = None;
@@ -1267,7 +1389,12 @@ impl AppState {
                     self.runtime_store_path.display()
                 );
             }
-            (abort_handle, cancel_tx, should_interrupt)
+            (
+                abort_handle,
+                cancel_tx,
+                should_interrupt,
+                should_try_provider_cancel,
+            )
         };
 
         if let Some(cancel_tx) = cancel_tx {
@@ -1279,22 +1406,34 @@ impl AppState {
             abort_handle.abort();
         }
 
-        if should_interrupt {
+        let provider_cancelled = if should_try_provider_cancel {
+            match self.provider_for_agent(session_snapshot.agent) {
+                Some(provider) => provider
+                    .cancel_session(&canonical_session_id, runtime_session_ref.as_deref())
+                    .await
+                    .map_err(|error| error.to_string())?,
+                None => false,
+            }
+        } else {
+            false
+        };
+
+        if should_interrupt || provider_cancelled {
             let preview = self
-                .latest_assistant_preview(session_id)
+                .latest_assistant_preview(&canonical_session_id)
                 .await
                 .or(Some("本次运行已中断，可继续发送消息恢复。".to_string()));
-            self.patch_session(session_id, SessionStatus::Interrupted, preview)
+            self.patch_session(&canonical_session_id, SessionStatus::Interrupted, preview)
                 .await;
             let _ = self
                 .event_tx
                 .send(SessionEvent::SessionStatus(SessionStatusEvent {
-                    session_id: session_id.to_string(),
+                    session_id: canonical_session_id.clone(),
                     status: SessionStatus::Interrupted,
                     error_message: None,
                 }));
         }
-        Ok(should_interrupt)
+        Ok(should_interrupt || provider_cancelled)
     }
 
     pub async fn submit_approval(
@@ -1404,14 +1543,20 @@ impl AppState {
         device
     }
 
-    pub async fn emit_message_delta(&self, session_id: &str, message_id: &str, delta: &str) {
+    pub async fn emit_assistant_message_snapshot(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        content: &str,
+    ) {
+        let content = content.to_string();
         {
             let mut messages = self.messages.write().await;
             if let Some(message) = messages
                 .get_mut(session_id)
                 .and_then(|items| items.iter_mut().find(|item| item.id == message_id))
             {
-                message.content.push_str(delta);
+                message.content = content.clone();
             }
         }
 
@@ -1420,7 +1565,7 @@ impl AppState {
             .send(SessionEvent::MessageDelta(MessageDeltaEvent {
                 session_id: session_id.to_string(),
                 message_id: message_id.to_string(),
-                delta: delta.to_string(),
+                delta: content,
             }));
     }
 
@@ -1446,19 +1591,37 @@ impl AppState {
         session_id: &str,
         message_id: &str,
     ) -> Result<(), String> {
-        let content = {
-            let messages = self.messages.read().await;
-            messages
+        let mut assistant_message = {
+            let mut messages = self.messages.write().await;
+            let message = messages
                 .get(session_id)
                 .and_then(|items| items.iter().find(|item| item.id == message_id))
-                .map(|message| message.content.clone())
-                .ok_or_else(|| format!("unknown message: {message_id}"))?
+                .cloned()
+                .ok_or_else(|| format!("unknown message: {message_id}"))?;
+            if let Some(stored) = messages
+                .get_mut(session_id)
+                .and_then(|items| items.iter_mut().find(|item| item.id == message_id))
+            {
+                stored.clone()
+            } else {
+                message
+            }
         };
+        if let Some(provider_message) = self
+            .refresh_provider_final_assistant_message(session_id, &assistant_message)
+            .await
+        {
+            assistant_message = provider_message;
+        }
+        let content = assistant_message.content.clone();
 
         self.patch_session(session_id, SessionStatus::Idle, Some(content.clone()))
             .await;
         self.clear_interrupted(session_id).await;
         self.clear_pending_approval(session_id).await;
+        let _ = self
+            .event_tx
+            .send(SessionEvent::MessageCreated(assistant_message));
         let _ = self
             .event_tx
             .send(SessionEvent::SessionStatus(SessionStatusEvent {
@@ -1479,6 +1642,86 @@ impl AppState {
                 .await;
         }
         Ok(())
+    }
+
+    async fn refresh_provider_final_assistant_message(
+        &self,
+        session_id: &str,
+        current: &ChatMessage,
+    ) -> Option<ChatMessage> {
+        let session = self.find_session(session_id).await?;
+        let provider = self.provider_for_agent(session.agent)?;
+        let provider_session_id = self
+            .provider_session_ref(session_id)
+            .await
+            .unwrap_or_else(|| session_id.to_string());
+        let provider_messages = provider.list_messages(&provider_session_id).await?;
+        let provider_messages =
+            MessageProjection::normalize_provider(session_id, provider_messages);
+        let provider_final = provider_messages
+            .iter()
+            .filter(|message| Self::is_final_assistant_candidate(current, message))
+            .max_by(|a, b| {
+                a.content
+                    .len()
+                    .cmp(&b.content.len())
+                    .then_with(|| a.created_at.cmp(&b.created_at))
+            })
+            .cloned()?;
+        if provider_final.content.len() < current.content.len() {
+            return None;
+        }
+        let final_message = ChatMessage {
+            id: current.id.clone(),
+            session_id: current.session_id.clone(),
+            role: current.role.clone(),
+            content: provider_final.content,
+            created_at: current.created_at,
+        };
+        let local_messages = self.messages.read().await.get(session_id).cloned()?;
+        let merged = local_messages
+            .into_iter()
+            .map(|message| {
+                if message.id == current.id {
+                    final_message.clone()
+                } else {
+                    message
+                }
+            })
+            .collect::<Vec<_>>();
+        self.messages
+            .write()
+            .await
+            .insert(session_id.to_string(), merged);
+        Some(final_message)
+    }
+
+    fn is_final_assistant_candidate(current: &ChatMessage, candidate: &ChatMessage) -> bool {
+        if current.role != MessageRole::Assistant || candidate.role != MessageRole::Assistant {
+            return false;
+        }
+        if current.session_id != candidate.session_id {
+            return false;
+        }
+        if current.id == candidate.id {
+            return true;
+        }
+        let seconds_apart = current
+            .created_at
+            .signed_duration_since(candidate.created_at)
+            .num_seconds()
+            .abs();
+        if seconds_apart > 10 * 60 {
+            return false;
+        }
+        let current_content = current.content.trim();
+        let candidate_content = candidate.content.trim();
+        if current_content.is_empty() || candidate_content.is_empty() {
+            return false;
+        }
+        candidate_content.starts_with(current_content)
+            || current_content.starts_with(candidate_content)
+            || current_content == candidate_content
     }
 
     pub async fn fail_session(&self, session_id: &str, message: String) {
@@ -1580,6 +1823,26 @@ impl AppState {
         let session = self.find_session(session_id).await?;
         let provider = self.provider_for_agent(session.agent)?;
         provider.default_runtime_ref(session_id).await
+    }
+
+    async fn resolve_session_id(&self, session_id: &str) -> String {
+        if self.sessions.read().await.contains_key(session_id) {
+            return session_id.to_string();
+        }
+
+        let runtime = self.runtime.lock().await;
+        if let Some(local_session_id) = runtime.iter().find_map(|(candidate_id, state)| {
+            (state.provider_session_ref.as_deref() == Some(session_id))
+                .then(|| candidate_id.clone())
+        }) {
+            drop(runtime);
+            if self.sessions.read().await.contains_key(&local_session_id) {
+                return local_session_id;
+            }
+            return session_id.to_string();
+        }
+
+        session_id.to_string()
     }
 
     async fn update_runtime_state<F>(&self, session_id: &str, update: F)
@@ -1788,13 +2051,24 @@ impl AppState {
     /// pre-seed it from the provider's archive so that later `list_messages`
     /// calls don't shadow the historical conversation.
     async fn ensure_inbox_seeded(&self, session_id: &str, agent: AgentKind) {
-        if self.messages.read().await.contains_key(session_id) {
+        if self
+            .messages
+            .read()
+            .await
+            .get(session_id)
+            .is_some_and(|messages| !messages.is_empty())
+        {
             return;
         }
         let Some(provider) = self.provider_for_agent(agent) else {
             return;
         };
-        if let Some(existing) = provider.list_messages(session_id).await {
+        let provider_session_id = self
+            .provider_session_ref(session_id)
+            .await
+            .unwrap_or_else(|| session_id.to_string());
+        if let Some(existing) = provider.list_messages(&provider_session_id).await {
+            let existing = MessageProjection::normalize_provider(session_id, existing);
             self.messages
                 .write()
                 .await
@@ -1850,6 +2124,7 @@ impl AppState {
         session_id: &str,
         provider_id: Option<Option<String>>,
         reasoning_effort: Option<Option<crate::models::ReasoningEffort>>,
+        model: Option<Option<String>>,
     ) -> Result<SessionSummary, String> {
         let mut sessions = self.sessions.write().await;
         let mut session = sessions.remove(session_id);
@@ -1863,6 +2138,9 @@ impl AppState {
         }
         if let Some(reasoning_effort) = reasoning_effort {
             current.reasoning_effort = reasoning_effort;
+        }
+        if let Some(model) = model {
+            current.model = model;
         }
         current.updated_at = Utc::now();
         let project_id = current.project_id.clone();
@@ -2136,6 +2414,9 @@ impl AppState {
         mut local_session: SessionSummary,
         provider_session: SessionSummary,
     ) -> SessionSummary {
+        if local_session.runtime_session_ref.is_none() {
+            local_session.runtime_session_ref = provider_session.runtime_session_ref.clone();
+        }
         local_session.status =
             Self::preferred_session_status(local_session.status, provider_session.status);
 
@@ -2484,11 +2765,92 @@ fn message_title(content: &str) -> String {
 mod tests {
     use super::*;
     use crate::{
+        adapter::AgentProvider,
         bridge_settings::{AiApprovalSettings, BridgeSettingsInput},
-        models::{AUTO_PROVIDER_ID, AgentKind, ApiFormat, ModelProviderConfig, SessionSummary},
+        models::{
+            AUTO_PROVIDER_ID, AgentKind, ApiFormat, ChatMessage, MessageRole, ModelProviderConfig,
+            SessionSummary,
+        },
     };
+    use anyhow::Result;
+    use async_trait::async_trait;
     use chrono::Utc;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::{
+        collections::HashMap,
+        sync::Arc,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+    use tokio::sync::Mutex as TokioMutex;
+
+    struct TestMessageProvider {
+        sessions: TokioMutex<HashMap<String, SessionSummary>>,
+        messages: TokioMutex<HashMap<String, Vec<ChatMessage>>>,
+        cancelled: TokioMutex<Vec<(String, Option<String>)>>,
+    }
+
+    impl TestMessageProvider {
+        fn new(messages: HashMap<String, Vec<ChatMessage>>) -> Self {
+            Self {
+                sessions: TokioMutex::new(HashMap::new()),
+                messages: TokioMutex::new(messages),
+                cancelled: TokioMutex::new(Vec::new()),
+            }
+        }
+
+        async fn set_session(&self, session: SessionSummary) {
+            self.sessions
+                .lock()
+                .await
+                .insert(session.id.clone(), session);
+        }
+
+        async fn set_messages(&self, session_id: impl Into<String>, messages: Vec<ChatMessage>) {
+            self.messages
+                .lock()
+                .await
+                .insert(session_id.into(), messages);
+        }
+
+        async fn cancelled_sessions(&self) -> Vec<(String, Option<String>)> {
+            self.cancelled.lock().await.clone()
+        }
+    }
+
+    #[async_trait]
+    impl AgentProvider for TestMessageProvider {
+        async fn list_sessions(&self) -> HashMap<String, SessionSummary> {
+            self.sessions.lock().await.clone()
+        }
+
+        async fn list_messages(&self, session_id: &str) -> Option<Vec<ChatMessage>> {
+            self.messages.lock().await.get(session_id).cloned()
+        }
+
+        async fn cancel_session(
+            &self,
+            session_id: &str,
+            runtime_session_ref: Option<&str>,
+        ) -> Result<bool> {
+            self.cancelled.lock().await.push((
+                session_id.to_string(),
+                runtime_session_ref.map(str::to_string),
+            ));
+            Ok(true)
+        }
+
+        async fn run_session(
+            &self,
+            _state: Arc<AppState>,
+            _session: SessionSummary,
+            _input: ChatMessage,
+            _system_prompt: Option<String>,
+            _reply: ChatMessage,
+            _provider_config: Option<ResolvedProviderConfig>,
+            _reasoning_effort: Option<crate::models::ReasoningEffort>,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
 
     fn test_path(prefix: &str) -> PathBuf {
         let unique = SystemTime::now()
@@ -2503,6 +2865,35 @@ mod tests {
         let runtime_path = test_path(&format!("{prefix}-runtime"));
         let metadata_path = test_path(&format!("{prefix}-metadata"));
         AppState::new_with_paths(settings_path, runtime_path, metadata_path).await
+    }
+
+    async fn test_state_with_providers(prefix: &str, providers: ProviderRegistry) -> AppState {
+        let settings_path = test_path(&format!("{prefix}-settings"));
+        let runtime_path = test_path(&format!("{prefix}-runtime"));
+        let metadata_path = test_path(&format!("{prefix}-metadata"));
+        AppState::new_with_paths_and_providers(
+            settings_path,
+            runtime_path,
+            metadata_path,
+            providers,
+        )
+        .await
+    }
+
+    fn test_message(
+        id: &str,
+        session_id: &str,
+        role: MessageRole,
+        content: &str,
+        created_at: chrono::DateTime<Utc>,
+    ) -> ChatMessage {
+        ChatMessage {
+            id: id.to_string(),
+            session_id: session_id.to_string(),
+            role,
+            content: content.to_string(),
+            created_at,
+        }
     }
 
     #[tokio::test]
@@ -2551,6 +2942,477 @@ mod tests {
             second.as_ref().map(|value| value.token.as_str()),
             Some(session.token.as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn list_messages_refreshes_provider_messages_even_with_cached_session_messages() {
+        let now = Utc::now();
+        let provider = Arc::new(TestMessageProvider::new(HashMap::new()));
+        let registry = ProviderRegistry::from_map(HashMap::from([(
+            AgentKind::Custom,
+            provider.clone() as Arc<dyn AgentProvider>,
+        )]));
+        let state = test_state_with_providers("refresh-messages", registry).await;
+        let project = state
+            .create_project(CreateProjectInput {
+                name: "Project".to_string(),
+                root_path: std::env::temp_dir().to_string_lossy().to_string(),
+            })
+            .await;
+        let session = state
+            .create_session(CreateSessionInput {
+                project_id: project.id,
+                title: Some("Session".to_string()),
+                agent: AgentKind::Custom,
+                brief_reply_mode: false,
+                provider_id: None,
+                reasoning_effort: None,
+            })
+            .await
+            .expect("session should be created");
+
+        provider
+            .set_messages(
+                session.id.clone(),
+                vec![
+                    test_message("u1", &session.id, MessageRole::User, "hello", now),
+                    test_message(
+                        "a1",
+                        &session.id,
+                        MessageRole::Assistant,
+                        "new remote reply",
+                        now + chrono::TimeDelta::seconds(1),
+                    ),
+                ],
+            )
+            .await;
+
+        state.messages.write().await.insert(
+            session.id.clone(),
+            vec![test_message(
+                "u1",
+                &session.id,
+                MessageRole::User,
+                "hello",
+                now,
+            )],
+        );
+
+        let messages = state
+            .list_messages(&session.id)
+            .await
+            .expect("messages should exist");
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].id, "a1");
+        assert_eq!(messages[1].content, "new remote reply");
+    }
+
+    #[tokio::test]
+    async fn list_messages_uses_provider_session_ref_for_remote_history() {
+        let now = Utc::now();
+        let provider = Arc::new(TestMessageProvider::new(HashMap::new()));
+        let registry = ProviderRegistry::from_map(HashMap::from([(
+            AgentKind::Codex,
+            provider.clone() as Arc<dyn AgentProvider>,
+        )]));
+        let state = test_state_with_providers("remote-provider-session-ref", registry).await;
+        let project = state
+            .create_project(CreateProjectInput {
+                name: "Project".to_string(),
+                root_path: std::env::temp_dir().to_string_lossy().to_string(),
+            })
+            .await;
+        let session = state
+            .create_session(CreateSessionInput {
+                project_id: project.id,
+                title: Some("Session".to_string()),
+                agent: AgentKind::Codex,
+                brief_reply_mode: false,
+                provider_id: None,
+                reasoning_effort: None,
+            })
+            .await
+            .expect("session should be created");
+
+        state
+            .set_provider_session_ref(&session.id, Some("codex-thread-1".to_string()))
+            .await;
+
+        provider
+            .set_messages(
+                "codex-thread-1",
+                vec![
+                    test_message("u1", "codex-thread-1", MessageRole::User, "hello", now),
+                    test_message(
+                        "a1",
+                        "codex-thread-1",
+                        MessageRole::Assistant,
+                        "latest remote reply",
+                        now + chrono::TimeDelta::seconds(1),
+                    ),
+                ],
+            )
+            .await;
+
+        let messages = state
+            .list_messages(&session.id)
+            .await
+            .expect("messages should exist");
+        let cached = state
+            .messages
+            .read()
+            .await
+            .get(&session.id)
+            .cloned()
+            .expect("messages should be cached");
+
+        assert_eq!(messages.len(), 2);
+        assert!(
+            messages
+                .iter()
+                .all(|message| message.session_id == session.id)
+        );
+        assert_eq!(messages[1].content, "latest remote reply");
+        assert_eq!(cached.len(), messages.len());
+        assert!(
+            cached
+                .iter()
+                .all(|message| message.session_id == session.id)
+        );
+        assert_eq!(cached[1].content, "latest remote reply");
+    }
+
+    #[tokio::test]
+    async fn list_messages_deduplicates_equivalent_remote_and_local_messages() {
+        let now = Utc::now();
+        let provider = Arc::new(TestMessageProvider::new(HashMap::new()));
+        let registry = ProviderRegistry::from_map(HashMap::from([(
+            AgentKind::Codex,
+            provider.clone() as Arc<dyn AgentProvider>,
+        )]));
+        let state = test_state_with_providers("merge-equivalent-messages", registry).await;
+        let project = state
+            .create_project(CreateProjectInput {
+                name: "Project".to_string(),
+                root_path: std::env::temp_dir().to_string_lossy().to_string(),
+            })
+            .await;
+        let session = state
+            .create_session(CreateSessionInput {
+                project_id: project.id,
+                title: Some("Session".to_string()),
+                agent: AgentKind::Codex,
+                brief_reply_mode: false,
+                provider_id: None,
+                reasoning_effort: None,
+            })
+            .await
+            .expect("session should be created");
+
+        state
+            .set_provider_session_ref(&session.id, Some("codex-thread-1".to_string()))
+            .await;
+
+        provider
+            .set_messages(
+                "codex-thread-1",
+                vec![
+                    test_message(
+                        "remote-user",
+                        "codex-thread-1",
+                        MessageRole::User,
+                        "Repeat me once",
+                        now,
+                    ),
+                    test_message(
+                        "remote-assistant",
+                        "codex-thread-1",
+                        MessageRole::Assistant,
+                        "Only one assistant bubble",
+                        now + chrono::TimeDelta::seconds(1),
+                    ),
+                ],
+            )
+            .await;
+
+        state.messages.write().await.insert(
+            session.id.clone(),
+            vec![
+                test_message(
+                    "local-user",
+                    &session.id,
+                    MessageRole::User,
+                    "Repeat me once",
+                    now + chrono::TimeDelta::seconds(2),
+                ),
+                test_message(
+                    "local-assistant",
+                    &session.id,
+                    MessageRole::Assistant,
+                    "Only one assistant bubble",
+                    now + chrono::TimeDelta::seconds(3),
+                ),
+            ],
+        );
+
+        let messages = state
+            .list_messages(&session.id)
+            .await
+            .expect("messages should exist");
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].id, "local-user");
+        assert_eq!(messages[1].id, "local-assistant");
+        assert!(
+            messages
+                .iter()
+                .all(|message| message.session_id == session.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn list_messages_keeps_repeated_content_when_messages_are_not_close_in_time() {
+        let now = Utc::now();
+        let provider = Arc::new(TestMessageProvider::new(HashMap::new()));
+        let registry = ProviderRegistry::from_map(HashMap::from([(
+            AgentKind::Codex,
+            provider.clone() as Arc<dyn AgentProvider>,
+        )]));
+        let state = test_state_with_providers("merge-repeated-content", registry).await;
+        let project = state
+            .create_project(CreateProjectInput {
+                name: "Project".to_string(),
+                root_path: std::env::temp_dir().to_string_lossy().to_string(),
+            })
+            .await;
+        let session = state
+            .create_session(CreateSessionInput {
+                project_id: project.id,
+                title: Some("Session".to_string()),
+                agent: AgentKind::Codex,
+                brief_reply_mode: false,
+                provider_id: None,
+                reasoning_effort: None,
+            })
+            .await
+            .expect("session should be created");
+
+        state
+            .set_provider_session_ref(&session.id, Some("codex-thread-1".to_string()))
+            .await;
+
+        provider
+            .set_messages(
+                "codex-thread-1",
+                vec![test_message(
+                    "remote-user",
+                    "codex-thread-1",
+                    MessageRole::User,
+                    "continue",
+                    now,
+                )],
+            )
+            .await;
+
+        state.messages.write().await.insert(
+            session.id.clone(),
+            vec![test_message(
+                "local-user",
+                &session.id,
+                MessageRole::User,
+                "continue",
+                now + chrono::TimeDelta::minutes(30),
+            )],
+        );
+
+        let messages = state
+            .list_messages(&session.id)
+            .await
+            .expect("messages should exist");
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].id, "remote-user");
+        assert_eq!(messages[1].id, "local-user");
+    }
+
+    #[tokio::test]
+    async fn list_messages_preserves_in_flight_assistant_id_for_finish() {
+        let now = Utc::now();
+        let provider = Arc::new(TestMessageProvider::new(HashMap::new()));
+        let registry = ProviderRegistry::from_map(HashMap::from([(
+            AgentKind::Codex,
+            provider.clone() as Arc<dyn AgentProvider>,
+        )]));
+        let state = test_state_with_providers("preserve-in-flight-assistant", registry).await;
+        let project = state
+            .create_project(CreateProjectInput {
+                name: "Project".to_string(),
+                root_path: std::env::temp_dir().to_string_lossy().to_string(),
+            })
+            .await;
+        let session = state
+            .create_session(CreateSessionInput {
+                project_id: project.id,
+                title: Some("Session".to_string()),
+                agent: AgentKind::Codex,
+                brief_reply_mode: false,
+                provider_id: None,
+                reasoning_effort: None,
+            })
+            .await
+            .expect("session should be created");
+
+        state
+            .set_provider_session_ref(&session.id, Some("codex-thread-1".to_string()))
+            .await;
+        let local_assistant = test_message(
+            "local-assistant",
+            &session.id,
+            MessageRole::Assistant,
+            "I will inspect the workspace and then commit.",
+            now,
+        );
+        state.messages.write().await.insert(
+            session.id.clone(),
+            vec![
+                test_message("local-user", &session.id, MessageRole::User, "commit", now),
+                local_assistant.clone(),
+            ],
+        );
+        provider
+            .set_messages(
+                "codex-thread-1",
+                vec![
+                    test_message("remote-user", "codex-thread-1", MessageRole::User, "commit", now),
+                    test_message(
+                        "remote-assistant",
+                        "codex-thread-1",
+                        MessageRole::Assistant,
+                        "I will inspect the workspace and then commit. Current branch is feat/desktop.",
+                        now + chrono::TimeDelta::seconds(3),
+                    ),
+                ],
+            )
+            .await;
+
+        let messages = state
+            .list_messages(&session.id)
+            .await
+            .expect("messages should exist");
+        let assistant = messages
+            .iter()
+            .find(|message| message.role == MessageRole::Assistant)
+            .expect("assistant should exist");
+        assert_eq!(assistant.id, local_assistant.id);
+        assert_eq!(
+            assistant.content,
+            "I will inspect the workspace and then commit. Current branch is feat/desktop."
+        );
+
+        state
+            .finish_assistant_message(&session.id, &local_assistant.id)
+            .await
+            .expect("original in-flight assistant id should still finish");
+    }
+
+    #[tokio::test]
+    async fn send_message_ignores_client_message_id_for_server_message_identity() {
+        let state = Arc::new(test_state("client-message-id").await);
+        let project = state
+            .create_project(CreateProjectInput {
+                name: "Project".to_string(),
+                root_path: std::env::temp_dir().to_string_lossy().to_string(),
+            })
+            .await;
+        let session = state
+            .create_session(CreateSessionInput {
+                project_id: project.id,
+                title: Some("Session".to_string()),
+                agent: AgentKind::Custom,
+                brief_reply_mode: false,
+                provider_id: None,
+                reasoning_effort: None,
+            })
+            .await
+            .expect("session should be created");
+
+        let (user_message, echoed_reply) = state
+            .send_message(
+                &session.id,
+                SendMessageInput {
+                    content: "hello".to_string(),
+                    input_mode: InputMode::Text,
+                    system_prompt: None,
+                    client_message_id: Some("local-user-123".to_string()),
+                    provider_id: None,
+                    reasoning_effort: None,
+                },
+            )
+            .await
+            .expect("message should send");
+
+        assert_ne!(user_message.id, "local-user-123");
+        assert_eq!(echoed_reply.id, user_message.id);
+    }
+
+    #[tokio::test]
+    async fn ensure_inbox_seeded_uses_provider_session_ref_and_normalizes_messages() {
+        let now = Utc::now();
+        let provider = Arc::new(TestMessageProvider::new(HashMap::new()));
+        let registry = ProviderRegistry::from_map(HashMap::from([(
+            AgentKind::Codex,
+            provider.clone() as Arc<dyn AgentProvider>,
+        )]));
+        let state = test_state_with_providers("seed-provider-session-ref", registry).await;
+        let project = state
+            .create_project(CreateProjectInput {
+                name: "Project".to_string(),
+                root_path: std::env::temp_dir().to_string_lossy().to_string(),
+            })
+            .await;
+        let session = state
+            .create_session(CreateSessionInput {
+                project_id: project.id,
+                title: Some("Session".to_string()),
+                agent: AgentKind::Codex,
+                brief_reply_mode: false,
+                provider_id: None,
+                reasoning_effort: None,
+            })
+            .await
+            .expect("session should be created");
+
+        state
+            .set_provider_session_ref(&session.id, Some("codex-thread-1".to_string()))
+            .await;
+
+        provider
+            .set_messages(
+                "codex-thread-1",
+                vec![test_message(
+                    "u1",
+                    "codex-thread-1",
+                    MessageRole::User,
+                    "hello",
+                    now,
+                )],
+            )
+            .await;
+
+        state
+            .ensure_inbox_seeded(&session.id, AgentKind::Codex)
+            .await;
+
+        let cached = state
+            .messages
+            .read()
+            .await
+            .get(&session.id)
+            .cloned()
+            .expect("messages should be seeded");
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].session_id, session.id);
     }
 
     #[test]
@@ -2640,8 +3502,10 @@ mod tests {
                     unread_count: 0,
                     last_message_preview: Some("local".to_string()),
                     pending_approval: None,
+                    runtime_session_ref: None,
                     provider_id: None,
                     reasoning_effort: None,
+                    model: None,
                 },
             ),
             (
@@ -2657,8 +3521,10 @@ mod tests {
                     unread_count: 0,
                     last_message_preview: Some("archived".to_string()),
                     pending_approval: None,
+                    runtime_session_ref: None,
                     provider_id: None,
                     reasoning_effort: None,
+                    model: None,
                 },
             ),
             (
@@ -2674,8 +3540,10 @@ mod tests {
                     unread_count: 1,
                     last_message_preview: Some("provider".to_string()),
                     pending_approval: None,
+                    runtime_session_ref: Some(provider_session_id.clone()),
                     provider_id: None,
                     reasoning_effort: None,
+                    model: None,
                 },
             ),
         ]);
@@ -2739,8 +3607,10 @@ mod tests {
             unread_count: 0,
             last_message_preview: None,
             pending_approval: None,
+            runtime_session_ref: None,
             provider_id: None,
             reasoning_effort: None,
+            model: None,
         };
 
         let resolved = state.resolve_provider_config(&session, &None).await;
@@ -2785,6 +3655,200 @@ mod tests {
             .expect("session detail should exist");
 
         assert!(matches!(detail.session.status, SessionStatus::Interrupted));
+        assert_eq!(
+            detail.session.runtime_session_ref.as_deref(),
+            Some("codex-thread")
+        );
+    }
+
+    #[tokio::test]
+    async fn finish_assistant_message_broadcasts_complete_message_snapshot() {
+        let state = test_state("finish-assistant-snapshot").await;
+        let project = state
+            .create_project(CreateProjectInput {
+                name: "Project".to_string(),
+                root_path: std::env::temp_dir().to_string_lossy().to_string(),
+            })
+            .await;
+        let session = state
+            .create_session(CreateSessionInput {
+                project_id: project.id,
+                title: Some("Session".to_string()),
+                agent: AgentKind::Codex,
+                brief_reply_mode: false,
+                provider_id: None,
+                reasoning_effort: None,
+            })
+            .await
+            .expect("session should be created");
+        let assistant_message = ChatMessage {
+            id: "assistant-message".to_string(),
+            session_id: session.id.clone(),
+            role: MessageRole::Assistant,
+            content: String::new(),
+            created_at: Utc::now(),
+        };
+        state.push_message(assistant_message.clone()).await;
+        let mut events = state.subscribe();
+
+        state
+            .emit_assistant_message_snapshot(&session.id, &assistant_message.id, "hello ")
+            .await;
+        state
+            .emit_assistant_message_snapshot(&session.id, &assistant_message.id, "hello world")
+            .await;
+        state
+            .finish_assistant_message(&session.id, &assistant_message.id)
+            .await
+            .expect("assistant message should finish");
+
+        let mut saw_complete_message = false;
+        let mut saw_idle_status_after_complete_message = false;
+        for _ in 0..4 {
+            match events.recv().await.expect("event should be broadcast") {
+                SessionEvent::MessageCreated(message) if message.id == assistant_message.id => {
+                    assert_eq!(message.content, "hello world");
+                    saw_complete_message = true;
+                }
+                SessionEvent::SessionStatus(event)
+                    if event.session_id == session.id
+                        && matches!(event.status, SessionStatus::Idle)
+                        && saw_complete_message =>
+                {
+                    saw_idle_status_after_complete_message = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        assert!(saw_complete_message);
+        assert!(saw_idle_status_after_complete_message);
+    }
+
+    #[tokio::test]
+    async fn finish_assistant_message_refreshes_provider_final_snapshot() {
+        let now = Utc::now();
+        let provider = Arc::new(TestMessageProvider::new(HashMap::new()));
+        let registry = ProviderRegistry::from_map(HashMap::from([(
+            AgentKind::Codex,
+            provider.clone() as Arc<dyn AgentProvider>,
+        )]));
+        let state = test_state_with_providers("finish-provider-final-snapshot", registry).await;
+        let project = state
+            .create_project(CreateProjectInput {
+                name: "Project".to_string(),
+                root_path: std::env::temp_dir().to_string_lossy().to_string(),
+            })
+            .await;
+        let session = state
+            .create_session(CreateSessionInput {
+                project_id: project.id,
+                title: Some("Session".to_string()),
+                agent: AgentKind::Codex,
+                brief_reply_mode: false,
+                provider_id: None,
+                reasoning_effort: None,
+            })
+            .await
+            .expect("session should be created");
+        state
+            .set_provider_session_ref(&session.id, Some("codex-thread-1".to_string()))
+            .await;
+        let assistant_message = ChatMessage {
+            id: "local-assistant".to_string(),
+            session_id: session.id.clone(),
+            role: MessageRole::Assistant,
+            content: "partial answer".to_string(),
+            created_at: now,
+        };
+        state.push_message(assistant_message.clone()).await;
+        provider
+            .set_messages(
+                "codex-thread-1",
+                vec![test_message(
+                    "provider-assistant",
+                    "codex-thread-1",
+                    MessageRole::Assistant,
+                    "partial answer with final tail",
+                    now + chrono::TimeDelta::seconds(2),
+                )],
+            )
+            .await;
+        let mut events = state.subscribe();
+
+        state
+            .finish_assistant_message(&session.id, &assistant_message.id)
+            .await
+            .expect("assistant message should finish");
+
+        let mut saw_final_message = false;
+        for _ in 0..3 {
+            if let SessionEvent::MessageCreated(message) =
+                events.recv().await.expect("event should be broadcast")
+            {
+                if message.role == MessageRole::Assistant {
+                    assert_eq!(message.content, "partial answer with final tail");
+                    assert_eq!(message.created_at, now);
+                    saw_final_message = true;
+                    break;
+                }
+            }
+        }
+
+        assert!(saw_final_message);
+        let messages = state
+            .list_messages(&session.id)
+            .await
+            .expect("messages should exist");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "partial answer with final tail");
+        assert_eq!(messages[0].created_at, now);
+    }
+
+    #[tokio::test]
+    async fn list_and_detail_expose_runtime_session_ref() {
+        let state = test_state("runtime-session-ref").await;
+        let project = state
+            .create_project(CreateProjectInput {
+                name: "Project".to_string(),
+                root_path: std::env::temp_dir().to_string_lossy().to_string(),
+            })
+            .await;
+        let session = state
+            .create_session(CreateSessionInput {
+                project_id: project.id,
+                title: Some("Session".to_string()),
+                agent: AgentKind::OpenCode,
+                brief_reply_mode: false,
+                provider_id: None,
+                reasoning_effort: None,
+            })
+            .await
+            .expect("session should be created");
+
+        state
+            .set_provider_session_ref(&session.id, Some("opencode-session-1".to_string()))
+            .await;
+
+        let listed = state.list_sessions().await;
+        let listed_session = listed
+            .into_iter()
+            .find(|item| item.id == session.id)
+            .expect("session should appear in list");
+        assert_eq!(
+            listed_session.runtime_session_ref.as_deref(),
+            Some("opencode-session-1")
+        );
+
+        let detail = state
+            .get_session(&session.id)
+            .await
+            .expect("session detail should exist");
+        assert_eq!(
+            detail.session.runtime_session_ref.as_deref(),
+            Some("opencode-session-1")
+        );
     }
 
     #[tokio::test]
@@ -2809,7 +3873,7 @@ mod tests {
             .expect("session should be created");
 
         let updated = state
-            .update_session_settings(&session.id, None, Some(None))
+            .update_session_settings(&session.id, None, Some(None), None)
             .await
             .expect("session should update");
         assert_eq!(updated.reasoning_effort, None);
@@ -2918,8 +3982,10 @@ mod tests {
                 unread_count: 0,
                 last_message_preview: None,
                 pending_approval: None,
+                runtime_session_ref: None,
                 provider_id: None,
                 reasoning_effort: None,
+                model: None,
             })
             .await;
 
@@ -3015,6 +4081,131 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancel_turn_resolves_provider_session_ref_to_local_session() {
+        let now = Utc::now();
+        let provider = Arc::new(TestMessageProvider::new(HashMap::new()));
+        let registry = ProviderRegistry::from_map(HashMap::from([(
+            AgentKind::Codex,
+            provider.clone() as Arc<dyn AgentProvider>,
+        )]));
+        let state = test_state_with_providers("cancel-provider-ref", registry).await;
+        let project = state
+            .create_project(CreateProjectInput {
+                name: "Project".to_string(),
+                root_path: std::env::temp_dir().to_string_lossy().to_string(),
+            })
+            .await;
+        let session = state
+            .create_session(CreateSessionInput {
+                project_id: project.id,
+                title: Some("Session".to_string()),
+                agent: AgentKind::Codex,
+                brief_reply_mode: false,
+                provider_id: None,
+                reasoning_effort: None,
+            })
+            .await
+            .expect("session should be created");
+
+        state
+            .patch_session(
+                &session.id,
+                SessionStatus::Running,
+                Some("running".to_string()),
+            )
+            .await;
+        state
+            .set_provider_session_ref(&session.id, Some("codex-thread".to_string()))
+            .await;
+        provider
+            .set_session(SessionSummary {
+                id: "codex-thread".to_string(),
+                project_id: session.project_id.clone(),
+                title: "Provider thread".to_string(),
+                agent: AgentKind::Codex,
+                brief_reply_mode: false,
+                status: SessionStatus::Running,
+                updated_at: Utc::now(),
+                unread_count: 0,
+                last_message_preview: Some("provider running".to_string()),
+                pending_approval: None,
+                runtime_session_ref: None,
+                provider_id: None,
+                reasoning_effort: None,
+                model: None,
+            })
+            .await;
+        state.messages.write().await.insert(
+            session.id.clone(),
+            vec![test_message(
+                "a1",
+                &session.id,
+                MessageRole::Assistant,
+                "latest",
+                now,
+            )],
+        );
+
+        let cancelled = state
+            .cancel_turn("codex-thread")
+            .await
+            .expect("cancel should resolve provider session ref");
+        let detail = state
+            .get_session(&session.id)
+            .await
+            .expect("session detail should exist");
+
+        assert!(cancelled);
+        assert!(matches!(detail.session.status, SessionStatus::Interrupted));
+    }
+
+    #[tokio::test]
+    async fn cancel_turn_falls_back_to_provider_cancel_when_runtime_missing() {
+        let provider = Arc::new(TestMessageProvider::new(HashMap::new()));
+        let registry = ProviderRegistry::from_map(HashMap::from([(
+            AgentKind::Codex,
+            provider.clone() as Arc<dyn AgentProvider>,
+        )]));
+        let state = test_state_with_providers("cancel-provider-fallback", registry).await;
+        let project = state
+            .create_project(CreateProjectInput {
+                name: "Project".to_string(),
+                root_path: std::env::temp_dir().to_string_lossy().to_string(),
+            })
+            .await;
+        let session = state
+            .create_session(CreateSessionInput {
+                project_id: project.id,
+                title: Some("Session".to_string()),
+                agent: AgentKind::Codex,
+                brief_reply_mode: false,
+                provider_id: None,
+                reasoning_effort: None,
+            })
+            .await
+            .expect("session should be created");
+
+        state
+            .patch_session(&session.id, SessionStatus::Idle, Some("idle".to_string()))
+            .await;
+        state
+            .set_provider_session_ref(&session.id, Some("codex-thread".to_string()))
+            .await;
+        state.finish_turn(&session.id).await;
+
+        let cancelled = state
+            .cancel_turn(&session.id)
+            .await
+            .expect("provider fallback cancel should succeed");
+
+        assert!(cancelled);
+        assert_eq!(
+            provider.cancelled_sessions().await,
+            vec![(session.id.clone(), Some("codex-thread".to_string()))]
+        );
+    }
+
+    #[tokio::test]
     async fn resolve_provider_config_auto_uses_priority_provider() {
         let state = test_state("provider-config-auto").await;
         state
@@ -3061,8 +4252,10 @@ mod tests {
             unread_count: 0,
             last_message_preview: None,
             pending_approval: None,
+            runtime_session_ref: None,
             provider_id: Some(AUTO_PROVIDER_ID.to_string()),
             reasoning_effort: None,
+            model: None,
         };
 
         let resolved = state.resolve_provider_config(&session, &None).await;
@@ -3118,8 +4311,10 @@ mod tests {
             unread_count: 0,
             last_message_preview: None,
             pending_approval: None,
+            runtime_session_ref: None,
             provider_id: Some(AUTO_PROVIDER_ID.to_string()),
             reasoning_effort: None,
+            model: None,
         };
 
         let resolved = state

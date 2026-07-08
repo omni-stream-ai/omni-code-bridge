@@ -161,7 +161,6 @@ pub struct AcpServerConfig {
 pub enum AcpProfile {
     #[default]
     Stdio,
-    Kiro,
     GenericHttp,
 }
 
@@ -204,12 +203,18 @@ pub struct SessionSummary {
     pub last_message_preview: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_approval: Option<ApprovalRequest>,
+    /// Runtime/provider-native session or thread id used to resume the upstream agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_session_ref: Option<String>,
     /// Default provider for this session (references provider config id)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
     /// Default reasoning effort for this session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Default model override for this session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -259,6 +264,24 @@ pub struct ChatMessage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageListQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageListPage {
+    pub messages: Vec<ChatMessage>,
+    pub has_more: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateSessionInput {
     pub project_id: String,
     pub title: Option<String>,
@@ -293,6 +316,14 @@ pub struct UpdateSessionInput {
         deserialize_with = "deserialize_patch_value"
     )]
     pub reasoning_effort: Option<Option<ReasoningEffort>>,
+    /// Update the session-level model override.
+    /// `Some(name)` sets the model, and `None` clears the override.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_patch_value"
+    )]
+    pub model: Option<Option<String>>,
 }
 
 fn deserialize_patch_value<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
@@ -364,6 +395,8 @@ pub struct SendMessageInput {
     pub input_mode: InputMode,
     #[serde(default)]
     pub system_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_message_id: Option<String>,
     /// Override provider for this message.
     /// Omit to avoid bridge-side provider resolution; use "AUTO" to enable auto-selection.
     #[serde(default, skip_serializing_if = "Option::is_none")]

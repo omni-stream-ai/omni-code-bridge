@@ -89,6 +89,7 @@ pub fn load_session_messages(path: &Path) -> Option<SessionMessages> {
     let mut messages = Vec::new();
     let mut pending_assistant: Option<PendingAssistantMessage> = None;
     let mut pending_user_images: Vec<String> = Vec::new();
+    let mut saw_agent_message = false;
 
     for line in content.lines() {
         let value: Value = serde_json::from_str(line).ok()?;
@@ -146,6 +147,23 @@ pub fn load_session_messages(path: &Path) -> Option<SessionMessages> {
                     });
                 }
             }
+            "event_msg" if payload.get("type").and_then(Value::as_str) == Some("agent_message") => {
+                saw_agent_message = true;
+                pending_assistant = None;
+                if let Some(text) = extract_agent_message_text(payload) {
+                    messages.push(ChatMessage {
+                        id: format!(
+                            "{}-assistant-{}",
+                            session_id.as_deref().unwrap_or("unknown"),
+                            messages.len()
+                        ),
+                        session_id: session_id.clone().unwrap_or_default(),
+                        role: MessageRole::Assistant,
+                        content: text,
+                        created_at: timestamp,
+                    });
+                }
+            }
             "response_item"
                 if payload.get("type").and_then(Value::as_str) == Some("message")
                     && payload.get("role").and_then(Value::as_str) == Some("user") =>
@@ -156,6 +174,9 @@ pub fn load_session_messages(path: &Path) -> Option<SessionMessages> {
                 if payload.get("type").and_then(Value::as_str) == Some("message")
                     && payload.get("role").and_then(Value::as_str) == Some("assistant") =>
             {
+                if saw_agent_message {
+                    continue;
+                }
                 if let Some(text) = extract_assistant_text(payload) {
                     let pending =
                         pending_assistant.get_or_insert_with(|| PendingAssistantMessage {
@@ -163,6 +184,50 @@ pub fn load_session_messages(path: &Path) -> Option<SessionMessages> {
                             blocks: Vec::new(),
                         });
                     pending.blocks.push(text);
+                }
+            }
+            "response_item"
+                if payload.get("type").and_then(Value::as_str) == Some("function_call") =>
+            {
+                flush_pending_assistant(
+                    &mut messages,
+                    &session_id.clone().unwrap_or_default(),
+                    &mut pending_assistant,
+                );
+                if let Some(content) = render_codex_function_call(payload) {
+                    messages.push(ChatMessage {
+                        id: format!(
+                            "{}-system-{}",
+                            session_id.as_deref().unwrap_or("unknown"),
+                            messages.len()
+                        ),
+                        session_id: session_id.clone().unwrap_or_default(),
+                        role: MessageRole::System,
+                        content,
+                        created_at: timestamp,
+                    });
+                }
+            }
+            "response_item"
+                if payload.get("type").and_then(Value::as_str) == Some("function_call_output") =>
+            {
+                flush_pending_assistant(
+                    &mut messages,
+                    &session_id.clone().unwrap_or_default(),
+                    &mut pending_assistant,
+                );
+                if let Some(content) = render_codex_function_call_output(payload) {
+                    messages.push(ChatMessage {
+                        id: format!(
+                            "{}-system-{}",
+                            session_id.as_deref().unwrap_or("unknown"),
+                            messages.len()
+                        ),
+                        session_id: session_id.clone().unwrap_or_default(),
+                        role: MessageRole::System,
+                        content,
+                        created_at: timestamp,
+                    });
                 }
             }
             _ => {}
@@ -362,6 +427,15 @@ fn flush_pending_assistant(
     });
 }
 
+fn extract_agent_message_text(payload: &Value) -> Option<String> {
+    payload
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(ToString::to_string)
+}
+
 fn parse_session_summary_file(path: &Path) -> Option<ParsedSessionSummaryRecord> {
     let content = fs::read_to_string(path).ok()?;
     let mut session_id = None;
@@ -370,6 +444,7 @@ fn parse_session_summary_file(path: &Path) -> Option<ParsedSessionSummaryRecord>
     let mut user_message_candidates = Vec::new();
     let mut last_preview = None;
     let mut status = SessionStatus::Idle;
+    let mut saw_agent_message = false;
 
     for line in content.lines() {
         let value: Value = serde_json::from_str(line).ok()?;
@@ -421,10 +496,19 @@ fn parse_session_summary_file(path: &Path) -> Option<ParsedSessionSummaryRecord>
                     last_preview = Some(text);
                 }
             }
+            "event_msg" if payload.get("type").and_then(Value::as_str) == Some("agent_message") => {
+                saw_agent_message = true;
+                if let Some(text) = extract_agent_message_text(payload) {
+                    last_preview = Some(text);
+                }
+            }
             "response_item"
                 if payload.get("type").and_then(Value::as_str) == Some("message")
                     && payload.get("role").and_then(Value::as_str) == Some("assistant") =>
             {
+                if saw_agent_message {
+                    continue;
+                }
                 if let Some(text) = extract_assistant_text(payload) {
                     last_preview = Some(text);
                 }
@@ -457,7 +541,7 @@ fn parse_session_summary_file(path: &Path) -> Option<ParsedSessionSummaryRecord>
             git_status: None,
         },
         session: SessionSummary {
-            id: session_id,
+            id: session_id.clone(),
             project_id,
             title: session_title,
             agent: AgentKind::Codex,
@@ -467,8 +551,10 @@ fn parse_session_summary_file(path: &Path) -> Option<ParsedSessionSummaryRecord>
             unread_count: 0,
             last_message_preview: last_preview,
             pending_approval: None,
+            runtime_session_ref: Some(session_id),
             provider_id: None,
             reasoning_effort: None,
+            model: None,
         },
         session_file: path.to_path_buf(),
     })
@@ -581,6 +667,56 @@ fn extract_assistant_text(payload: &Value) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
+fn render_codex_function_call(payload: &Value) -> Option<String> {
+    let name = payload
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("tool");
+    let call_id = payload
+        .get("call_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let arguments = payload
+        .get("arguments")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    let mut content = format!("[tool:{name}]");
+    if let Some(call_id) = call_id {
+        content.push_str(&format!(" call_id={call_id}"));
+    }
+    if let Some(arguments) = arguments {
+        content.push('\n');
+        content.push_str(arguments);
+    }
+    Some(content)
+}
+
+fn render_codex_function_call_output(payload: &Value) -> Option<String> {
+    let output = payload
+        .get("output")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let call_id = payload
+        .get("call_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    let mut content = "[tool:output]".to_string();
+    if let Some(call_id) = call_id {
+        content.push_str(&format!(" call_id={call_id}"));
+    }
+    content.push('\n');
+    content.push_str(output);
+    Some(content)
+}
+
 fn sessions_root() -> PathBuf {
     std::env::var("ECHO_MATE_CODEX_SESSIONS_DIR")
         .map(PathBuf::from)
@@ -655,6 +791,62 @@ mod tests {
     }
 
     #[test]
+    fn load_session_messages_prefers_agent_messages_over_response_item_mirrors() {
+        let file = temp_jsonl_file(
+            "codex-agent-message",
+            &[
+                r#"{"timestamp":"2026-05-01T00:00:00Z","type":"session_meta","payload":{"id":"codex-agent","cwd":"/tmp/project"}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"hello codex"}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":"commentary message","phase":"commentary"}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"commentary message"}],"phase":"commentary"}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:04Z","type":"event_msg","payload":{"type":"agent_message","message":"final answer","phase":"final_answer"}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:05Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"final answer"}],"phase":"final_answer"}}"#,
+            ],
+        );
+
+        let messages = load_session_messages(&file)
+            .expect("codex archive should parse")
+            .messages;
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].role, MessageRole::User);
+        assert_eq!(messages[1].role, MessageRole::Assistant);
+        assert_eq!(messages[1].content, "commentary message");
+        assert_eq!(messages[2].role, MessageRole::Assistant);
+        assert_eq!(messages[2].content, "final answer");
+    }
+
+    #[test]
+    fn load_session_messages_parses_codex_tool_items_as_system_messages() {
+        let file = temp_jsonl_file(
+            "codex-session-tools",
+            &[
+                r#"{"timestamp":"2026-05-01T00:00:00Z","type":"session_meta","payload":{"id":"codex-tools","cwd":"/tmp/project"}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"run pwd"}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:02Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"pwd\"}","call_id":"call-1"}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":"Chunk ID: abc\nOutput:\n/tmp/project"}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:04Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:05Z","type":"event_msg","payload":{"type":"task_complete"}}"#,
+            ],
+        );
+
+        let messages = load_session_messages(&file)
+            .expect("codex archive should parse")
+            .messages;
+
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].role, MessageRole::User);
+        assert_eq!(messages[1].role, MessageRole::System);
+        assert!(messages[1].content.starts_with("[tool:exec_command]"));
+        assert!(messages[1].content.contains(r#"{"cmd":"pwd"}"#));
+        assert_eq!(messages[2].role, MessageRole::System);
+        assert!(messages[2].content.starts_with("[tool:output]"));
+        assert!(messages[2].content.contains("/tmp/project"));
+        assert_eq!(messages[3].role, MessageRole::Assistant);
+        assert_eq!(messages[3].content, "done");
+    }
+
+    #[test]
     fn load_session_messages_renders_user_images_as_markdown() {
         let file = temp_jsonl_file(
             "codex-session-images",
@@ -716,6 +908,30 @@ mod tests {
         assert_eq!(record.session.last_message_preview.as_deref(), Some("done"));
         assert_eq!(record.project.name, "example-app");
         assert_eq!(record.project.session_count, 1);
+    }
+
+    #[test]
+    fn parse_session_summary_file_prefers_agent_message_preview() {
+        let file = temp_jsonl_file(
+            "codex-summary-agent-message",
+            &[
+                r#"{"timestamp":"2026-05-01T00:00:00Z","type":"session_meta","payload":{"id":"codex-3","cwd":"/tmp/example-app"}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"implement feature"}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":"visible agent reply","phase":"final_answer"}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"provider mirror"}],"phase":"final_answer"}}"#,
+            ],
+        );
+
+        let record = parse_session_summary_file(&file).expect("summary should parse");
+
+        assert_eq!(
+            record.session.last_message_preview.as_deref(),
+            Some("visible agent reply")
+        );
+        assert_eq!(
+            record.project.last_session_preview.as_deref(),
+            Some("visible agent reply")
+        );
     }
 
     #[test]

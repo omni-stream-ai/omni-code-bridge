@@ -32,12 +32,12 @@ use crate::{
         AgentCommandsSummary, AgentInstallInput, AgentKind, AgentReadiness, AgentSummary, ApiError,
         ApiResponse, AppUpdateManifest, ApprovalDecisionInput, AudioSpeechStreamResponse,
         CancelSessionReplyResult, ClientAuthRequestInput, CreateProjectInput, CreateSessionInput,
-        FileCompletionItem, FileCompletionQuery, OpenAiAudioSpeechRequest, OpenAiErrorDetail,
-        OpenAiErrorResponse, OpenAiModel, OpenAiModelList, OpenAiTranscriptionResponse,
-        OpenAiVerboseTranscriptionResponse, OpenAiVerboseTranscriptionSegment,
-        RegisterPushDeviceInput, ReplySummary, SendMessageInput, SessionEvent,
-        SpeakerFilterSettingsInput, SpeechModelDownloadInput, SpeechModelKind, SpeechProfile,
-        SpeechProfileSelectionInput, SpeechVoiceSelectionInput, SummarizeReplyInput,
+        FileCompletionItem, FileCompletionQuery, MessageListPage, MessageListQuery,
+        OpenAiAudioSpeechRequest, OpenAiErrorDetail, OpenAiErrorResponse, OpenAiModel,
+        OpenAiModelList, OpenAiTranscriptionResponse, OpenAiVerboseTranscriptionResponse,
+        OpenAiVerboseTranscriptionSegment, RegisterPushDeviceInput, ReplySummary, SendMessageInput,
+        SessionEvent, SpeakerFilterSettingsInput, SpeechModelDownloadInput, SpeechModelKind,
+        SpeechProfile, SpeechProfileSelectionInput, SpeechVoiceSelectionInput, SummarizeReplyInput,
         TriggerClientMessageInput, UpdateSessionInput, UploadedFileResponse,
     },
     realtime, speaker,
@@ -1607,14 +1607,173 @@ async fn trigger_client_message(
 async fn list_messages(
     Path(id): Path<String>,
     headers: HeaderMap,
+    Query(query): Query<MessageListQuery>,
     State(state): State<Arc<AppState>>,
-) -> Result<Json<ApiResponse<Vec<crate::models::ChatMessage>>>, ApiError> {
+) -> Result<Json<ApiResponse<MessageListPage>>, ApiError> {
     authorize_request_status(&headers, &state).await?;
     let messages = state.list_messages(&id).await.ok_or(ApiError {
         status: StatusCode::NOT_FOUND,
         message: "session not found".to_string(),
     })?;
-    Ok(Json(ApiResponse { data: messages }))
+    let page = paginate_messages(messages, query)?;
+    Ok(Json(ApiResponse { data: page }))
+}
+
+fn paginate_messages(
+    messages: Vec<crate::models::ChatMessage>,
+    query: MessageListQuery,
+) -> Result<MessageListPage, ApiError> {
+    if query.before_id.is_some() && query.after_id.is_some() {
+        return Err(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            message: "before_id and after_id cannot be used together".to_string(),
+        });
+    }
+
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let mut start = 0usize;
+    let mut end = messages.len();
+
+    let uses_after_cursor = query.after_id.is_some();
+
+    if let Some(before_id) = query.before_id {
+        let cursor_index = messages
+            .iter()
+            .position(|message| message.id == before_id)
+            .ok_or(ApiError {
+                status: StatusCode::BAD_REQUEST,
+                message: format!("unknown before_id: {before_id}"),
+            })?;
+        end = message_unit_start(&messages, cursor_index);
+    }
+
+    if let Some(after_id) = query.after_id {
+        let cursor_index = messages
+            .iter()
+            .position(|message| message.id == after_id)
+            .ok_or(ApiError {
+                status: StatusCode::BAD_REQUEST,
+                message: format!("unknown after_id: {after_id}"),
+            })?;
+        start = message_unit_end(&messages, cursor_index, end);
+    }
+
+    if start > end {
+        return Err(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            message: "after_id must refer to a message before before_id".to_string(),
+        });
+    }
+
+    let (skip, take_len, has_more) = if uses_after_cursor {
+        let take_end = forward_message_window_end(&messages, start, end, limit);
+        (start, take_end.saturating_sub(start), take_end < end)
+    } else {
+        let (skip, take_end) = trailing_message_window_bounds(&messages, start, end, limit);
+        (skip, take_end.saturating_sub(skip), skip > start)
+    };
+
+    let page_messages = messages
+        .into_iter()
+        .skip(skip)
+        .take(take_len)
+        .collect::<Vec<_>>();
+    let next_cursor = if has_more && uses_after_cursor {
+        page_messages.last().map(|message| message.id.clone())
+    } else if has_more {
+        page_messages.first().map(|message| message.id.clone())
+    } else {
+        None
+    };
+
+    Ok(MessageListPage {
+        messages: page_messages,
+        has_more,
+        next_cursor,
+    })
+}
+
+fn is_user_message(message: &crate::models::ChatMessage) -> bool {
+    matches!(message.role, crate::models::MessageRole::User)
+}
+
+fn message_unit_start(messages: &[crate::models::ChatMessage], index: usize) -> usize {
+    if is_user_message(&messages[index]) {
+        return index;
+    }
+
+    let mut start = index;
+    while start > 0 && !is_user_message(&messages[start - 1]) {
+        start -= 1;
+    }
+    start
+}
+
+fn message_unit_end(
+    messages: &[crate::models::ChatMessage],
+    index: usize,
+    max_end: usize,
+) -> usize {
+    if is_user_message(&messages[index]) {
+        return index + 1;
+    }
+
+    let mut end = index + 1;
+    while end < max_end && !is_user_message(&messages[end]) {
+        end += 1;
+    }
+    end
+}
+
+fn previous_message_unit_start(
+    messages: &[crate::models::ChatMessage],
+    start: usize,
+    before: usize,
+) -> usize {
+    let mut unit_start = before - 1;
+    if is_user_message(&messages[unit_start]) {
+        return unit_start;
+    }
+    while unit_start > start && !is_user_message(&messages[unit_start - 1]) {
+        unit_start -= 1;
+    }
+    unit_start
+}
+
+fn trailing_message_window_bounds(
+    messages: &[crate::models::ChatMessage],
+    start: usize,
+    end: usize,
+    limit: usize,
+) -> (usize, usize) {
+    let mut counted = 0usize;
+    let mut window_start = end;
+    while window_start > start && counted < limit {
+        window_start = previous_message_unit_start(messages, start, window_start);
+        counted += 1;
+    }
+    (window_start, end)
+}
+
+fn forward_message_window_end(
+    messages: &[crate::models::ChatMessage],
+    start: usize,
+    end: usize,
+    limit: usize,
+) -> usize {
+    let mut counted = 0usize;
+    let mut window_end = start;
+    while window_end < end && counted < limit {
+        if is_user_message(&messages[window_end]) {
+            window_end += 1;
+        } else {
+            while window_end < end && !is_user_message(&messages[window_end]) {
+                window_end += 1;
+            }
+        }
+        counted += 1;
+    }
+    window_end
 }
 
 async fn send_message(
@@ -1672,7 +1831,7 @@ async fn update_session(
 ) -> Result<impl IntoResponse, ApiError> {
     authorize_request(&headers, &state).await?;
     let session = state
-        .update_session_settings(&id, input.provider_id, input.reasoning_effort)
+        .update_session_settings(&id, input.provider_id, input.reasoning_effort, input.model)
         .await
         .map_err(|err| ApiError {
             status: StatusCode::NOT_FOUND,
@@ -2099,6 +2258,7 @@ async fn session_events(
                 Ok(event) if event_belongs_to_session(&event, &session_id) => {
                     sse_event_for_session_event(&event)
                 }
+                Err(_) => Some(sync_required_event()),
                 _ => None,
             }
         }
@@ -2115,6 +2275,12 @@ async fn session_events(
 fn sse_event_for_session_event(event: &SessionEvent) -> Option<Result<Event, Infallible>> {
     let (name, json) = encode_session_event(event)?;
     Some(Ok(Event::default().event(name).data(json)))
+}
+
+fn sync_required_event() -> Result<Event, Infallible> {
+    Ok(Event::default()
+        .event("sync.required")
+        .data(r#"{"type":"sync_required","payload":{}}"#))
 }
 
 fn encode_session_event(event: &SessionEvent) -> Option<(&'static str, String)> {
@@ -2719,7 +2885,7 @@ mod tests {
         completion_search_scope, content_type_for_path, content_type_for_upload_name,
         encode_session_event, get_acp_agent_diagnostic, list_completion_items,
         normalize_completion_prefix, normalize_transcription_language,
-        normalize_transcription_response_format, resolve_path_within_root,
+        normalize_transcription_response_format, paginate_messages, resolve_path_within_root,
         sanitize_upload_file_name, sanitize_upload_lookup_id, transcription_response, uploads_dir,
         validate_speech_options, validate_transcription_options,
     };
@@ -2727,8 +2893,9 @@ mod tests {
         app_state::AppState,
         bridge_settings::{AiApprovalSettings, BridgeSettingsInput},
         models::{
-            AcpProfile, AcpServerConfig, AgentKind, AgentReadiness, ClientAuthRequestInput,
-            FileCompletionQuery, HeaderKeyValue, SessionEvent,
+            AcpProfile, AcpServerConfig, AgentKind, AgentReadiness, ChatMessage,
+            ClientAuthRequestInput, FileCompletionQuery, HeaderKeyValue, MessageListQuery,
+            MessageRole, SessionEvent,
         },
     };
     use axum::{
@@ -3083,8 +3250,10 @@ for line in sys.stdin:
             unread_count: 0,
             last_message_preview: Some("hello".to_string()),
             pending_approval: None,
+            runtime_session_ref: Some("thread-1".to_string()),
             provider_id: None,
             reasoning_effort: None,
+            model: None,
         });
 
         let (name, body) = encode_session_event(&event).expect("snapshot should encode");
@@ -3115,6 +3284,272 @@ for line in sys.stdin:
 
         let opencode = agent_commands_summary(AgentKind::OpenCode);
         assert!(opencode.commands.is_empty());
+    }
+
+    fn test_message(id: &str, role: MessageRole, content: &str) -> ChatMessage {
+        ChatMessage {
+            id: id.to_string(),
+            session_id: "session".to_string(),
+            role,
+            content: content.to_string(),
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn list_messages_supports_limit_and_cursors() {
+        let messages = vec![
+            test_message("first", MessageRole::User, "first"),
+            test_message("second", MessageRole::Assistant, "second"),
+            test_message("third", MessageRole::User, "third"),
+        ];
+
+        let page = paginate_messages(
+            messages.clone(),
+            MessageListQuery {
+                limit: Some(2),
+                before_id: None,
+                after_id: None,
+            },
+        )
+        .expect("request should succeed");
+        assert_eq!(
+            page.messages
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["second", "third"]
+        );
+        assert!(page.has_more);
+        assert_eq!(page.next_cursor.as_deref(), Some("second"));
+
+        let page = paginate_messages(
+            messages.clone(),
+            MessageListQuery {
+                limit: Some(2),
+                before_id: Some("third".to_string()),
+                after_id: None,
+            },
+        )
+        .expect("before_id request should succeed");
+        assert_eq!(
+            page.messages
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+        assert!(!page.has_more);
+        assert_eq!(page.next_cursor, None);
+
+        let page = paginate_messages(
+            messages,
+            MessageListQuery {
+                limit: Some(1),
+                before_id: None,
+                after_id: Some("first".to_string()),
+            },
+        )
+        .expect("after_id request should succeed");
+        assert_eq!(
+            page.messages
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["second"]
+        );
+        assert!(page.has_more);
+        assert_eq!(page.next_cursor.as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn list_messages_default_page_includes_active_reply() {
+        let messages = vec![
+            test_message("old-user", MessageRole::User, "old"),
+            test_message("new-user", MessageRole::User, "new"),
+            test_message("active-reply", MessageRole::Assistant, "partial reply"),
+        ];
+
+        let page = paginate_messages(
+            messages,
+            MessageListQuery {
+                limit: Some(2),
+                before_id: None,
+                after_id: None,
+            },
+        )
+        .expect("request should succeed");
+
+        assert_eq!(
+            page.messages
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["new-user", "active-reply"]
+        );
+        assert!(page.has_more);
+        assert_eq!(page.next_cursor.as_deref(), Some("new-user"));
+        assert_eq!(page.messages[1].content, "partial reply");
+    }
+
+    #[test]
+    fn list_messages_before_id_returns_adjacent_previous_page() {
+        let messages = vec![
+            test_message("first", MessageRole::User, "first"),
+            test_message("second", MessageRole::Assistant, "second"),
+            test_message("third", MessageRole::User, "third"),
+            test_message("fourth", MessageRole::Assistant, "fourth"),
+            test_message("fifth", MessageRole::User, "fifth"),
+        ];
+
+        let page = paginate_messages(
+            messages,
+            MessageListQuery {
+                limit: Some(2),
+                before_id: Some("fifth".to_string()),
+                after_id: None,
+            },
+        )
+        .expect("before_id request should succeed");
+
+        assert_eq!(
+            page.messages
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["third", "fourth"]
+        );
+        assert!(page.has_more);
+        assert_eq!(page.next_cursor.as_deref(), Some("third"));
+    }
+
+    #[test]
+    fn list_messages_rejects_invalid_cursor_combinations() {
+        let messages = vec![test_message("only", MessageRole::User, "only")];
+
+        let error = paginate_messages(
+            messages.clone(),
+            MessageListQuery {
+                limit: Some(10),
+                before_id: Some("a".to_string()),
+                after_id: Some("b".to_string()),
+            },
+        )
+        .expect_err("conflicting cursors should fail");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("cannot be used together"));
+
+        let error = paginate_messages(
+            messages,
+            MessageListQuery {
+                limit: Some(10),
+                before_id: Some("missing".to_string()),
+                after_id: None,
+            },
+        )
+        .expect_err("unknown before_id should fail");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("unknown before_id"));
+    }
+
+    #[test]
+    fn list_messages_limit_counts_agent_reply_segment_as_one_message() {
+        let messages = vec![
+            test_message("user-1", MessageRole::User, "u1"),
+            test_message("assistant-1", MessageRole::Assistant, "a1"),
+            test_message("system-1", MessageRole::System, "s1"),
+            test_message("system-2", MessageRole::System, "s2"),
+            test_message("user-2", MessageRole::User, "u2"),
+            test_message("assistant-2", MessageRole::Assistant, "a2"),
+        ];
+
+        let page = paginate_messages(
+            messages,
+            MessageListQuery {
+                limit: Some(2),
+                before_id: None,
+                after_id: None,
+            },
+        )
+        .expect("request should succeed");
+
+        assert_eq!(
+            page.messages
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["user-2", "assistant-2"]
+        );
+        assert!(page.has_more);
+        assert_eq!(page.next_cursor.as_deref(), Some("user-2"));
+    }
+
+    #[test]
+    fn list_messages_limit_keeps_system_messages_in_agent_reply_segment() {
+        let messages = vec![
+            test_message("user-1", MessageRole::User, "u1"),
+            test_message("assistant-1", MessageRole::Assistant, "a1"),
+            test_message("user-2", MessageRole::User, "u2"),
+            test_message("assistant-2", MessageRole::Assistant, "a2"),
+            test_message("system-1", MessageRole::System, "s1"),
+            test_message("system-2", MessageRole::System, "s2"),
+        ];
+
+        let page = paginate_messages(
+            messages,
+            MessageListQuery {
+                limit: Some(2),
+                before_id: None,
+                after_id: None,
+            },
+        )
+        .expect("request should keep trailing system messages");
+
+        assert_eq!(
+            page.messages
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["user-2", "assistant-2", "system-1", "system-2"]
+        );
+        assert!(page.has_more);
+        assert_eq!(page.next_cursor.as_deref(), Some("user-2"));
+    }
+
+    #[test]
+    fn list_messages_before_id_inside_agent_reply_does_not_split_segment() {
+        let messages = vec![
+            test_message("user-1", MessageRole::User, "u1"),
+            test_message("assistant-1", MessageRole::Assistant, "a1"),
+            test_message("system-1", MessageRole::System, "s1"),
+            test_message("system-2", MessageRole::System, "s2"),
+            test_message("user-2", MessageRole::User, "u2"),
+            test_message("assistant-2", MessageRole::Assistant, "a2"),
+            test_message("system-3", MessageRole::System, "s3"),
+            test_message("system-4", MessageRole::System, "s4"),
+            test_message("assistant-3", MessageRole::Assistant, "a3"),
+            test_message("system-5", MessageRole::System, "s5"),
+        ];
+
+        let page = paginate_messages(
+            messages,
+            MessageListQuery {
+                limit: Some(2),
+                before_id: Some("system-5".to_string()),
+                after_id: None,
+            },
+        )
+        .expect("before_id should not split agent reply segments");
+
+        assert_eq!(
+            page.messages
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["assistant-1", "system-1", "system-2", "user-2"]
+        );
+        assert!(page.has_more);
+        assert_eq!(page.next_cursor.as_deref(), Some("assistant-1"));
     }
 
     #[tokio::test]
@@ -3241,7 +3676,7 @@ for line in sys.stdin:
                     AcpServerConfig {
                         id: "kiro-primary".to_string(),
                         name: "Kiro Primary".to_string(),
-                        profile: AcpProfile::Kiro,
+                        profile: AcpProfile::Stdio,
                         endpoint: None,
                         command: Some("/definitely/missing/kiro-cli".to_string()),
                         args: vec!["acp".to_string()],
@@ -3291,7 +3726,7 @@ for line in sys.stdin:
         let diagnostic = acp.acp_diagnostic.expect("diagnostic should exist");
         assert_eq!(diagnostic.configured_server_id, "kiro-primary");
         assert_eq!(diagnostic.configured_server_name, "Kiro Primary");
-        assert!(matches!(diagnostic.profile, AcpProfile::Kiro));
+        assert!(matches!(diagnostic.profile, AcpProfile::Stdio));
         assert_eq!(
             diagnostic.command.as_deref(),
             Some("/definitely/missing/kiro-cli")
@@ -3930,7 +4365,7 @@ data: {\"type\":\"done\"}\n\n",
                 acp_servers: Some(vec![AcpServerConfig {
                     id: "kiro-mock".to_string(),
                     name: "Kiro Mock".to_string(),
-                    profile: AcpProfile::Kiro,
+                    profile: AcpProfile::Stdio,
                     endpoint: None,
                     command: Some("python3".to_string()),
                     args: vec![

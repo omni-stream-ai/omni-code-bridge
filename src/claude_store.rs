@@ -278,7 +278,7 @@ fn parse_session_summary_file(path: &Path) -> Option<ParsedSessionSummaryRecord>
             git_status: None,
         },
         session: SessionSummary {
-            id: session_id,
+            id: session_id.clone(),
             project_id,
             title: session_title,
             agent: AgentKind::ClaudeCode,
@@ -288,8 +288,10 @@ fn parse_session_summary_file(path: &Path) -> Option<ParsedSessionSummaryRecord>
             unread_count: 0,
             last_message_preview: last_preview,
             pending_approval: None,
+            runtime_session_ref: Some(session_id),
             provider_id: None,
             reasoning_effort: None,
+            model: None,
         },
         session_file: path.to_path_buf(),
     })

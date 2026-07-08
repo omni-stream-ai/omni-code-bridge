@@ -248,7 +248,7 @@ pub fn validate_acp_servers(servers: &[AcpServerConfig]) -> Result<(), String> {
             .filter(|command| !command.is_empty())
             .is_some();
         match server.profile {
-            crate::models::AcpProfile::Stdio | crate::models::AcpProfile::Kiro => {
+            crate::models::AcpProfile::Stdio => {
                 if !has_command {
                     return Err(format!(
                         "ACP server {} with profile `{}` must configure command",
@@ -324,7 +324,6 @@ pub fn validate_acp_servers(servers: &[AcpServerConfig]) -> Result<(), String> {
 fn acp_profile_name(profile: crate::models::AcpProfile) -> &'static str {
     match profile {
         crate::models::AcpProfile::Stdio => "stdio",
-        crate::models::AcpProfile::Kiro => "kiro",
         crate::models::AcpProfile::GenericHttp => "generic_http",
     }
 }
@@ -575,7 +574,7 @@ mod tests {
         let servers = vec![crate::models::AcpServerConfig {
             id: "kiro-local".to_string(),
             name: "Kiro Local".to_string(),
-            profile: crate::models::AcpProfile::Kiro,
+            profile: crate::models::AcpProfile::Stdio,
             endpoint: None,
             command: Some("kiro-cli".to_string()),
             args: vec!["acp".to_string()],
@@ -615,7 +614,7 @@ mod tests {
         let kiro_without_command = crate::models::AcpServerConfig {
             id: "bad-kiro".to_string(),
             name: "Bad Kiro".to_string(),
-            profile: crate::models::AcpProfile::Kiro,
+            profile: crate::models::AcpProfile::Stdio,
             endpoint: Some("https://acp.example.test".to_string()),
             command: None,
             args: Vec::new(),
@@ -650,7 +649,7 @@ mod tests {
         let kiro_with_endpoint = crate::models::AcpServerConfig {
             id: "kiro-mixed".to_string(),
             name: "Kiro Mixed".to_string(),
-            profile: crate::models::AcpProfile::Kiro,
+            profile: crate::models::AcpProfile::Stdio,
             endpoint: Some("https://acp.example.test".to_string()),
             command: Some("kiro-cli".to_string()),
             args: vec!["acp".to_string()],
