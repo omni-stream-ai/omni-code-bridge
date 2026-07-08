@@ -165,11 +165,10 @@ impl AgentProvider for StubProvider {
             "当前 provider 架构已就位，这个 agent 还没有接入真实 CLI。".to_string(),
             format!("任务内容：{}", input.content),
         ];
-
         for chunk in chunks {
             sleep(Duration::from_millis(120)).await;
             state
-                .emit_message_delta(&session.id, &reply.id, &chunk)
+                .emit_assistant_message_snapshot(&session.id, &reply.id, &chunk)
                 .await;
         }
 
@@ -934,6 +933,7 @@ mod tests {
             runtime_session_ref: None,
             provider_id: None,
             reasoning_effort: None,
+            model: None,
         };
         let input = ChatMessage {
             id: "input".to_string(),
@@ -5813,7 +5813,7 @@ async fn push_incremental_text(
     if let Some(delta) = next_text.strip_prefix(last_rendered.as_str()) {
         if !delta.is_empty() {
             state
-                .emit_message_delta(session_id, message_id, delta)
+                .emit_assistant_message_snapshot(session_id, message_id, next_text)
                 .await;
             *last_rendered = next_text.to_string();
         }

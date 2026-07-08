@@ -9,6 +9,7 @@ mod claude_hook;
 mod claude_store;
 mod client_auth_store;
 mod device_store;
+mod message_projection;
 mod models;
 mod push;
 mod realtime;

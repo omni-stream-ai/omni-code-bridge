@@ -21,6 +21,7 @@ use crate::{
     bridge_settings::{BridgeSettings, BridgeSettingsStore},
     client_auth_store::ClientAuthStore,
     device_store::{load_device_registrations, save_device_registrations},
+    message_projection::MessageProjection,
     models::{
         AUTO_PROVIDER_ID, AgentErrorEvent, AgentKind, ApiFormat, ApprovalChoice, ApprovalRequest,
         ApprovalRequestEvent, ApprovalResolvedEvent, ChatMessage, ClientAuthRecord,
@@ -635,15 +636,15 @@ impl AppState {
             .provider_session_ref(session_id)
             .await
             .unwrap_or_else(|| session_id.to_string());
-        let cached = self.messages.read().await.get(session_id).cloned();
         let provider_messages = provider
             .list_messages(&provider_session_id)
             .await
-            .map(|messages| Self::normalize_messages_for_session(messages, session_id));
+            .map(|messages| MessageProjection::normalize_provider(session_id, messages));
+        let cached = self.messages.read().await.get(session_id).cloned();
 
         match (cached, provider_messages) {
             (Some(local), Some(remote)) => {
-                let merged = Self::merge_messages(remote, local);
+                let merged = MessageProjection::from_sources(session_id, remote, local);
                 self.messages
                     .write()
                     .await
@@ -1542,14 +1543,20 @@ impl AppState {
         device
     }
 
-    pub async fn emit_message_delta(&self, session_id: &str, message_id: &str, delta: &str) {
+    pub async fn emit_assistant_message_snapshot(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        content: &str,
+    ) {
+        let content = content.to_string();
         {
             let mut messages = self.messages.write().await;
             if let Some(message) = messages
                 .get_mut(session_id)
                 .and_then(|items| items.iter_mut().find(|item| item.id == message_id))
             {
-                message.content.push_str(delta);
+                message.content = content.clone();
             }
         }
 
@@ -1558,7 +1565,7 @@ impl AppState {
             .send(SessionEvent::MessageDelta(MessageDeltaEvent {
                 session_id: session_id.to_string(),
                 message_id: message_id.to_string(),
-                delta: delta.to_string(),
+                delta: content,
             }));
     }
 
@@ -1584,14 +1591,28 @@ impl AppState {
         session_id: &str,
         message_id: &str,
     ) -> Result<(), String> {
-        let assistant_message = {
-            let messages = self.messages.read().await;
-            messages
+        let mut assistant_message = {
+            let mut messages = self.messages.write().await;
+            let message = messages
                 .get(session_id)
                 .and_then(|items| items.iter().find(|item| item.id == message_id))
                 .cloned()
-                .ok_or_else(|| format!("unknown message: {message_id}"))?
+                .ok_or_else(|| format!("unknown message: {message_id}"))?;
+            if let Some(stored) = messages
+                .get_mut(session_id)
+                .and_then(|items| items.iter_mut().find(|item| item.id == message_id))
+            {
+                stored.clone()
+            } else {
+                message
+            }
         };
+        if let Some(provider_message) = self
+            .refresh_provider_final_assistant_message(session_id, &assistant_message)
+            .await
+        {
+            assistant_message = provider_message;
+        }
         let content = assistant_message.content.clone();
 
         self.patch_session(session_id, SessionStatus::Idle, Some(content.clone()))
@@ -1621,6 +1642,86 @@ impl AppState {
                 .await;
         }
         Ok(())
+    }
+
+    async fn refresh_provider_final_assistant_message(
+        &self,
+        session_id: &str,
+        current: &ChatMessage,
+    ) -> Option<ChatMessage> {
+        let session = self.find_session(session_id).await?;
+        let provider = self.provider_for_agent(session.agent)?;
+        let provider_session_id = self
+            .provider_session_ref(session_id)
+            .await
+            .unwrap_or_else(|| session_id.to_string());
+        let provider_messages = provider.list_messages(&provider_session_id).await?;
+        let provider_messages =
+            MessageProjection::normalize_provider(session_id, provider_messages);
+        let provider_final = provider_messages
+            .iter()
+            .filter(|message| Self::is_final_assistant_candidate(current, message))
+            .max_by(|a, b| {
+                a.content
+                    .len()
+                    .cmp(&b.content.len())
+                    .then_with(|| a.created_at.cmp(&b.created_at))
+            })
+            .cloned()?;
+        if provider_final.content.len() < current.content.len() {
+            return None;
+        }
+        let final_message = ChatMessage {
+            id: current.id.clone(),
+            session_id: current.session_id.clone(),
+            role: current.role.clone(),
+            content: provider_final.content,
+            created_at: current.created_at,
+        };
+        let local_messages = self.messages.read().await.get(session_id).cloned()?;
+        let merged = local_messages
+            .into_iter()
+            .map(|message| {
+                if message.id == current.id {
+                    final_message.clone()
+                } else {
+                    message
+                }
+            })
+            .collect::<Vec<_>>();
+        self.messages
+            .write()
+            .await
+            .insert(session_id.to_string(), merged);
+        Some(final_message)
+    }
+
+    fn is_final_assistant_candidate(current: &ChatMessage, candidate: &ChatMessage) -> bool {
+        if current.role != MessageRole::Assistant || candidate.role != MessageRole::Assistant {
+            return false;
+        }
+        if current.session_id != candidate.session_id {
+            return false;
+        }
+        if current.id == candidate.id {
+            return true;
+        }
+        let seconds_apart = current
+            .created_at
+            .signed_duration_since(candidate.created_at)
+            .num_seconds()
+            .abs();
+        if seconds_apart > 10 * 60 {
+            return false;
+        }
+        let current_content = current.content.trim();
+        let candidate_content = candidate.content.trim();
+        if current_content.is_empty() || candidate_content.is_empty() {
+            return false;
+        }
+        candidate_content.starts_with(current_content)
+            || current_content.starts_with(candidate_content)
+            || current_content == candidate_content
     }
 
     pub async fn fail_session(&self, session_id: &str, message: String) {
@@ -1967,56 +2068,12 @@ impl AppState {
             .await
             .unwrap_or_else(|| session_id.to_string());
         if let Some(existing) = provider.list_messages(&provider_session_id).await {
-            let existing = Self::normalize_messages_for_session(existing, session_id);
+            let existing = MessageProjection::normalize_provider(session_id, existing);
             self.messages
                 .write()
                 .await
                 .insert(session_id.to_string(), existing);
         }
-    }
-
-    fn merge_messages(
-        provider_messages: Vec<ChatMessage>,
-        local_messages: Vec<ChatMessage>,
-    ) -> Vec<ChatMessage> {
-        let mut merged = provider_messages;
-        let mut seen_ids = merged
-            .iter()
-            .map(|message| message.id.clone())
-            .collect::<HashSet<_>>();
-
-        for local in &local_messages {
-            if let Some(existing) = merged.iter_mut().find(|message| message.id == local.id) {
-                if local.content.len() >= existing.content.len() {
-                    *existing = local.clone();
-                }
-                continue;
-            }
-
-            if seen_ids.insert(local.id.clone()) {
-                merged.push(local.clone());
-            }
-        }
-
-        merged.sort_by(|a, b| {
-            a.created_at
-                .cmp(&b.created_at)
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        merged
-    }
-
-    fn normalize_messages_for_session(
-        messages: Vec<ChatMessage>,
-        session_id: &str,
-    ) -> Vec<ChatMessage> {
-        messages
-            .into_iter()
-            .map(|mut message| {
-                message.session_id = session_id.to_string();
-                message
-            })
-            .collect()
     }
 
     async fn latest_assistant_preview(&self, session_id: &str) -> Option<String> {
@@ -3027,7 +3084,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_messages_keeps_distinct_remote_and_local_messages_without_identity_mapping() {
+    async fn list_messages_deduplicates_equivalent_remote_and_local_messages() {
         let now = Utc::now();
         let provider = Arc::new(TestMessageProvider::new(HashMap::new()));
         let registry = ProviderRegistry::from_map(HashMap::from([(
@@ -3104,16 +3161,159 @@ mod tests {
             .await
             .expect("messages should exist");
 
-        assert_eq!(messages.len(), 4);
-        assert_eq!(messages[0].id, "remote-user");
-        assert_eq!(messages[1].id, "remote-assistant");
-        assert_eq!(messages[2].id, "local-user");
-        assert_eq!(messages[3].id, "local-assistant");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].id, "local-user");
+        assert_eq!(messages[1].id, "local-assistant");
         assert!(
             messages
                 .iter()
                 .all(|message| message.session_id == session.id)
         );
+    }
+
+    #[tokio::test]
+    async fn list_messages_keeps_repeated_content_when_messages_are_not_close_in_time() {
+        let now = Utc::now();
+        let provider = Arc::new(TestMessageProvider::new(HashMap::new()));
+        let registry = ProviderRegistry::from_map(HashMap::from([(
+            AgentKind::Codex,
+            provider.clone() as Arc<dyn AgentProvider>,
+        )]));
+        let state = test_state_with_providers("merge-repeated-content", registry).await;
+        let project = state
+            .create_project(CreateProjectInput {
+                name: "Project".to_string(),
+                root_path: std::env::temp_dir().to_string_lossy().to_string(),
+            })
+            .await;
+        let session = state
+            .create_session(CreateSessionInput {
+                project_id: project.id,
+                title: Some("Session".to_string()),
+                agent: AgentKind::Codex,
+                brief_reply_mode: false,
+                provider_id: None,
+                reasoning_effort: None,
+            })
+            .await
+            .expect("session should be created");
+
+        state
+            .set_provider_session_ref(&session.id, Some("codex-thread-1".to_string()))
+            .await;
+
+        provider
+            .set_messages(
+                "codex-thread-1",
+                vec![test_message(
+                    "remote-user",
+                    "codex-thread-1",
+                    MessageRole::User,
+                    "continue",
+                    now,
+                )],
+            )
+            .await;
+
+        state.messages.write().await.insert(
+            session.id.clone(),
+            vec![test_message(
+                "local-user",
+                &session.id,
+                MessageRole::User,
+                "continue",
+                now + chrono::TimeDelta::minutes(30),
+            )],
+        );
+
+        let messages = state
+            .list_messages(&session.id)
+            .await
+            .expect("messages should exist");
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].id, "remote-user");
+        assert_eq!(messages[1].id, "local-user");
+    }
+
+    #[tokio::test]
+    async fn list_messages_preserves_in_flight_assistant_id_for_finish() {
+        let now = Utc::now();
+        let provider = Arc::new(TestMessageProvider::new(HashMap::new()));
+        let registry = ProviderRegistry::from_map(HashMap::from([(
+            AgentKind::Codex,
+            provider.clone() as Arc<dyn AgentProvider>,
+        )]));
+        let state = test_state_with_providers("preserve-in-flight-assistant", registry).await;
+        let project = state
+            .create_project(CreateProjectInput {
+                name: "Project".to_string(),
+                root_path: std::env::temp_dir().to_string_lossy().to_string(),
+            })
+            .await;
+        let session = state
+            .create_session(CreateSessionInput {
+                project_id: project.id,
+                title: Some("Session".to_string()),
+                agent: AgentKind::Codex,
+                brief_reply_mode: false,
+                provider_id: None,
+                reasoning_effort: None,
+            })
+            .await
+            .expect("session should be created");
+
+        state
+            .set_provider_session_ref(&session.id, Some("codex-thread-1".to_string()))
+            .await;
+        let local_assistant = test_message(
+            "local-assistant",
+            &session.id,
+            MessageRole::Assistant,
+            "I will inspect the workspace and then commit.",
+            now,
+        );
+        state.messages.write().await.insert(
+            session.id.clone(),
+            vec![
+                test_message("local-user", &session.id, MessageRole::User, "commit", now),
+                local_assistant.clone(),
+            ],
+        );
+        provider
+            .set_messages(
+                "codex-thread-1",
+                vec![
+                    test_message("remote-user", "codex-thread-1", MessageRole::User, "commit", now),
+                    test_message(
+                        "remote-assistant",
+                        "codex-thread-1",
+                        MessageRole::Assistant,
+                        "I will inspect the workspace and then commit. Current branch is feat/desktop.",
+                        now + chrono::TimeDelta::seconds(3),
+                    ),
+                ],
+            )
+            .await;
+
+        let messages = state
+            .list_messages(&session.id)
+            .await
+            .expect("messages should exist");
+        let assistant = messages
+            .iter()
+            .find(|message| message.role == MessageRole::Assistant)
+            .expect("assistant should exist");
+        assert_eq!(assistant.id, local_assistant.id);
+        assert_eq!(
+            assistant.content,
+            "I will inspect the workspace and then commit. Current branch is feat/desktop."
+        );
+
+        state
+            .finish_assistant_message(&session.id, &local_assistant.id)
+            .await
+            .expect("original in-flight assistant id should still finish");
     }
 
     #[tokio::test]
@@ -3492,10 +3692,10 @@ mod tests {
         let mut events = state.subscribe();
 
         state
-            .emit_message_delta(&session.id, &assistant_message.id, "hello ")
+            .emit_assistant_message_snapshot(&session.id, &assistant_message.id, "hello ")
             .await;
         state
-            .emit_message_delta(&session.id, &assistant_message.id, "world")
+            .emit_assistant_message_snapshot(&session.id, &assistant_message.id, "hello world")
             .await;
         state
             .finish_assistant_message(&session.id, &assistant_message.id)
@@ -3524,6 +3724,86 @@ mod tests {
 
         assert!(saw_complete_message);
         assert!(saw_idle_status_after_complete_message);
+    }
+
+    #[tokio::test]
+    async fn finish_assistant_message_refreshes_provider_final_snapshot() {
+        let now = Utc::now();
+        let provider = Arc::new(TestMessageProvider::new(HashMap::new()));
+        let registry = ProviderRegistry::from_map(HashMap::from([(
+            AgentKind::Codex,
+            provider.clone() as Arc<dyn AgentProvider>,
+        )]));
+        let state = test_state_with_providers("finish-provider-final-snapshot", registry).await;
+        let project = state
+            .create_project(CreateProjectInput {
+                name: "Project".to_string(),
+                root_path: std::env::temp_dir().to_string_lossy().to_string(),
+            })
+            .await;
+        let session = state
+            .create_session(CreateSessionInput {
+                project_id: project.id,
+                title: Some("Session".to_string()),
+                agent: AgentKind::Codex,
+                brief_reply_mode: false,
+                provider_id: None,
+                reasoning_effort: None,
+            })
+            .await
+            .expect("session should be created");
+        state
+            .set_provider_session_ref(&session.id, Some("codex-thread-1".to_string()))
+            .await;
+        let assistant_message = ChatMessage {
+            id: "local-assistant".to_string(),
+            session_id: session.id.clone(),
+            role: MessageRole::Assistant,
+            content: "partial answer".to_string(),
+            created_at: now,
+        };
+        state.push_message(assistant_message.clone()).await;
+        provider
+            .set_messages(
+                "codex-thread-1",
+                vec![test_message(
+                    "provider-assistant",
+                    "codex-thread-1",
+                    MessageRole::Assistant,
+                    "partial answer with final tail",
+                    now + chrono::TimeDelta::seconds(2),
+                )],
+            )
+            .await;
+        let mut events = state.subscribe();
+
+        state
+            .finish_assistant_message(&session.id, &assistant_message.id)
+            .await
+            .expect("assistant message should finish");
+
+        let mut saw_final_message = false;
+        for _ in 0..3 {
+            if let SessionEvent::MessageCreated(message) =
+                events.recv().await.expect("event should be broadcast")
+            {
+                if message.role == MessageRole::Assistant {
+                    assert_eq!(message.content, "partial answer with final tail");
+                    assert_eq!(message.created_at, now);
+                    saw_final_message = true;
+                    break;
+                }
+            }
+        }
+
+        assert!(saw_final_message);
+        let messages = state
+            .list_messages(&session.id)
+            .await
+            .expect("messages should exist");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "partial answer with final tail");
+        assert_eq!(messages[0].created_at, now);
     }
 
     #[tokio::test]
@@ -3593,7 +3873,7 @@ mod tests {
             .expect("session should be created");
 
         let updated = state
-            .update_session_settings(&session.id, None, Some(None))
+            .update_session_settings(&session.id, None, Some(None), None)
             .await
             .expect("session should update");
         assert_eq!(updated.reasoning_effort, None);

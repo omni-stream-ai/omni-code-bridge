@@ -1831,12 +1831,7 @@ async fn update_session(
 ) -> Result<impl IntoResponse, ApiError> {
     authorize_request(&headers, &state).await?;
     let session = state
-        .update_session_settings(
-            &id,
-            input.provider_id,
-            input.reasoning_effort,
-            input.model,
-        )
+        .update_session_settings(&id, input.provider_id, input.reasoning_effort, input.model)
         .await
         .map_err(|err| ApiError {
             status: StatusCode::NOT_FOUND,
@@ -2263,6 +2258,7 @@ async fn session_events(
                 Ok(event) if event_belongs_to_session(&event, &session_id) => {
                     sse_event_for_session_event(&event)
                 }
+                Err(_) => Some(sync_required_event()),
                 _ => None,
             }
         }
@@ -2279,6 +2275,12 @@ async fn session_events(
 fn sse_event_for_session_event(event: &SessionEvent) -> Option<Result<Event, Infallible>> {
     let (name, json) = encode_session_event(event)?;
     Some(Ok(Event::default().event(name).data(json)))
+}
+
+fn sync_required_event() -> Result<Event, Infallible> {
+    Ok(Event::default()
+        .event("sync.required")
+        .data(r#"{"type":"sync_required","payload":{}}"#))
 }
 
 fn encode_session_event(event: &SessionEvent) -> Option<(&'static str, String)> {
