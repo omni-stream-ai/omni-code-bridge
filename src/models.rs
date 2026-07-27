@@ -160,6 +160,7 @@ pub struct AcpServerConfig {
 #[serde(rename_all = "snake_case")]
 pub enum AcpProfile {
     #[default]
+    #[serde(alias = "kiro")]
     Stdio,
     GenericHttp,
 }
@@ -481,6 +482,15 @@ pub struct MessageDeltaEvent {
     pub delta: String,
 }
 
+/// A complete replacement for an in-flight assistant message's content.
+/// Clients must replace, rather than append, the `content` value.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageSnapshotEvent {
+    pub session_id: String,
+    pub message_id: String,
+    pub content: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentErrorEvent {
     pub session_id: String,
@@ -543,6 +553,7 @@ pub enum SessionEvent {
     SessionStatus(SessionStatusEvent),
     MessageCreated(ChatMessage),
     MessageDelta(MessageDeltaEvent),
+    MessageSnapshot(MessageSnapshotEvent),
     AgentError(AgentErrorEvent),
     ApprovalRequested(ApprovalRequestEvent),
     ApprovalResolved(ApprovalResolvedEvent),
@@ -1058,6 +1069,7 @@ pub struct AcpHandshakeProbe {
 pub enum AgentCommandForwarding {
     Native,
     Wrapped,
+    Bridge,
 }
 
 #[derive(Debug, Clone, Serialize)]

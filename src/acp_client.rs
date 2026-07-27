@@ -5,25 +5,20 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 pub use agent_client_protocol::schema::ProtocolVersion;
 
 pub use agent_client_protocol::schema::v1::{
-    CancelNotification, ContentBlock, ContentChunk, FileSystemCapabilities,
-    Implementation, InitializeRequest, InitializeResponse, LoadSessionRequest,
-    ClientCapabilities, NewSessionRequest, NewSessionResponse,
-    PromptRequest, PromptResponse, ReadTextFileRequest, ReadTextFileResponse,
-    SessionId, SessionNotification, SessionUpdate, StopReason, TextContent,
-    WriteTextFileRequest, WriteTextFileResponse,
+    CancelNotification, ClientCapabilities, ContentBlock, ContentChunk, FileSystemCapabilities,
+    Implementation, InitializeRequest, LoadSessionRequest, NewSessionRequest, PromptRequest,
+    PromptResponse, SessionId, SessionNotification, SessionUpdate, StopReason, TextContent,
 };
 
-pub use agent_client_protocol::schema::v1::{
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, ToolCall, ToolCallUpdate, ToolCallStatus,
-    PermissionOption, PermissionOptionKind,
-};
+pub use agent_client_protocol::schema::v1::{RequestPermissionRequest, RequestPermissionResponse};
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct AcpTransport {
     next_request_id: u64,
 }
 
+#[allow(dead_code)]
 impl AcpTransport {
     pub fn new() -> Self {
         Self { next_request_id: 1 }
@@ -100,6 +95,7 @@ pub struct RawJsonRpcMessage {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum AcpIncomingMessage {
     Response {
         id: String,
@@ -122,6 +118,7 @@ pub enum AcpIncomingMessage {
 }
 
 impl AcpMessageParser {
+    #[allow(dead_code)]
     pub fn parse(line: &str) -> Result<AcpIncomingMessage> {
         let raw: RawJsonRpcMessage =
             serde_json::from_str(line).context("invalid JSON-RPC message")?;
@@ -142,10 +139,7 @@ impl AcpMessageParser {
         } else if let Some(error) = raw.error {
             Ok(AcpIncomingMessage::Error {
                 id: raw.id.as_ref().map(json_value_to_id_string),
-                code: error
-                    .get("code")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(-1),
+                code: error.get("code").and_then(|v| v.as_i64()).unwrap_or(-1),
                 message: error
                     .get("message")
                     .and_then(|v| v.as_str())
@@ -167,7 +161,10 @@ impl AcpMessageParser {
             .context("failed to parse session/update notification")
     }
 
-    pub fn parse_permission_request(params: &serde_json::Value) -> Result<RequestPermissionRequest> {
+    #[allow(dead_code)]
+    pub fn parse_permission_request(
+        params: &serde_json::Value,
+    ) -> Result<RequestPermissionRequest> {
         serde_json::from_value::<RequestPermissionRequest>(params.clone())
             .context("failed to parse permission request")
     }
@@ -178,16 +175,11 @@ impl AcpMessageParser {
     }
 }
 
-pub fn build_initialize_request(
-    client_name: &str,
-    client_version: &str,
-) -> InitializeRequest {
+pub fn build_initialize_request(client_name: &str, client_version: &str) -> InitializeRequest {
     let fs = FileSystemCapabilities::new()
         .read_text_file(true)
         .write_text_file(true);
-    let caps = ClientCapabilities::new()
-        .fs(fs)
-        .terminal(true);
+    let caps = ClientCapabilities::new().fs(fs).terminal(true);
     InitializeRequest::new(ProtocolVersion::V1)
         .client_capabilities(caps)
         .client_info(Implementation::new(client_name, client_version))
@@ -198,10 +190,7 @@ pub fn build_new_session_request(cwd: &str) -> NewSessionRequest {
 }
 
 pub fn build_load_session_request(session_id: &str, cwd: &str) -> LoadSessionRequest {
-    LoadSessionRequest::new(
-        SessionId::new(session_id),
-        cwd.to_string(),
-    )
+    LoadSessionRequest::new(SessionId::new(session_id), cwd.to_string())
 }
 
 pub fn build_prompt_request(session_id: &str, text: &str) -> PromptRequest {
@@ -211,10 +200,7 @@ pub fn build_prompt_request(session_id: &str, text: &str) -> PromptRequest {
     )
 }
 
-pub fn build_prompt_with_blocks(
-    session_id: &str,
-    blocks: Vec<ContentBlock>,
-) -> PromptRequest {
+pub fn build_prompt_with_blocks(session_id: &str, blocks: Vec<ContentBlock>) -> PromptRequest {
     PromptRequest::new(SessionId::new(session_id), blocks)
 }
 
@@ -222,6 +208,7 @@ pub fn make_text_block(text: impl Into<String>) -> ContentBlock {
     ContentBlock::Text(TextContent::new(text))
 }
 
+#[allow(dead_code)]
 pub fn text_from_content_blocks(blocks: &[ContentBlock]) -> String {
     blocks
         .iter()
@@ -237,7 +224,10 @@ pub fn build_cancel_notification(session_id: &str) -> CancelNotification {
     CancelNotification::new(SessionId::new(session_id))
 }
 
-pub fn build_permission_response(outcome: RequestPermissionOutcome) -> RequestPermissionResponse {
+#[allow(dead_code)]
+pub fn build_permission_response(
+    outcome: agent_client_protocol::schema::v1::RequestPermissionOutcome,
+) -> RequestPermissionResponse {
     RequestPermissionResponse::new(outcome)
 }
 
@@ -272,6 +262,7 @@ pub fn serialize_to_json_value<T: Serialize>(value: &T) -> Result<serde_json::Va
     serde_json::to_value(value).context("failed to serialize ACP message")
 }
 
+#[allow(dead_code)]
 async fn write_json_line(
     writer: &mut (impl AsyncWrite + Unpin),
     value: &serde_json::Value,
@@ -283,6 +274,7 @@ async fn write_json_line(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn json_value_to_id_string(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::Number(n) => n.to_string(),

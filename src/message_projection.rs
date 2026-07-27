@@ -2,7 +2,8 @@ use std::collections::HashSet;
 
 use crate::models::{ChatMessage, MessageRole};
 
-const EQUIVALENT_MESSAGE_WINDOW_SECONDS: i64 = 10 * 60;
+const EQUIVALENT_ASSISTANT_MESSAGE_WINDOW_SECONDS: i64 = 10 * 60;
+const EQUIVALENT_USER_MESSAGE_WINDOW_SECONDS: i64 = 10;
 
 pub struct MessageProjection;
 
@@ -58,6 +59,18 @@ fn merge_canonical_messages(
 
         if let Some(existing_index) = merged.iter().position(|message| {
             messages_are_equivalent_in_context(message, &bridge_message, &merged, &bridge_context)
+                || is_empty_assistant_placeholder_for_same_turn(
+                    message,
+                    &bridge_message,
+                    &merged,
+                    &bridge_context,
+                )
+                || is_final_assistant_reply_for_same_turn(
+                    message,
+                    &bridge_message,
+                    &merged,
+                    &bridge_context,
+                )
         }) {
             let existing = &mut merged[existing_index];
             *existing = merge_equivalent_message(existing, &bridge_message);
@@ -71,6 +84,67 @@ fn merge_canonical_messages(
 
     sort_messages(&mut merged);
     merged
+}
+
+fn is_empty_assistant_placeholder_for_same_turn(
+    provider_message: &ChatMessage,
+    bridge_message: &ChatMessage,
+    provider_context: &[ChatMessage],
+    bridge_context: &[ChatMessage],
+) -> bool {
+    if provider_message.role != MessageRole::Assistant
+        || bridge_message.role != MessageRole::Assistant
+        || provider_message.session_id != bridge_message.session_id
+        || !bridge_message.content.trim().is_empty()
+        || provider_message.content.trim().is_empty()
+    {
+        return false;
+    }
+
+    let Some(provider_user) = nearest_user_before(provider_context, provider_message) else {
+        return false;
+    };
+    let Some(bridge_user) = nearest_user_before(bridge_context, bridge_message) else {
+        return false;
+    };
+    provider_user.session_id == bridge_user.session_id
+        && provider_user.content.trim() == bridge_user.content.trim()
+}
+
+fn is_final_assistant_reply_for_same_turn(
+    provider_message: &ChatMessage,
+    bridge_message: &ChatMessage,
+    provider_context: &[ChatMessage],
+    bridge_context: &[ChatMessage],
+) -> bool {
+    if provider_message.role != MessageRole::Assistant
+        || bridge_message.role != MessageRole::Assistant
+        || provider_message.session_id != bridge_message.session_id
+        || provider_message.content.trim().is_empty()
+        || bridge_message.content.trim().is_empty()
+        || !is_last_assistant_in_turn(provider_context, provider_message)
+        || !is_last_assistant_in_turn(bridge_context, bridge_message)
+    {
+        return false;
+    }
+
+    let Some(provider_user) = nearest_user_before(provider_context, provider_message) else {
+        return false;
+    };
+    let Some(bridge_user) = nearest_user_before(bridge_context, bridge_message) else {
+        return false;
+    };
+    provider_user.session_id == bridge_user.session_id
+        && provider_user.content.trim() == bridge_user.content.trim()
+}
+
+fn is_last_assistant_in_turn(messages: &[ChatMessage], target: &ChatMessage) -> bool {
+    let Some(index) = messages.iter().position(|message| message.id == target.id) else {
+        return false;
+    };
+    messages[index + 1..]
+        .iter()
+        .all(|message| message.role == MessageRole::System || message.role == MessageRole::User)
 }
 
 fn should_replace_same_id(existing: &ChatMessage, incoming: &ChatMessage) -> bool {
@@ -106,11 +180,17 @@ fn messages_are_equivalent(a: &ChatMessage, b: &ChatMessage) -> bool {
         return false;
     }
 
+    let window_seconds = match a.role {
+        MessageRole::User => EQUIVALENT_USER_MESSAGE_WINDOW_SECONDS,
+        MessageRole::Assistant => EQUIVALENT_ASSISTANT_MESSAGE_WINDOW_SECONDS,
+        MessageRole::System => return false,
+    };
+
     a.created_at
         .signed_duration_since(b.created_at)
         .num_seconds()
         .abs()
-        <= EQUIVALENT_MESSAGE_WINDOW_SECONDS
+        <= window_seconds
 }
 
 fn messages_are_equivalent_in_context(
@@ -318,6 +398,108 @@ mod tests {
         assert_eq!(
             projected[0].content,
             "I will inspect the workspace and then commit. Current branch is feat/desktop."
+        );
+    }
+
+    #[test]
+    fn projection_merges_empty_bridge_reply_placeholder_with_provider_final_reply() {
+        let now = Utc::now();
+        let projected = MessageProjection::from_sources(
+            "session",
+            vec![
+                message(
+                    "remote-user",
+                    "provider-thread",
+                    MessageRole::User,
+                    "inspect the workspace",
+                    now,
+                ),
+                message(
+                    "remote-assistant",
+                    "provider-thread",
+                    MessageRole::Assistant,
+                    "I inspected the workspace and found two changed files.",
+                    now + TimeDelta::seconds(2),
+                ),
+            ],
+            vec![
+                message(
+                    "bridge-user",
+                    "session",
+                    MessageRole::User,
+                    "inspect the workspace",
+                    now + TimeDelta::seconds(1),
+                ),
+                message(
+                    "bridge-assistant",
+                    "session",
+                    MessageRole::Assistant,
+                    "",
+                    now + TimeDelta::seconds(1),
+                ),
+            ],
+        );
+
+        assert_eq!(projected.len(), 2);
+        let assistant = projected
+            .iter()
+            .find(|message| message.role == MessageRole::Assistant)
+            .expect("assistant reply should exist");
+        assert_eq!(assistant.id, "bridge-assistant");
+        assert_eq!(
+            assistant.content,
+            "I inspected the workspace and found two changed files."
+        );
+    }
+
+    #[test]
+    fn projection_merges_non_prefix_bridge_stream_with_provider_final_reply() {
+        let now = Utc::now();
+        let projected = MessageProjection::from_sources(
+            "session",
+            vec![
+                message(
+                    "remote-user",
+                    "provider-thread",
+                    MessageRole::User,
+                    "inspect the workspace",
+                    now,
+                ),
+                message(
+                    "remote-assistant",
+                    "provider-thread",
+                    MessageRole::Assistant,
+                    "I found two changed files and one untracked directory.",
+                    now + TimeDelta::seconds(2),
+                ),
+            ],
+            vec![
+                message(
+                    "bridge-user",
+                    "session",
+                    MessageRole::User,
+                    "inspect the workspace",
+                    now + TimeDelta::seconds(1),
+                ),
+                message(
+                    "bridge-assistant",
+                    "session",
+                    MessageRole::Assistant,
+                    "Looking through the repository now.",
+                    now + TimeDelta::seconds(1),
+                ),
+            ],
+        );
+
+        assert_eq!(projected.len(), 2);
+        let assistant = projected
+            .iter()
+            .find(|message| message.role == MessageRole::Assistant)
+            .expect("assistant reply should exist");
+        assert_eq!(assistant.id, "bridge-assistant");
+        assert_eq!(
+            assistant.content,
+            "I found two changed files and one untracked directory."
         );
     }
 

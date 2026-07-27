@@ -24,7 +24,7 @@ use tokio_stream::wrappers::BroadcastStream;
 
 use crate::{
     adapter,
-    app_state::AppState,
+    app_state::{AppState, EventReplay, SequencedSessionEvent},
     asr,
     bridge_settings::{BridgeSettings, BridgeSettingsInput},
     models::{
@@ -2216,7 +2216,63 @@ fn agent_commands_summary(kind: AgentKind) -> AgentCommandsSummary {
                 forwarding: AgentCommandForwarding::Wrapped,
             },
         ],
-        AgentKind::OpenCode | AgentKind::Acp | AgentKind::Custom => Vec::new(),
+        AgentKind::OpenCode => vec![
+            AgentCommandSummary {
+                name: "/clear".to_string(),
+                args_hint: None,
+                description: "Clear the current OpenCode session context".to_string(),
+                forwarding: AgentCommandForwarding::Native,
+            },
+            AgentCommandSummary {
+                name: "/compact".to_string(),
+                args_hint: None,
+                description: "Compact the current OpenCode session context".to_string(),
+                forwarding: AgentCommandForwarding::Native,
+            },
+            AgentCommandSummary {
+                name: "/undo".to_string(),
+                args_hint: None,
+                description: "Undo the last OpenCode edit".to_string(),
+                forwarding: AgentCommandForwarding::Native,
+            },
+            AgentCommandSummary {
+                name: "/redo".to_string(),
+                args_hint: None,
+                description: "Redo the last undone OpenCode edit".to_string(),
+                forwarding: AgentCommandForwarding::Native,
+            },
+            AgentCommandSummary {
+                name: "/init".to_string(),
+                args_hint: None,
+                description: "Initialize an AGENTS.md file for the current project".to_string(),
+                forwarding: AgentCommandForwarding::Native,
+            },
+            AgentCommandSummary {
+                name: "/share".to_string(),
+                args_hint: None,
+                description: "Share the current OpenCode session".to_string(),
+                forwarding: AgentCommandForwarding::Native,
+            },
+            AgentCommandSummary {
+                name: "/unshare".to_string(),
+                args_hint: None,
+                description: "Stop sharing the current OpenCode session".to_string(),
+                forwarding: AgentCommandForwarding::Native,
+            },
+            AgentCommandSummary {
+                name: "/model".to_string(),
+                args_hint: Some("<provider/model>".to_string()),
+                description: "Switch the active model for this session".to_string(),
+                forwarding: AgentCommandForwarding::Native,
+            },
+            AgentCommandSummary {
+                name: "/rename".to_string(),
+                args_hint: Some("<title>".to_string()),
+                description: "Rename current session".to_string(),
+                forwarding: AgentCommandForwarding::Bridge,
+            },
+        ],
+        AgentKind::Acp | AgentKind::Custom => Vec::new(),
     };
     AgentCommandsSummary { kind, commands }
 }
@@ -2242,20 +2298,47 @@ async fn session_events(
     State(state): State<Arc<AppState>>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
     authorize_request_status(&headers, &state).await?;
+    let last_event_id = headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok());
+    let subscription = state.subscribe_with_replay(last_event_id);
     let detail = state.get_session(&id).await.ok_or(ApiError {
         status: StatusCode::NOT_FOUND,
         message: "session not found".to_string(),
     })?;
 
-    let initial_event = SessionEvent::SessionSnapshot(detail.session);
-    let initial_stream = stream::once(async move { sse_event_for_session_event(&initial_event) })
-        .filter_map(std::future::ready);
+    let replay_session_id = id.clone();
+    let initial_stream = match last_event_id {
+        Some(_) => match subscription.replay {
+            EventReplay::Events(events) => stream::iter(
+                events
+                    .into_iter()
+                    .filter(move |event| event_belongs_to_session(&event.event, &replay_session_id))
+                    .filter_map(|event| sse_event_for_session_event(&event)),
+            )
+            .boxed(),
+            EventReplay::SyncRequired => stream::once(async { sync_required_event() }).boxed(),
+        },
+        None => {
+            let initial_event = SessionEvent::SessionSnapshot(detail.session);
+            let high_watermark = subscription.high_watermark;
+            stream::once(
+                async move { sse_event_for_initial_snapshot(&initial_event, high_watermark) },
+            )
+            .boxed()
+        }
+    };
 
-    let broadcast_stream = BroadcastStream::new(state.subscribe()).filter_map(move |item| {
+    let high_watermark = subscription.high_watermark;
+    let broadcast_stream = BroadcastStream::new(subscription.receiver).filter_map(move |item| {
         let session_id = id.clone();
         async move {
             match item {
-                Ok(event) if event_belongs_to_session(&event, &session_id) => {
+                Ok(event)
+                    if event.id > high_watermark
+                        && event_belongs_to_session(&event.event, &session_id) =>
+                {
                     sse_event_for_session_event(&event)
                 }
                 Err(_) => Some(sync_required_event()),
@@ -2272,9 +2355,23 @@ async fn session_events(
     ))
 }
 
-fn sse_event_for_session_event(event: &SessionEvent) -> Option<Result<Event, Infallible>> {
-    let (name, json) = encode_session_event(event)?;
-    Some(Ok(Event::default().event(name).data(json)))
+fn sse_event_for_initial_snapshot(
+    event: &SessionEvent,
+    event_id: u64,
+) -> Result<Event, Infallible> {
+    let (name, json) = encode_session_event(event).expect("session snapshot serializes");
+    Ok(Event::default()
+        .id(event_id.to_string())
+        .event(name)
+        .data(json))
+}
+
+fn sse_event_for_session_event(event: &SequencedSessionEvent) -> Option<Result<Event, Infallible>> {
+    let (name, json) = encode_session_event(&event.event)?;
+    Some(Ok(Event::default()
+        .id(event.id.to_string())
+        .event(name)
+        .data(json)))
 }
 
 fn sync_required_event() -> Result<Event, Infallible> {
@@ -2370,6 +2467,7 @@ fn event_belongs_to_session(event: &SessionEvent, session_id: &str) -> bool {
         SessionEvent::SessionStatus(status) => status.session_id == session_id,
         SessionEvent::MessageCreated(message) => message.session_id == session_id,
         SessionEvent::MessageDelta(delta) => delta.session_id == session_id,
+        SessionEvent::MessageSnapshot(snapshot) => snapshot.session_id == session_id,
         SessionEvent::AgentError(error) => error.session_id == session_id,
         SessionEvent::ApprovalRequested(event) => event.session_id == session_id,
         SessionEvent::ApprovalResolved(event) => event.session_id == session_id,
@@ -2382,6 +2480,7 @@ fn event_name(event: &SessionEvent) -> &'static str {
         SessionEvent::SessionStatus(_) => "session.status",
         SessionEvent::MessageCreated(_) => "message.created",
         SessionEvent::MessageDelta(_) => "message.delta",
+        SessionEvent::MessageSnapshot(_) => "message.snapshot",
         SessionEvent::AgentError(_) => "agent.error",
         SessionEvent::ApprovalRequested(_) => "approval.requested",
         SessionEvent::ApprovalResolved(_) => "approval.resolved",
@@ -3283,7 +3382,24 @@ for line in sys.stdin:
         );
 
         let opencode = agent_commands_summary(AgentKind::OpenCode);
-        assert!(opencode.commands.is_empty());
+        assert!(
+            opencode
+                .commands
+                .iter()
+                .any(|command| command.name == "/clear")
+        );
+        assert!(
+            opencode
+                .commands
+                .iter()
+                .any(|command| command.name == "/compact")
+        );
+        assert!(
+            opencode
+                .commands
+                .iter()
+                .any(|command| command.name == "/rename")
+        );
     }
 
     fn test_message(id: &str, role: MessageRole, content: &str) -> ChatMessage {

@@ -590,6 +590,23 @@ mod tests {
     }
 
     #[test]
+    fn acp_profile_deserializes_legacy_kiro_alias_as_stdio() {
+        let server: crate::models::AcpServerConfig = serde_json::from_str(
+            r#"{
+                "id": "kiro-local",
+                "name": "Kiro Local ACP",
+                "profile": "kiro",
+                "command": "kiro-cli",
+                "args": ["acp"]
+            }"#,
+        )
+        .expect("legacy kiro profile should deserialize");
+
+        assert!(matches!(server.profile, crate::models::AcpProfile::Stdio));
+        assert!(validate_acp_servers(&[server]).is_ok());
+    }
+
+    #[test]
     fn validate_acp_servers_accepts_stdio_command_profile() {
         let servers = vec![crate::models::AcpServerConfig {
             id: "opencode-acp".to_string(),

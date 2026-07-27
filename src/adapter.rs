@@ -1,5 +1,6 @@
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    hash::{Hash, Hasher},
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex, OnceLock},
@@ -130,32 +131,39 @@ fn drain_stdout(mut rx: mpsc::UnboundedReceiver<std::result::Result<String, Stri
     output
 }
 
-async fn list_acp_sessions(config: &crate::models::AcpServerConfig) -> Result<HashMap<String, SessionSummary>> {
-    let (
-        mut child,
-        mut stdin,
-        mut stdout_rx,
-        stderr_task,
-        stderr_buffer,
-        _command_name,
-    ) = AcpProvider::spawn_and_init(config).await?;
+async fn list_acp_sessions(
+    config: &crate::models::AcpServerConfig,
+) -> Result<HashMap<String, SessionSummary>> {
+    let (mut child, mut stdin, mut stdout_rx, stderr_task, stderr_buffer, _command_name) =
+        AcpProvider::spawn_and_init(config).await?;
 
     let mut next_request_id = 1_u64;
     let mut raw_stdout = String::new();
     let result = async {
         AcpProvider::initialize_acp(
-            &mut stdin, &mut stdout_rx, &mut child,
-            &stderr_buffer, &mut raw_stdout, &mut next_request_id,
+            &mut stdin,
+            &mut stdout_rx,
+            &mut child,
+            &stderr_buffer,
+            &mut raw_stdout,
+            &mut next_request_id,
             "omni-code-bridge-lister",
-        ).await?;
+        )
+        .await?;
 
         let params = serde_json::json!({});
-        let list_id = send_json_rpc_request(&mut stdin, &mut next_request_id, "session/list", params).await?;
+        let list_id =
+            send_json_rpc_request(&mut stdin, &mut next_request_id, "session/list", params).await?;
         let response = wait_for_acp_json_rpc_response(
-            &mut child, &mut stdout_rx, &mut raw_stdout,
-            &stderr_buffer, list_id,
-            acp_json_rpc_handshake_timeout(), "session/list",
-        ).await?;
+            &mut child,
+            &mut stdout_rx,
+            &mut raw_stdout,
+            &stderr_buffer,
+            list_id,
+            acp_json_rpc_handshake_timeout(),
+            "session/list",
+        )
+        .await?;
 
         let sessions = response
             .get("sessions")
@@ -183,25 +191,29 @@ async fn list_acp_sessions(config: &crate::models::AcpServerConfig) -> Result<Ha
             let project_id = cwd
                 .map(crate::session_store::project_id_for_path)
                 .unwrap_or_else(|| "acp-project".to_string());
-            result.insert(id.clone(), SessionSummary {
-                id: id.clone(),
-                project_id,
-                title,
-                agent: AgentKind::Acp,
-                brief_reply_mode: false,
-                status: crate::models::SessionStatus::Idle,
-                updated_at: chrono::Utc::now(),
-                unread_count: 0,
-                last_message_preview: None,
-                pending_approval: None,
-                runtime_session_ref: Some(id),
-                provider_id: config.id.clone().into(),
-                reasoning_effort: None,
-                model: None,
-            });
+            result.insert(
+                id.clone(),
+                SessionSummary {
+                    id: id.clone(),
+                    project_id,
+                    title,
+                    agent: AgentKind::Acp,
+                    brief_reply_mode: false,
+                    status: crate::models::SessionStatus::Idle,
+                    updated_at: chrono::Utc::now(),
+                    unread_count: 0,
+                    last_message_preview: None,
+                    pending_approval: None,
+                    runtime_session_ref: Some(id),
+                    provider_id: config.id.clone().into(),
+                    reasoning_effort: None,
+                    model: None,
+                },
+            );
         }
         Ok::<_, anyhow::Error>(result)
-    }.await;
+    }
+    .await;
 
     let _ = child.kill().await;
     let _ = drain_stdout(stdout_rx);
@@ -213,14 +225,8 @@ async fn load_acp_session_messages(
     config: &crate::models::AcpServerConfig,
     session_id: &str,
 ) -> Result<Vec<ChatMessage>> {
-    let (
-        mut child,
-        mut stdin,
-        mut stdout_rx,
-        stderr_task,
-        stderr_buffer,
-        _command_name,
-    ) = AcpProvider::spawn_and_init(config).await?;
+    let (mut child, mut stdin, mut stdout_rx, stderr_task, stderr_buffer, _command_name) =
+        AcpProvider::spawn_and_init(config).await?;
 
     let mut next_request_id = 1_u64;
     let mut raw_stdout = String::new();
@@ -319,14 +325,8 @@ async fn summarize_with_acp(
     config: &crate::models::AcpServerConfig,
     content: &str,
 ) -> Result<String> {
-    let (
-        mut child,
-        mut stdin,
-        mut stdout_rx,
-        stderr_task,
-        stderr_buffer,
-        _command_name,
-    ) = AcpProvider::spawn_and_init(config).await?;
+    let (mut child, mut stdin, mut stdout_rx, stderr_task, stderr_buffer, _command_name) =
+        AcpProvider::spawn_and_init(config).await?;
 
     let mut next_request_id = 1_u64;
     let mut raw_stdout = String::new();
@@ -549,6 +549,56 @@ mod tests {
         }
 
         assert_eq!(state.finish_text().as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn codex_streaming_state_ignores_replayed_delta_after_completion() {
+        let mut state = CodexAppServerStreamingState::default();
+        let delta = serde_json::json!({
+            "method": "item/agentMessage/delta",
+            "params": {"itemId": "msg-1", "delta": "final answer"}
+        });
+        let complete = serde_json::json!({
+            "method": "item/completed",
+            "params": {"item": {"id": "msg-1", "type": "agentMessage", "text": "final answer"}}
+        });
+
+        assert!(matches!(
+            state.ingest_value(&delta),
+            CodexAppServerEvent::Content(_)
+        ));
+        assert!(matches!(
+            state.ingest_value(&complete),
+            CodexAppServerEvent::Content(_)
+        ));
+        assert!(matches!(
+            state.ingest_value(&delta),
+            CodexAppServerEvent::None
+        ));
+        assert!(matches!(
+            state.ingest_value(&complete),
+            CodexAppServerEvent::None
+        ));
+        assert_eq!(state.finish_text().as_deref(), Some("final answer"));
+    }
+
+    #[test]
+    fn codex_streaming_state_ignores_immediately_repeated_delta() {
+        let mut state = CodexAppServerStreamingState::default();
+        let delta = serde_json::json!({
+            "method": "item/agentMessage/delta",
+            "params": {"itemId": "msg-1", "delta": "hello"}
+        });
+
+        assert!(matches!(
+            state.ingest_value(&delta),
+            CodexAppServerEvent::Content(_)
+        ));
+        assert!(matches!(
+            state.ingest_value(&delta),
+            CodexAppServerEvent::None
+        ));
+        assert_eq!(state.finish_text().as_deref(), Some("hello"));
     }
 
     #[test]
@@ -2500,6 +2550,173 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn opencode_messages_render_tool_only_history_parts() {
+        let messages = opencode_messages_from_value(
+            "ses_123",
+            &serde_json::json!([
+                {
+                    "info": {
+                        "id": "msg_tool",
+                        "role": "assistant",
+                        "time": { "created": 1767036064268_i64 }
+                    },
+                    "parts": [
+                        { "type": "step-start" },
+                        {
+                            "type": "tool",
+                            "tool": "bash",
+                            "state": {
+                                "status": "completed",
+                                "input": { "command": "cargo test" }
+                            }
+                        },
+                        { "type": "step-finish" }
+                    ]
+                }
+            ]),
+        );
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, MessageRole::Assistant);
+        assert_eq!(
+            messages[0].content,
+            "[opencode] step started\n[opencode:bash:completed] cargo test\n[opencode] step finished"
+        );
+    }
+
+    #[test]
+    fn opencode_messages_keep_text_around_status_parts() {
+        let messages = opencode_messages_from_value(
+            "ses_123",
+            &serde_json::json!([
+                {
+                    "info": {
+                        "id": "msg_mixed",
+                        "role": "assistant",
+                        "time": { "created": 1767036064268_i64 }
+                    },
+                    "parts": [
+                        { "type": "text", "text": "hello " },
+                        { "type": "text", "text": "world" },
+                        { "type": "step-finish" }
+                    ]
+                }
+            ]),
+        );
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "hello world\n[opencode] step finished");
+    }
+
+    #[test]
+    fn opencode_db_path_candidates_include_platform_defaults() {
+        let explicit = PathBuf::from("/custom/opencode-data");
+        let xdg = PathBuf::from("/xdg-data");
+        let home = PathBuf::from("/home/alice");
+
+        let unix = opencode_db_path_candidates_from_values(
+            vec![explicit.clone()],
+            Some(xdg.clone()),
+            Some(home.clone()),
+            None,
+            None,
+            OpenCodeDbPlatform::Unix,
+        );
+        assert_eq!(unix[0], explicit.join("opencode.db"));
+        assert!(unix.contains(&xdg.join("opencode/opencode.db")));
+        assert!(unix.contains(&home.join(".local/share/opencode/opencode.db")));
+        assert!(unix.contains(&home.join(".opencode/opencode.db")));
+
+        let macos = opencode_db_path_candidates_from_values(
+            Vec::new(),
+            None,
+            Some(home.clone()),
+            None,
+            None,
+            OpenCodeDbPlatform::Macos,
+        );
+        assert!(macos.contains(&home.join("Library/Application Support/opencode/opencode.db")));
+
+        let windows = opencode_db_path_candidates_from_values(
+            Vec::new(),
+            None,
+            Some(PathBuf::from("C:/Users/Alice")),
+            Some(PathBuf::from("C:/Users/Alice/AppData/Local")),
+            Some(PathBuf::from("C:/Users/Alice/AppData/Roaming")),
+            OpenCodeDbPlatform::Windows,
+        );
+        assert!(windows.contains(&PathBuf::from(
+            "C:/Users/Alice/AppData/Local/opencode/opencode.db"
+        )));
+        assert!(windows.contains(&PathBuf::from(
+            "C:/Users/Alice/AppData/Roaming/opencode/opencode.db"
+        )));
+    }
+
+    #[test]
+    fn opencode_db_archive_lists_sessions_and_messages() {
+        let db_path = std::env::temp_dir().join(format!(
+            "omni-code-bridge-opencode-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        {
+            let conn = rusqlite::Connection::open(&db_path).expect("db should open");
+            conn.execute_batch(
+                r#"
+                CREATE TABLE session (
+                    id text PRIMARY KEY,
+                    project_id text NOT NULL,
+                    directory text NOT NULL,
+                    title text NOT NULL,
+                    time_updated integer NOT NULL,
+                    time_archived integer
+                );
+                CREATE TABLE message (
+                    id text PRIMARY KEY,
+                    session_id text NOT NULL,
+                    time_created integer NOT NULL,
+                    data text NOT NULL
+                );
+                CREATE TABLE part (
+                    id text PRIMARY KEY,
+                    message_id text NOT NULL,
+                    session_id text NOT NULL,
+                    time_created integer NOT NULL,
+                    data text NOT NULL
+                );
+                INSERT INTO session (id, project_id, directory, title, time_updated, time_archived)
+                VALUES ('ses_local', 'project-local', '/tmp/opencode-project', 'Local OpenCode', 1767036064268, NULL);
+                INSERT INTO message (id, session_id, time_created, data)
+                VALUES
+                    ('msg_user', 'ses_local', 1767036064268, '{"role":"user","time":{"created":1767036064268}}'),
+                    ('msg_assistant', 'ses_local', 1767036065268, '{"role":"assistant","time":{"created":1767036065268}}');
+                INSERT INTO part (id, message_id, session_id, time_created, data)
+                VALUES
+                    ('part_user_text', 'msg_user', 'ses_local', 1767036064268, '{"type":"text","text":"hello"}'),
+                    ('part_assistant_step', 'msg_assistant', 'ses_local', 1767036065268, '{"type":"step-start"}'),
+                    ('part_assistant_tool', 'msg_assistant', 'ses_local', 1767036065269, '{"type":"tool","tool":"bash","state":{"status":"completed","input":{"command":"cargo test"}}}');
+                "#,
+            )
+            .expect("schema should be created");
+        }
+
+        let archive = load_opencode_archive_from_db(&db_path).expect("archive should load");
+        assert!(archive.sessions.contains_key("ses_local"));
+        assert_eq!(archive.projects.len(), 1);
+
+        let messages =
+            load_opencode_messages_from_db(&db_path, "ses_local").expect("messages should load");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content, "hello");
+        assert_eq!(
+            messages[1].content,
+            "[opencode] step started\n[opencode:bash:completed] cargo test"
+        );
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
     fn acp_notification_parses_agent_message_chunks() {
         let params = serde_json::json!({
             "type": "AgentMessageChunk",
@@ -2508,10 +2725,7 @@ for line in sys.stdin:
             }
         });
 
-        assert_eq!(
-            extract_acp_message_chunk(&params).as_deref(),
-            Some("hello")
-        );
+        assert_eq!(extract_acp_message_chunk(&params).as_deref(), Some("hello"));
 
         let session_update = serde_json::json!({
             "sessionUpdate": "agent_message_chunk",
@@ -2919,11 +3133,86 @@ impl AgentProvider for ClaudeCodeProvider {
     }
 }
 
-struct OpenCodeProvider;
+#[derive(Clone)]
+struct CachedOpenCodeArchive {
+    checked_at: Instant,
+    fingerprint: u64,
+    db_path: PathBuf,
+    projects: HashMap<String, ProjectSummary>,
+    sessions: HashMap<String, SessionSummary>,
+    messages: HashMap<String, CachedMessageSet>,
+}
+
+struct OpenCodeProvider {
+    cache: Mutex<Option<CachedOpenCodeArchive>>,
+}
 
 impl OpenCodeProvider {
+    const ARCHIVE_CACHE_TTL: Duration = Duration::from_secs(2);
+
     fn new() -> Self {
-        Self
+        Self {
+            cache: Mutex::new(None),
+        }
+    }
+
+    fn ensure_archive(&self) -> Option<CachedOpenCodeArchive> {
+        let db_path = opencode_db_path();
+        let fingerprint = file_fingerprint_for_opencode_db(&db_path)?;
+        {
+            let cache = self.cache.lock().expect("opencode cache poisoned");
+            if let Some(existing) = cache.as_ref()
+                && existing.db_path == db_path
+                && existing.fingerprint == fingerprint
+                && existing.checked_at.elapsed() < Self::ARCHIVE_CACHE_TTL
+            {
+                return Some(existing.clone());
+            }
+        }
+
+        let loaded = load_opencode_archive_from_db(&db_path).ok()?;
+        let mut cache = self.cache.lock().expect("opencode cache poisoned");
+        if let Some(existing) = cache.as_mut()
+            && existing.db_path == db_path
+            && existing.fingerprint == fingerprint
+        {
+            existing.checked_at = Instant::now();
+            return Some(existing.clone());
+        }
+
+        let messages = cache
+            .as_ref()
+            .filter(|existing| existing.db_path == db_path && existing.fingerprint == fingerprint)
+            .map(|existing| existing.messages.clone())
+            .unwrap_or_default();
+        let archive = CachedOpenCodeArchive {
+            checked_at: Instant::now(),
+            fingerprint,
+            db_path,
+            projects: loaded.projects,
+            sessions: loaded.sessions,
+            messages,
+        };
+        *cache = Some(archive.clone());
+        Some(archive)
+    }
+
+    fn load_messages_for_session(&self, session_id: &str) -> Option<Vec<ChatMessage>> {
+        let mut archive = self.ensure_archive()?;
+        if let Some(existing) = archive.messages.get(session_id) {
+            return Some(existing.messages.clone());
+        }
+        let loaded = load_opencode_messages_from_db(&archive.db_path, session_id).ok()?;
+        archive.messages.insert(
+            session_id.to_string(),
+            CachedMessageSet {
+                fingerprint: archive.fingerprint,
+                messages: loaded.clone(),
+            },
+        );
+        let mut cache = self.cache.lock().expect("opencode cache poisoned");
+        *cache = Some(archive);
+        Some(loaded)
     }
 }
 
@@ -3053,7 +3342,14 @@ impl AcpProvider {
             }
         });
 
-        Ok((child, stdin, stdout_rx, stderr_task, stderr_buffer, command_name))
+        Ok((
+            child,
+            stdin,
+            stdout_rx,
+            stderr_task,
+            stderr_buffer,
+            command_name,
+        ))
     }
 
     async fn initialize_acp(
@@ -3065,16 +3361,21 @@ impl AcpProvider {
         next_request_id: &mut u64,
         client_name: &str,
     ) -> Result<()> {
-        let init_request = crate::acp_client::build_initialize_request(
-            client_name,
-            env!("CARGO_PKG_VERSION"),
-        );
+        let init_request =
+            crate::acp_client::build_initialize_request(client_name, env!("CARGO_PKG_VERSION"));
         let init_params = crate::acp_client::serialize_to_json_value(&init_request)?;
-        let init_id = send_json_rpc_request(stdin, next_request_id, "initialize", init_params).await?;
+        let init_id =
+            send_json_rpc_request(stdin, next_request_id, "initialize", init_params).await?;
         wait_for_acp_json_rpc_response(
-            child, stdout_rx, raw_stdout, stderr_buffer,
-            init_id, acp_json_rpc_handshake_timeout(), "initialize",
-        ).await?;
+            child,
+            stdout_rx,
+            raw_stdout,
+            stderr_buffer,
+            init_id,
+            acp_json_rpc_handshake_timeout(),
+            "initialize",
+        )
+        .await?;
         Ok(())
     }
 }
@@ -3135,6 +3436,9 @@ fn claude_prompt_input(text: &str) -> String {
 #[async_trait]
 impl AgentProvider for OpenCodeProvider {
     async fn list_projects(&self) -> HashMap<String, ProjectSummary> {
+        if let Some(archive) = self.ensure_archive() {
+            return archive.projects;
+        }
         match OpenCodeHttpClient::start().await {
             Ok(mut client) => {
                 let result = client.list_projects().await.unwrap_or_default();
@@ -3146,6 +3450,9 @@ impl AgentProvider for OpenCodeProvider {
     }
 
     async fn list_sessions(&self) -> HashMap<String, SessionSummary> {
+        if let Some(archive) = self.ensure_archive() {
+            return archive.sessions;
+        }
         match OpenCodeHttpClient::start().await {
             Ok(mut client) => {
                 let result = client.list_sessions().await.unwrap_or_default();
@@ -3157,14 +3464,22 @@ impl AgentProvider for OpenCodeProvider {
     }
 
     async fn list_messages(&self, session_id: &str) -> Option<Vec<ChatMessage>> {
+        if let Some(messages) = self.load_messages_for_session(session_id) {
+            return Some(messages);
+        }
         let mut client = OpenCodeHttpClient::start().await.ok()?;
         let result = client.list_messages(session_id).await.ok();
         client.shutdown().await;
         result
     }
 
-    async fn default_runtime_ref(&self, _session_id: &str) -> Option<String> {
-        None
+    async fn default_runtime_ref(&self, session_id: &str) -> Option<String> {
+        self.ensure_archive().and_then(|archive| {
+            archive
+                .sessions
+                .contains_key(session_id)
+                .then(|| session_id.to_string())
+        })
     }
 
     async fn run_session(
@@ -3243,7 +3558,9 @@ impl AgentProvider for AcpProvider {
         match load_acp_session_messages(&config, session_id).await {
             Ok(messages) => {
                 let mut archive = self.archive.lock().unwrap();
-                archive.messages.insert(session_id.to_string(), messages.clone());
+                archive
+                    .messages
+                    .insert(session_id.to_string(), messages.clone());
                 Some(messages)
             }
             Err(_) => None,
@@ -3298,7 +3615,7 @@ impl AgentProvider for AcpProvider {
     async fn summarize_reply(
         &self,
         state: Arc<AppState>,
-        session: SessionSummary,
+        _session: SessionSummary,
         content: String,
     ) -> Result<String> {
         self.store_state(&state);
@@ -5149,6 +5466,28 @@ async fn run_opencode(
         .map(PathBuf::from)
         .map_err(anyhow::Error::msg)?;
 
+    if let Some(cmd) = parse_slash_command(&input.content) {
+        if cmd.name == "rename" {
+            let new_title = if cmd.args.is_empty() {
+                "OpenCode session"
+            } else {
+                cmd.args
+            };
+            state
+                .update_session_title(&session.id, new_title.to_string())
+                .await
+                .ok();
+            state
+                .emit_system_message(&session.id, format!("Session renamed to: {new_title}"))
+                .await;
+            state
+                .finish_assistant_message(&session.id, &reply.id)
+                .await
+                .map_err(anyhow::Error::msg)?;
+            return Ok(());
+        }
+    }
+
     let mut client = OpenCodeHttpClient::start_with_config(provider_config.as_ref()).await?;
     let opencode_session_id =
         if let Some(session_id) = state.provider_session_ref(&session.id).await {
@@ -5250,6 +5589,12 @@ async fn run_opencode(
                     "session.idle" => break,
                     _ => {
                         if let Some(status) = render_opencode_event_status(event_type, properties) {
+                            eprintln!(
+                                "[opencode] system event session={} type={} status={}",
+                                opencode_session_id,
+                                event_type,
+                                status
+                            );
                             state.emit_system_message(&session.id, status).await;
                         }
                     }
@@ -5300,10 +5645,7 @@ async fn run_acp(
     let Some(config) = provider_config else {
         bail!("ACP agent requires an ACP server configuration");
     };
-    if matches!(
-        config.acp_profile,
-        Some(AcpProfile::Stdio)
-    ) {
+    if matches!(config.acp_profile, Some(AcpProfile::Stdio)) {
         run_stdio_acp(
             state,
             session,
@@ -5643,18 +5985,11 @@ async fn run_stdio_acp(
 
     let mut next_request_id = 1_u64;
     let mut raw_stdout = String::new();
-    let init_request = crate::acp_client::build_initialize_request(
-        "omni-code-bridge",
-        env!("CARGO_PKG_VERSION"),
-    );
+    let init_request =
+        crate::acp_client::build_initialize_request("omni-code-bridge", env!("CARGO_PKG_VERSION"));
     let init_params = crate::acp_client::serialize_to_json_value(&init_request)?;
-    let init_request_id = send_json_rpc_request(
-        &mut stdin,
-        &mut next_request_id,
-        "initialize",
-        init_params,
-    )
-    .await?;
+    let init_request_id =
+        send_json_rpc_request(&mut stdin, &mut next_request_id, "initialize", init_params).await?;
     wait_for_acp_json_rpc_response(
         &mut child,
         &mut stdout_rx,
@@ -5722,17 +6057,12 @@ async fn run_stdio_acp(
             }
         }
     } else {
-        let new_request = crate::acp_client::build_new_session_request(
-            &project_root.display().to_string(),
-        );
+        let new_request =
+            crate::acp_client::build_new_session_request(&project_root.display().to_string());
         let new_params = crate::acp_client::serialize_to_json_value(&new_request)?;
-        let new_request_id = send_json_rpc_request(
-            &mut stdin,
-            &mut next_request_id,
-            "session/new",
-            new_params,
-        )
-        .await?;
+        let new_request_id =
+            send_json_rpc_request(&mut stdin, &mut next_request_id, "session/new", new_params)
+                .await?;
         wait_for_acp_json_rpc_response(
             &mut child,
             &mut stdout_rx,
@@ -5784,8 +6114,15 @@ async fn run_stdio_acp(
     if let Some(cmd) = parse_slash_command(&input.content) {
         match cmd.name {
             "rename" => {
-                let new_title = if cmd.args.is_empty() { "ACP session" } else { cmd.args };
-                state.update_session_title(&session.id, new_title.to_string()).await.ok();
+                let new_title = if cmd.args.is_empty() {
+                    "ACP session"
+                } else {
+                    cmd.args
+                };
+                state
+                    .update_session_title(&session.id, new_title.to_string())
+                    .await
+                    .ok();
             }
             _ => {}
         }
@@ -5802,10 +6139,8 @@ async fn run_stdio_acp(
             reasoning_effort.as_str()
         )));
     }
-    let prompt_request = crate::acp_client::build_prompt_with_blocks(
-        &runtime_session_id,
-        content_blocks.clone(),
-    );
+    let prompt_request =
+        crate::acp_client::build_prompt_with_blocks(&runtime_session_id, content_blocks.clone());
     let mut prompt_params = crate::acp_client::serialize_to_json_value(&prompt_request)?;
     if let Some(obj) = prompt_params.as_object_mut() {
         let prompt_val = obj["prompt"].clone();
@@ -6561,6 +6896,8 @@ struct CodexAppServerStreamingState {
     display_blocks: Vec<String>,
     assistant_blocks: Vec<String>,
     partial_agent_messages: BTreeMap<String, String>,
+    last_agent_message_delta: BTreeMap<String, String>,
+    completed_agent_message_ids: HashSet<String>,
     latest_status: Option<String>,
     session_id: Option<String>,
     running_command: Option<RunningCommand>,
@@ -6664,9 +7001,17 @@ impl CodexAppServerStreamingState {
                         .get("delta")
                         .and_then(Value::as_str)
                         .unwrap_or_default();
-                    if item_id.is_empty() || delta.is_empty() {
+                    if item_id.is_empty()
+                        || delta.is_empty()
+                        || self.completed_agent_message_ids.contains(&item_id)
+                    {
                         CodexAppServerEvent::None
                     } else {
+                        if self.last_agent_message_delta.get(&item_id) == Some(&delta.to_string()) {
+                            return CodexAppServerEvent::None;
+                        }
+                        self.last_agent_message_delta
+                            .insert(item_id.clone(), delta.to_string());
                         let entry = self.partial_agent_messages.entry(item_id).or_default();
                         entry.push_str(delta);
                         self.render_assistant_text()
@@ -6882,6 +7227,11 @@ impl CodexAppServerStreamingState {
         match item_type {
             "agentMessage" if method == "item/completed" => {
                 let item_id = item.get("id").and_then(Value::as_str).unwrap_or_default();
+                if item_id.is_empty()
+                    || !self.completed_agent_message_ids.insert(item_id.to_string())
+                {
+                    return CodexAppServerEvent::None;
+                }
                 let Some(text) = item.get("text").and_then(Value::as_str) else {
                     return CodexAppServerEvent::None;
                 };
@@ -6890,6 +7240,7 @@ impl CodexAppServerStreamingState {
                     return CodexAppServerEvent::None;
                 }
                 self.partial_agent_messages.remove(item_id);
+                self.last_agent_message_delta.remove(item_id);
                 self.display_blocks.push(text.clone());
                 self.assistant_blocks.push(text);
                 self.render_assistant_text()
@@ -7170,8 +7521,12 @@ async fn handle_acp_client_method_request(
             } else {
                 contents
             };
-            send_json_rpc_response(writer, request_id, serde_json::json!({ "content": content }))
-                .await
+            send_json_rpc_response(
+                writer,
+                request_id,
+                serde_json::json!({ "content": content }),
+            )
+            .await
         }
         "fs/write_text_file" => {
             let path = params
@@ -7199,15 +7554,15 @@ async fn handle_acp_client_method_request(
                 PathBuf::from(path)
             };
             if let Some(parent) = full_path.parent() {
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .context(format!("failed to create parent dirs for: {}", full_path.display()))?;
+                tokio::fs::create_dir_all(parent).await.context(format!(
+                    "failed to create parent dirs for: {}",
+                    full_path.display()
+                ))?;
             }
             tokio::fs::write(&full_path, content)
                 .await
                 .context(format!("failed to write file: {}", full_path.display()))?;
-            send_json_rpc_response(writer, request_id, serde_json::json!({}))
-                .await
+            send_json_rpc_response(writer, request_id, serde_json::json!({})).await
         }
         "secretStorage/get" | "secretStorage/getSecret" | "secrets/get" => {
             let key = secret_storage_key_from_params(&params)?;
@@ -7231,9 +7586,18 @@ async fn handle_acp_client_method_request(
             state.secret_store().delete(&key).await?;
             send_json_rpc_response(writer, request_id, serde_json::json!({})).await
         }
-        "terminal/create" | "terminal/kill" | "terminal/output"
-        | "terminal/release" | "terminal/wait_for_exit" => {
-            send_json_rpc_error(writer, request_id, -32601, "terminal methods not supported by bridge").await
+        "terminal/create"
+        | "terminal/kill"
+        | "terminal/output"
+        | "terminal/release"
+        | "terminal/wait_for_exit" => {
+            send_json_rpc_error(
+                writer,
+                request_id,
+                -32601,
+                "terminal methods not supported by bridge",
+            )
+            .await
         }
         _ => {
             send_json_rpc_error(
@@ -8825,10 +9189,7 @@ fn render_acp_notification_status(params: &Value) -> Option<String> {
                 .or_else(|| params.pointer("/message"))
                 .and_then(extract_text_from_json)
                 .unwrap_or_else(|| "updated".to_string());
-            Some(format!(
-                "[acp:{tool}] {}",
-                truncate_tool_text(&status, 120)
-            ))
+            Some(format!("[acp:{tool}] {}", truncate_tool_text(&status, 120)))
         }
         "TurnEnd" => {
             let status = params
@@ -8932,6 +9293,276 @@ fn parse_sse_json_event(line: &str) -> Option<Value> {
         .and_then(|data| serde_json::from_str::<Value>(data).ok())
 }
 
+struct LoadedOpenCodeArchive {
+    projects: HashMap<String, ProjectSummary>,
+    sessions: HashMap<String, SessionSummary>,
+}
+
+fn opencode_db_path() -> PathBuf {
+    if let Some(path) = env_path("ECHO_MATE_OPENCODE_DB") {
+        return path;
+    }
+
+    let candidates = opencode_db_path_candidates();
+    candidates
+        .iter()
+        .find(|path| path.is_file())
+        .cloned()
+        .or_else(|| candidates.into_iter().next())
+        .unwrap_or_else(|| PathBuf::from("opencode.db"))
+}
+
+fn opencode_db_path_candidates() -> Vec<PathBuf> {
+    let platform = if cfg!(target_os = "macos") {
+        OpenCodeDbPlatform::Macos
+    } else if cfg!(target_os = "windows") {
+        OpenCodeDbPlatform::Windows
+    } else {
+        OpenCodeDbPlatform::Unix
+    };
+    opencode_db_path_candidates_from_values(
+        [
+            env_path("ECHO_MATE_OPENCODE_DATA_DIR"),
+            env_path("OPENCODE_DATA_DIR"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
+        env_path("XDG_DATA_HOME"),
+        env_path("HOME"),
+        env_path("LOCALAPPDATA"),
+        env_path("APPDATA"),
+        platform,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum OpenCodeDbPlatform {
+    Unix,
+    Macos,
+    Windows,
+}
+
+fn opencode_db_path_candidates_from_values(
+    explicit_data_dirs: Vec<PathBuf>,
+    xdg_data_home: Option<PathBuf>,
+    home: Option<PathBuf>,
+    local_app_data: Option<PathBuf>,
+    app_data: Option<PathBuf>,
+    platform: OpenCodeDbPlatform,
+) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    dirs.extend(
+        explicit_data_dirs
+            .into_iter()
+            .filter(|path| !path.as_os_str().is_empty()),
+    );
+    if let Some(xdg_data_home) = xdg_data_home.filter(|path| !path.as_os_str().is_empty()) {
+        dirs.push(xdg_data_home.join("opencode"));
+    }
+    match platform {
+        OpenCodeDbPlatform::Macos => {
+            if let Some(home) = home.as_ref().filter(|path| !path.as_os_str().is_empty()) {
+                dirs.push(home.join("Library/Application Support/opencode"));
+            }
+        }
+        OpenCodeDbPlatform::Windows => {
+            if let Some(local_app_data) = local_app_data.filter(|path| !path.as_os_str().is_empty())
+            {
+                dirs.push(local_app_data.join("opencode"));
+            }
+            if let Some(app_data) = app_data.filter(|path| !path.as_os_str().is_empty()) {
+                dirs.push(app_data.join("opencode"));
+            }
+        }
+        OpenCodeDbPlatform::Unix => {}
+    }
+    if let Some(home) = home.filter(|path| !path.as_os_str().is_empty()) {
+        dirs.push(home.join(".local/share/opencode"));
+        dirs.push(home.join(".opencode"));
+    }
+
+    let mut db_paths = Vec::new();
+    for path in dirs {
+        let db_path = path.join("opencode.db");
+        if !db_paths.contains(&db_path) {
+            db_paths.push(db_path);
+        }
+    }
+    db_paths
+}
+
+fn env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+}
+
+fn file_fingerprint_for_opencode_db(path: &Path) -> Option<u64> {
+    if !path.is_file() {
+        return None;
+    }
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hash_file_metadata_for_opencode(path, &mut hasher)?;
+    hash_file_metadata_for_opencode(
+        &PathBuf::from(format!("{}-wal", path.display())),
+        &mut hasher,
+    );
+    hash_file_metadata_for_opencode(
+        &PathBuf::from(format!("{}-shm", path.display())),
+        &mut hasher,
+    );
+    Some(hasher.finish())
+}
+
+fn hash_file_metadata_for_opencode(
+    path: &Path,
+    hasher: &mut std::collections::hash_map::DefaultHasher,
+) -> Option<()> {
+    let metadata = std::fs::metadata(path).ok()?;
+    path.hash(hasher);
+    metadata.len().hash(hasher);
+    metadata
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis()
+        .hash(hasher);
+    Some(())
+}
+
+fn load_opencode_archive_from_db(path: &Path) -> Result<LoadedOpenCodeArchive> {
+    let conn =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    conn.execute_batch("PRAGMA query_only = ON;")?;
+
+    let mut sessions = HashMap::new();
+    let mut projects = HashMap::<String, ProjectSummary>::new();
+    let mut stmt = conn.prepare(
+        "SELECT id, directory, title, time_updated FROM session WHERE time_archived IS NULL ORDER BY time_updated DESC, id",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+        ))
+    })?;
+
+    for row in rows {
+        let (id, directory, title, time_updated) = row?;
+        let title = if title.trim().is_empty() {
+            "opencode session".to_string()
+        } else {
+            title
+        };
+        let updated_at = opencode_time_from_millis(time_updated);
+        let project_id = crate::session_store::project_id_for_path(&directory);
+        let session = SessionSummary {
+            id: id.clone(),
+            project_id: project_id.clone(),
+            title: title.clone(),
+            agent: AgentKind::OpenCode,
+            brief_reply_mode: false,
+            status: crate::models::SessionStatus::Idle,
+            updated_at,
+            unread_count: 0,
+            last_message_preview: Some(title.clone()),
+            pending_approval: None,
+            runtime_session_ref: Some(id.clone()),
+            provider_id: None,
+            reasoning_effort: None,
+            model: None,
+        };
+
+        projects
+            .entry(project_id.clone())
+            .and_modify(|project| {
+                project.session_count += 1;
+                if updated_at > project.updated_at {
+                    project.updated_at = updated_at;
+                    project.last_session_preview = Some(title.clone());
+                }
+            })
+            .or_insert_with(|| ProjectSummary {
+                id: project_id,
+                name: project_name_from_path(&directory),
+                root_path: directory,
+                updated_at,
+                session_count: 1,
+                last_session_preview: Some(title.clone()),
+                git_branch: None,
+                git_status: None,
+            });
+        sessions.insert(id, session);
+    }
+
+    Ok(LoadedOpenCodeArchive { projects, sessions })
+}
+
+fn load_opencode_messages_from_db(path: &Path, session_id: &str) -> Result<Vec<ChatMessage>> {
+    let conn =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    conn.execute_batch("PRAGMA query_only = ON;")?;
+
+    let mut parts_by_message = HashMap::<String, Vec<Value>>::new();
+    let mut parts_stmt = conn.prepare(
+        "SELECT message_id, data FROM part WHERE session_id = ?1 ORDER BY time_created, id",
+    )?;
+    let part_rows = parts_stmt.query_map([session_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in part_rows {
+        let (message_id, data) = row?;
+        if let Ok(value) = serde_json::from_str::<Value>(&data) {
+            parts_by_message.entry(message_id).or_default().push(value);
+        }
+    }
+
+    let mut messages = Vec::new();
+    let mut message_stmt = conn.prepare(
+        "SELECT id, time_created, data FROM message WHERE session_id = ?1 ORDER BY time_created, id",
+    )?;
+    let message_rows = message_stmt.query_map([session_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    for row in message_rows {
+        let (message_id, time_created, data) = row?;
+        let value = serde_json::from_str::<Value>(&data).unwrap_or(Value::Null);
+        let role = match value.get("role").and_then(Value::as_str) {
+            Some("user") => crate::models::MessageRole::User,
+            Some("assistant") => crate::models::MessageRole::Assistant,
+            _ => continue,
+        };
+        let parts = Value::Array(parts_by_message.remove(&message_id).unwrap_or_default());
+        let content = opencode_parts_text(&parts);
+        if content.trim().is_empty() {
+            continue;
+        }
+        let created_at = value
+            .pointer("/time/created")
+            .and_then(Value::as_i64)
+            .map(opencode_time_from_millis)
+            .unwrap_or_else(|| opencode_time_from_millis(time_created));
+        messages.push(ChatMessage {
+            id: message_id,
+            session_id: session_id.to_string(),
+            role,
+            content,
+            created_at,
+        });
+    }
+
+    Ok(messages)
+}
+
 fn opencode_session_summary(value: &Value) -> Option<SessionSummary> {
     let id = value.get("id").and_then(Value::as_str)?.to_string();
     let directory = value.get("directory").and_then(Value::as_str)?;
@@ -8991,22 +9622,41 @@ fn opencode_messages_from_value(session_id: &str, value: &Value) -> Vec<ChatMess
 }
 
 fn opencode_parts_text(parts: &Value) -> String {
-    parts
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|part| match part.get("type").and_then(Value::as_str) {
-            Some("text") => part.get("text").and_then(Value::as_str),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("")
-        .trim()
-        .to_string()
+    let mut blocks = Vec::new();
+    let mut text_buffer = String::new();
+
+    for part in parts.as_array().into_iter().flatten() {
+        if part.get("type").and_then(Value::as_str) == Some("text") {
+            if let Some(text) = part.get("text").and_then(Value::as_str) {
+                text_buffer.push_str(text);
+            }
+            continue;
+        }
+
+        let text = text_buffer.trim().to_string();
+        if !text.is_empty() {
+            blocks.push(text);
+        }
+        text_buffer.clear();
+
+        if let Some(status) = render_opencode_part_status(part) {
+            blocks.push(status);
+        }
+    }
+
+    let text = text_buffer.trim().to_string();
+    if !text.is_empty() {
+        blocks.push(text);
+    }
+
+    blocks.join("\n").trim().to_string()
 }
 
 fn opencode_time(value: Option<&Value>) -> chrono::DateTime<chrono::Utc> {
-    let millis = value.and_then(Value::as_i64).unwrap_or(0);
+    opencode_time_from_millis(value.and_then(Value::as_i64).unwrap_or(0))
+}
+
+fn opencode_time_from_millis(millis: i64) -> chrono::DateTime<chrono::Utc> {
     chrono::DateTime::<chrono::Utc>::from_timestamp_millis(millis).unwrap_or_else(chrono::Utc::now)
 }
 
@@ -9848,8 +10498,8 @@ async fn probe_stdio_acp_handshake(server: &crate::models::AcpServerConfig) -> A
     for entry in &server.env {
         command.env(&entry.key, &entry.value);
     }
-        if !server.auth_token.is_empty() {
-            command.env("ACP_API_KEY", &server.auth_token);
+    if !server.auth_token.is_empty() {
+        command.env("ACP_API_KEY", &server.auth_token);
     }
 
     let mut child = match command.spawn() {
@@ -9925,13 +10575,9 @@ async fn probe_stdio_acp_handshake(server: &crate::models::AcpServerConfig) -> A
             env!("CARGO_PKG_VERSION"),
         );
         let init_params = crate::acp_client::serialize_to_json_value(&init_request)?;
-        let init_request_id = send_json_rpc_request(
-            &mut stdin,
-            &mut next_request_id,
-            "initialize",
-            init_params,
-        )
-        .await?;
+        let init_request_id =
+            send_json_rpc_request(&mut stdin, &mut next_request_id, "initialize", init_params)
+                .await?;
         wait_for_acp_json_rpc_response(
             &mut child,
             &mut stdout_rx,
@@ -9947,13 +10593,9 @@ async fn probe_stdio_acp_handshake(server: &crate::models::AcpServerConfig) -> A
             &std::env::current_dir()?.display().to_string(),
         );
         let new_params = crate::acp_client::serialize_to_json_value(&new_request)?;
-        let session_request_id = send_json_rpc_request(
-            &mut stdin,
-            &mut next_request_id,
-            "session/new",
-            new_params,
-        )
-        .await?;
+        let session_request_id =
+            send_json_rpc_request(&mut stdin, &mut next_request_id, "session/new", new_params)
+                .await?;
         let response = wait_for_acp_json_rpc_response(
             &mut child,
             &mut stdout_rx,
@@ -10368,7 +11010,7 @@ pub fn manual_install_hint(agent: AgentKind) -> String {
              Windows: scoop install opencode"
             .to_string(),
         AgentKind::Acp => "ACP agent is configured in bridge settings.\n  \
-             Kiro (local stdio): install `kiro-cli`, run `kiro-cli login`, then configure `profile: kiro` with `command: kiro-cli` and `args: [\"acp\"]`\n  \
+             Kiro (local stdio): install `kiro-cli`, run `kiro-cli login`, then configure `profile: stdio` with `command: kiro-cli` and `args: [\"acp\"]`\n  \
              Generic HTTP: configure `profile: generic_http` with an ACP-compatible endpoint URL"
             .to_string(),
         AgentKind::Custom => "Custom agent does not support auto-install".to_string(),

@@ -1,10 +1,10 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fs,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
     process::Command,
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant},
 };
 
@@ -26,7 +26,7 @@ use crate::{
         AUTO_PROVIDER_ID, AgentErrorEvent, AgentKind, ApiFormat, ApprovalChoice, ApprovalRequest,
         ApprovalRequestEvent, ApprovalResolvedEvent, ChatMessage, ClientAuthRecord,
         ClientAuthRequestInput, ClientAuthStatus, CreateProjectInput, CreateSessionInput,
-        GitStatusDetail, InputMode, MessageDeltaEvent, MessageRole, ModelProviderConfig,
+        GitStatusDetail, InputMode, MessageRole, MessageSnapshotEvent, ModelProviderConfig,
         ProjectGitStatus, ProjectSummary, PushDeviceRegistration, RegisterPushDeviceInput,
         ResolvedProviderConfig, SendMessageInput, SessionDetail, SessionEvent, SessionStatus,
         SessionStatusEvent, SessionSummary, SpeakerFilterSettings, TriggerClientMessageInput,
@@ -164,10 +164,12 @@ pub struct AppState {
     sessions: RwLock<HashMap<String, SessionSummary>>,
     session_title_overrides: RwLock<HashMap<String, String>>,
     messages: RwLock<HashMap<String, Vec<ChatMessage>>>,
+    client_message_results: RwLock<HashMap<(String, String), (ChatMessage, ChatMessage)>>,
     devices: RwLock<HashMap<String, PushDeviceRegistration>>,
     list_cache: Mutex<Option<AggregatedListCache>>,
     runtime: Mutex<HashMap<String, SessionRuntimeState>>,
-    event_tx: broadcast::Sender<SessionEvent>,
+    event_tx: broadcast::Sender<SequencedSessionEvent>,
+    event_stream: StdMutex<EventStreamState>,
     providers: ProviderRegistry,
     settings: BridgeSettingsStore,
     speech: Arc<SpeechService>,
@@ -177,6 +179,28 @@ pub struct AppState {
     tts_stream_sessions: Mutex<HashMap<String, TtsStreamSession>>,
     runtime_store_path: PathBuf,
     session_metadata_store_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct SequencedSessionEvent {
+    pub id: u64,
+    pub event: SessionEvent,
+}
+
+struct EventStreamState {
+    next_event_id: u64,
+    log: VecDeque<SequencedSessionEvent>,
+}
+
+pub enum EventReplay {
+    Events(Vec<SequencedSessionEvent>),
+    SyncRequired,
+}
+
+pub struct EventSubscription {
+    pub receiver: broadcast::Receiver<SequencedSessionEvent>,
+    pub replay: EventReplay,
+    pub high_watermark: u64,
 }
 
 impl AppState {
@@ -213,7 +237,7 @@ impl AppState {
         runtime_store_path: PathBuf,
         session_metadata_store_path: PathBuf,
     ) -> Self {
-        let (event_tx, _) = broadcast::channel(256);
+        let (event_tx, _) = broadcast::channel(512);
         let persisted_runtime = load_persisted_runtime(&runtime_store_path).await;
         let persisted_metadata =
             load_persisted_session_metadata(&session_metadata_store_path).await;
@@ -234,6 +258,7 @@ impl AppState {
                     .collect(),
             ),
             messages: RwLock::new(HashMap::new()),
+            client_message_results: RwLock::new(HashMap::new()),
             devices: RwLock::new(load_device_registrations()),
             list_cache: Mutex::new(None),
             runtime: Mutex::new(
@@ -245,6 +270,10 @@ impl AppState {
                     .collect(),
             ),
             event_tx,
+            event_stream: StdMutex::new(EventStreamState {
+                next_event_id: 1,
+                log: VecDeque::new(),
+            }),
             providers: ProviderRegistry::new(),
             settings: BridgeSettingsStore::load_from_path(settings_path).await,
             speech: Arc::new(SpeechService::load().await),
@@ -264,7 +293,7 @@ impl AppState {
         session_metadata_store_path: PathBuf,
         providers: ProviderRegistry,
     ) -> Self {
-        let (event_tx, _) = broadcast::channel(256);
+        let (event_tx, _) = broadcast::channel(512);
         let persisted_runtime = load_persisted_runtime(&runtime_store_path).await;
         let persisted_metadata =
             load_persisted_session_metadata(&session_metadata_store_path).await;
@@ -285,6 +314,7 @@ impl AppState {
                     .collect(),
             ),
             messages: RwLock::new(HashMap::new()),
+            client_message_results: RwLock::new(HashMap::new()),
             devices: RwLock::new(load_device_registrations()),
             list_cache: Mutex::new(None),
             runtime: Mutex::new(
@@ -296,6 +326,10 @@ impl AppState {
                     .collect(),
             ),
             event_tx,
+            event_stream: StdMutex::new(EventStreamState {
+                next_event_id: 1,
+                log: VecDeque::new(),
+            }),
             providers,
             settings: BridgeSettingsStore::load_from_path(settings_path).await,
             speech: Arc::new(SpeechService::load().await),
@@ -313,7 +347,7 @@ impl AppState {
         runtime_store_path: PathBuf,
         session_metadata_store_path: PathBuf,
     ) -> anyhow::Result<Self> {
-        let (event_tx, _) = broadcast::channel(256);
+        let (event_tx, _) = broadcast::channel(512);
         let persisted_runtime = load_persisted_runtime(&runtime_store_path).await;
         let persisted_metadata =
             load_persisted_session_metadata(&session_metadata_store_path).await;
@@ -334,6 +368,7 @@ impl AppState {
                     .collect(),
             ),
             messages: RwLock::new(HashMap::new()),
+            client_message_results: RwLock::new(HashMap::new()),
             devices: RwLock::new(load_device_registrations()),
             list_cache: Mutex::new(None),
             runtime: Mutex::new(
@@ -345,6 +380,10 @@ impl AppState {
                     .collect(),
             ),
             event_tx,
+            event_stream: StdMutex::new(EventStreamState {
+                next_event_id: 1,
+                log: VecDeque::new(),
+            }),
             providers: ProviderRegistry::new(),
             settings: BridgeSettingsStore::load_from_path_strict(settings_path).await?,
             speech: Arc::new(SpeechService::load().await),
@@ -631,36 +670,35 @@ impl AppState {
 
     pub async fn list_messages(&self, session_id: &str) -> Option<Vec<ChatMessage>> {
         let session = self.find_session(session_id).await?;
-        let provider = self.provider_for_agent(session.agent)?;
-        let provider_session_id = self
-            .provider_session_ref(session_id)
-            .await
-            .unwrap_or_else(|| session_id.to_string());
-        let provider_messages = provider
-            .list_messages(&provider_session_id)
-            .await
-            .map(|messages| MessageProjection::normalize_provider(session_id, messages));
-        let cached = self.messages.read().await.get(session_id).cloned();
+        let provider_messages = if let Some(provider) = self.provider_for_agent(session.agent) {
+            let provider_session_id = self
+                .provider_session_ref(session_id)
+                .await
+                .unwrap_or_else(|| session_id.to_string());
+            provider
+                .list_messages(&provider_session_id)
+                .await
+                .map(|messages| MessageProjection::normalize_provider(session_id, messages))
+        } else {
+            None
+        };
+        let mut message_cache = self.messages.write().await;
+        let cached = message_cache.get(session_id).cloned();
 
-        match (cached, provider_messages) {
+        let messages = match (cached, provider_messages) {
             (Some(local), Some(remote)) => {
                 let merged = MessageProjection::from_sources(session_id, remote, local);
-                self.messages
-                    .write()
-                    .await
-                    .insert(session_id.to_string(), merged.clone());
-                Some(merged)
+                message_cache.insert(session_id.to_string(), merged.clone());
+                merged
             }
-            (Some(local), None) => Some(local),
+            (Some(local), None) => local,
             (None, Some(remote)) => {
-                self.messages
-                    .write()
-                    .await
-                    .insert(session_id.to_string(), remote.clone());
-                Some(remote)
+                message_cache.insert(session_id.to_string(), remote.clone());
+                remote
             }
-            (None, None) => None,
-        }
+            (None, None) => Vec::new(),
+        };
+        Some(sort_messages(messages))
     }
 
     pub async fn get_session(&self, session_id: &str) -> Option<SessionDetail> {
@@ -755,9 +793,7 @@ impl AppState {
         self.invalidate_list_cache().await;
         self.refresh_project_summary(&session.project_id).await;
 
-        let _ = self
-            .event_tx
-            .send(SessionEvent::SessionSnapshot(session.clone()));
+        self.publish_event(SessionEvent::SessionSnapshot(session.clone()));
 
         Ok(session)
     }
@@ -856,12 +892,8 @@ impl AppState {
         self.invalidate_list_cache().await;
         self.refresh_project_summary(&session.project_id).await;
 
-        let _ = self
-            .event_tx
-            .send(SessionEvent::SessionSnapshot(session.clone()));
-        let _ = self
-            .event_tx
-            .send(SessionEvent::MessageCreated(message.clone()));
+        self.publish_event(SessionEvent::SessionSnapshot(session.clone()));
+        self.publish_event(SessionEvent::MessageCreated(message.clone()));
 
         let devices = self
             .devices
@@ -885,8 +917,54 @@ impl AppState {
         })
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<SessionEvent> {
+    #[cfg(test)]
+    pub fn subscribe(&self) -> broadcast::Receiver<SequencedSessionEvent> {
         self.event_tx.subscribe()
+    }
+
+    pub fn subscribe_with_replay(&self, event_id: Option<u64>) -> EventSubscription {
+        let Ok(stream) = self.event_stream.lock() else {
+            return EventSubscription {
+                receiver: self.event_tx.subscribe(),
+                replay: EventReplay::SyncRequired,
+                high_watermark: 0,
+            };
+        };
+        let receiver = self.event_tx.subscribe();
+        let high_watermark = stream.next_event_id.saturating_sub(1);
+        let replay = event_id
+            .map(|event_id| replay_events_from_stream(&stream, event_id))
+            .unwrap_or_else(|| EventReplay::Events(Vec::new()));
+        EventSubscription {
+            receiver,
+            replay,
+            high_watermark,
+        }
+    }
+
+    pub fn publish_event(&self, event: SessionEvent) {
+        const EVENT_LOG_CAPACITY: usize = 512;
+        let Ok(mut stream) = self.event_stream.lock() else {
+            return;
+        };
+        let sequenced = SequencedSessionEvent {
+            id: stream.next_event_id,
+            event,
+        };
+        stream.next_event_id += 1;
+        stream.log.push_back(sequenced.clone());
+        while stream.log.len() > EVENT_LOG_CAPACITY {
+            stream.log.pop_front();
+        }
+        let _ = self.event_tx.send(sequenced);
+    }
+
+    #[cfg(test)]
+    pub fn replay_events_after(&self, event_id: u64) -> EventReplay {
+        let Ok(stream) = self.event_stream.lock() else {
+            return EventReplay::SyncRequired;
+        };
+        replay_events_from_stream(&stream, event_id)
     }
 
     /// Resolve provider configuration for a message based on priority:
@@ -1184,6 +1262,23 @@ impl AppState {
         session_id: &str,
         input: SendMessageInput,
     ) -> Result<(ChatMessage, ChatMessage), String> {
+        let client_message_id = input
+            .client_message_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        if let Some(client_message_id) = &client_message_id {
+            if let Some(result) = self
+                .client_message_results
+                .read()
+                .await
+                .get(&(session_id.to_string(), client_message_id.clone()))
+                .cloned()
+            {
+                return Ok(result);
+            }
+        }
         let mut already_processing = false;
         self.update_runtime_state(session_id, |entry| {
             if entry.turn_in_flight {
@@ -1228,16 +1323,18 @@ impl AppState {
             )
             .await;
             self.finish_turn(session_id).await;
-            let _ = self
-                .event_tx
-                .send(SessionEvent::MessageCreated(user_message.clone()));
-            let _ = self
-                .event_tx
-                .send(SessionEvent::SessionStatus(SessionStatusEvent {
-                    session_id: session_id.to_string(),
-                    status: SessionStatus::Idle,
-                    error_message: None,
-                }));
+            if let Some(client_message_id) = client_message_id {
+                self.client_message_results.write().await.insert(
+                    (session_id.to_string(), client_message_id),
+                    (user_message.clone(), user_message.clone()),
+                );
+            }
+            self.publish_event(SessionEvent::MessageCreated(user_message.clone()));
+            self.publish_event(SessionEvent::SessionStatus(SessionStatusEvent {
+                session_id: session_id.to_string(),
+                status: SessionStatus::Idle,
+                error_message: None,
+            }));
             return Ok((user_message.clone(), user_message));
         }
 
@@ -1273,6 +1370,12 @@ impl AppState {
             .await;
         self.push_message(user_message.clone()).await;
         self.push_message(pending_reply.clone()).await;
+        if let Some(client_message_id) = client_message_id {
+            self.client_message_results.write().await.insert(
+                (session_id.to_string(), client_message_id),
+                (user_message.clone(), pending_reply.clone()),
+            );
+        }
         self.patch_session(
             session_id,
             SessionStatus::Running,
@@ -1280,19 +1383,13 @@ impl AppState {
         )
         .await;
         self.clear_pending_approval(session_id).await;
-        let _ = self
-            .event_tx
-            .send(SessionEvent::MessageCreated(user_message.clone()));
-        let _ = self
-            .event_tx
-            .send(SessionEvent::MessageCreated(pending_reply.clone()));
-        let _ = self
-            .event_tx
-            .send(SessionEvent::SessionStatus(SessionStatusEvent {
-                session_id: session_id.to_string(),
-                status: SessionStatus::Running,
-                error_message: None,
-            }));
+        self.publish_event(SessionEvent::MessageCreated(user_message.clone()));
+        self.publish_event(SessionEvent::MessageCreated(pending_reply.clone()));
+        self.publish_event(SessionEvent::SessionStatus(SessionStatusEvent {
+            session_id: session_id.to_string(),
+            status: SessionStatus::Running,
+            error_message: None,
+        }));
 
         // Resolve provider configuration
         let provider_config = self
@@ -1425,13 +1522,11 @@ impl AppState {
                 .or(Some("本次运行已中断，可继续发送消息恢复。".to_string()));
             self.patch_session(&canonical_session_id, SessionStatus::Interrupted, preview)
                 .await;
-            let _ = self
-                .event_tx
-                .send(SessionEvent::SessionStatus(SessionStatusEvent {
-                    session_id: canonical_session_id.clone(),
-                    status: SessionStatus::Interrupted,
-                    error_message: None,
-                }));
+            self.publish_event(SessionEvent::SessionStatus(SessionStatusEvent {
+                session_id: canonical_session_id.clone(),
+                status: SessionStatus::Interrupted,
+                error_message: None,
+            }));
         }
         Ok(should_interrupt || provider_cancelled)
     }
@@ -1560,13 +1655,11 @@ impl AppState {
             }
         }
 
-        let _ = self
-            .event_tx
-            .send(SessionEvent::MessageDelta(MessageDeltaEvent {
-                session_id: session_id.to_string(),
-                message_id: message_id.to_string(),
-                delta: content,
-            }));
+        self.publish_event(SessionEvent::MessageSnapshot(MessageSnapshotEvent {
+            session_id: session_id.to_string(),
+            message_id: message_id.to_string(),
+            content,
+        }));
     }
 
     pub async fn emit_system_message(&self, session_id: &str, content: impl Into<String>) {
@@ -1583,7 +1676,7 @@ impl AppState {
             created_at: Utc::now(),
         };
         self.push_message(message.clone()).await;
-        let _ = self.event_tx.send(SessionEvent::MessageCreated(message));
+        self.publish_event(SessionEvent::MessageCreated(message));
     }
 
     pub async fn finish_assistant_message(
@@ -1619,16 +1712,12 @@ impl AppState {
             .await;
         self.clear_interrupted(session_id).await;
         self.clear_pending_approval(session_id).await;
-        let _ = self
-            .event_tx
-            .send(SessionEvent::MessageCreated(assistant_message));
-        let _ = self
-            .event_tx
-            .send(SessionEvent::SessionStatus(SessionStatusEvent {
-                session_id: session_id.to_string(),
-                status: SessionStatus::Idle,
-                error_message: None,
-            }));
+        self.publish_event(SessionEvent::MessageCreated(assistant_message));
+        self.publish_event(SessionEvent::SessionStatus(SessionStatusEvent {
+            session_id: session_id.to_string(),
+            status: SessionStatus::Idle,
+            error_message: None,
+        }));
         if let Some(session) = self.find_session(session_id).await {
             let devices = self
                 .devices
@@ -1660,15 +1749,12 @@ impl AppState {
             MessageProjection::normalize_provider(session_id, provider_messages);
         let provider_final = provider_messages
             .iter()
-            .filter(|message| Self::is_final_assistant_candidate(current, message))
-            .max_by(|a, b| {
-                a.content
-                    .len()
-                    .cmp(&b.content.len())
-                    .then_with(|| a.created_at.cmp(&b.created_at))
-            })
+            .rev()
+            .find(|message| Self::is_final_assistant_candidate(current, message))
             .cloned()?;
-        if provider_final.content.len() < current.content.len() {
+        if provider_final.content.len() < current.content.len()
+            && !Self::is_assistant_message_aggregate(current, &provider_final)
+        {
             return None;
         }
         let final_message = ChatMessage {
@@ -1676,7 +1762,7 @@ impl AppState {
             session_id: current.session_id.clone(),
             role: current.role.clone(),
             content: provider_final.content,
-            created_at: current.created_at,
+            created_at: provider_final.created_at,
         };
         let local_messages = self.messages.read().await.get(session_id).cloned()?;
         let merged = local_messages
@@ -1722,6 +1808,15 @@ impl AppState {
         candidate_content.starts_with(current_content)
             || current_content.starts_with(candidate_content)
             || current_content == candidate_content
+            || Self::is_assistant_message_aggregate(current, candidate)
+    }
+
+    fn is_assistant_message_aggregate(current: &ChatMessage, candidate: &ChatMessage) -> bool {
+        let current_content = current.content.trim();
+        let candidate_content = candidate.content.trim();
+        current_content.len() > candidate_content.len()
+            && current_content.contains(candidate_content)
+            && current_content.contains("\n\n---\n\n")
     }
 
     pub async fn fail_session(&self, session_id: &str, message: String) {
@@ -1729,19 +1824,15 @@ impl AppState {
             .await;
         self.clear_interrupted(session_id).await;
         self.clear_pending_approval(session_id).await;
-        let _ = self
-            .event_tx
-            .send(SessionEvent::AgentError(AgentErrorEvent {
-                session_id: session_id.to_string(),
-                message: message.clone(),
-            }));
-        let _ = self
-            .event_tx
-            .send(SessionEvent::SessionStatus(SessionStatusEvent {
-                session_id: session_id.to_string(),
-                status: SessionStatus::Failed,
-                error_message: Some(message.clone()),
-            }));
+        self.publish_event(SessionEvent::AgentError(AgentErrorEvent {
+            session_id: session_id.to_string(),
+            message: message.clone(),
+        }));
+        self.publish_event(SessionEvent::SessionStatus(SessionStatusEvent {
+            session_id: session_id.to_string(),
+            status: SessionStatus::Failed,
+            error_message: Some(message.clone()),
+        }));
     }
 
     pub async fn set_provider_session_ref(&self, session_id: &str, session_ref: Option<String>) {
@@ -1975,19 +2066,15 @@ impl AppState {
                 .send_approval_request(session, request.clone(), devices)
                 .await;
         }
-        let _ = self
-            .event_tx
-            .send(SessionEvent::ApprovalRequested(ApprovalRequestEvent {
-                session_id: session_id.to_string(),
-                request,
-            }));
-        let _ = self
-            .event_tx
-            .send(SessionEvent::SessionStatus(SessionStatusEvent {
-                session_id: session_id.to_string(),
-                status: SessionStatus::AwaitingApproval,
-                error_message: None,
-            }));
+        self.publish_event(SessionEvent::ApprovalRequested(ApprovalRequestEvent {
+            session_id: session_id.to_string(),
+            request,
+        }));
+        self.publish_event(SessionEvent::SessionStatus(SessionStatusEvent {
+            session_id: session_id.to_string(),
+            status: SessionStatus::AwaitingApproval,
+            error_message: None,
+        }));
     }
 
     pub async fn resolve_approval(
@@ -2009,20 +2096,16 @@ impl AppState {
         self.patch_session(session_id, SessionStatus::Running, Some(preview.clone()))
             .await;
         self.emit_system_message(session_id, preview.clone()).await;
-        let _ = self
-            .event_tx
-            .send(SessionEvent::ApprovalResolved(ApprovalResolvedEvent {
-                session_id: session_id.to_string(),
-                request_id: request_id.to_string(),
-                choice,
-            }));
-        let _ = self
-            .event_tx
-            .send(SessionEvent::SessionStatus(SessionStatusEvent {
-                session_id: session_id.to_string(),
-                status: SessionStatus::Running,
-                error_message: None,
-            }));
+        self.publish_event(SessionEvent::ApprovalResolved(ApprovalResolvedEvent {
+            session_id: session_id.to_string(),
+            request_id: request_id.to_string(),
+            choice,
+        }));
+        self.publish_event(SessionEvent::SessionStatus(SessionStatusEvent {
+            session_id: session_id.to_string(),
+            status: SessionStatus::Running,
+            error_message: None,
+        }));
     }
 
     async fn clear_pending_approval(&self, session_id: &str) {
@@ -2183,9 +2266,7 @@ impl AppState {
             .await?;
         self.invalidate_list_cache().await;
         self.refresh_project_summary(&project_id).await;
-        let _ = self
-            .event_tx
-            .send(SessionEvent::SessionSnapshot(summary.clone()));
+        self.publish_event(SessionEvent::SessionSnapshot(summary.clone()));
         Ok(summary)
     }
 
@@ -2750,6 +2831,36 @@ fn decorate_user_content(input: &SendMessageInput) -> String {
     }
 }
 
+fn sort_messages(mut messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    messages.sort_by(|left, right| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    messages
+}
+
+fn replay_events_from_stream(stream: &EventStreamState, event_id: u64) -> EventReplay {
+    let high_watermark = stream.next_event_id.saturating_sub(1);
+    if event_id > high_watermark {
+        return EventReplay::SyncRequired;
+    }
+    let Some(oldest) = stream.log.front() else {
+        return EventReplay::Events(Vec::new());
+    };
+    if event_id.saturating_add(1) < oldest.id {
+        return EventReplay::SyncRequired;
+    }
+    EventReplay::Events(
+        stream
+            .log
+            .iter()
+            .filter(|event| event.id > event_id)
+            .cloned()
+            .collect(),
+    )
+}
+
 fn message_title(content: &str) -> String {
     let title = content
         .lines()
@@ -3006,6 +3117,39 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[1].id, "a1");
         assert_eq!(messages[1].content, "new remote reply");
+    }
+
+    #[tokio::test]
+    async fn list_messages_returns_empty_page_when_session_has_no_history() {
+        let provider = Arc::new(TestMessageProvider::new(HashMap::new()));
+        let registry = ProviderRegistry::from_map(HashMap::from([(
+            AgentKind::Custom,
+            provider as Arc<dyn AgentProvider>,
+        )]));
+        let state = test_state_with_providers("empty-message-history", registry).await;
+        let project = state
+            .create_project(CreateProjectInput {
+                name: "Project".to_string(),
+                root_path: std::env::temp_dir().to_string_lossy().to_string(),
+            })
+            .await;
+        let session = state
+            .create_session(CreateSessionInput {
+                project_id: project.id,
+                title: Some("Session".to_string()),
+                agent: AgentKind::Custom,
+                brief_reply_mode: false,
+                provider_id: None,
+                reasoning_effort: None,
+            })
+            .await
+            .expect("session should be created");
+
+        let messages = state
+            .list_messages(&session.id)
+            .await
+            .expect("existing session should return a message page");
+        assert!(messages.is_empty());
     }
 
     #[tokio::test]
@@ -3317,7 +3461,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_message_ignores_client_message_id_for_server_message_identity() {
+    async fn send_message_deduplicates_retries_by_client_message_id() {
         let state = Arc::new(test_state("client-message-id").await);
         let project = state
             .create_project(CreateProjectInput {
@@ -3337,23 +3481,140 @@ mod tests {
             .await
             .expect("session should be created");
 
+        let input = SendMessageInput {
+            content: "hello".to_string(),
+            input_mode: InputMode::Text,
+            system_prompt: None,
+            client_message_id: Some("local-user-123".to_string()),
+            provider_id: None,
+            reasoning_effort: None,
+        };
         let (user_message, echoed_reply) = state
-            .send_message(
-                &session.id,
-                SendMessageInput {
-                    content: "hello".to_string(),
-                    input_mode: InputMode::Text,
-                    system_prompt: None,
-                    client_message_id: Some("local-user-123".to_string()),
-                    provider_id: None,
-                    reasoning_effort: None,
-                },
-            )
+            .send_message(&session.id, input.clone())
             .await
             .expect("message should send");
 
+        let (retried_user_message, retried_reply) = state
+            .send_message(&session.id, input)
+            .await
+            .expect("retry should reuse result");
+
         assert_ne!(user_message.id, "local-user-123");
         assert_eq!(echoed_reply.id, user_message.id);
+        assert_eq!(retried_user_message.id, user_message.id);
+        assert_eq!(retried_reply.id, echoed_reply.id);
+        assert_eq!(
+            state
+                .list_messages(&session.id)
+                .await
+                .expect("messages should exist")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn event_replay_returns_only_events_after_cursor() {
+        let state = test_state("event-replay").await;
+        state.publish_event(SessionEvent::SessionStatus(SessionStatusEvent {
+            session_id: "session-1".to_string(),
+            status: SessionStatus::Running,
+            error_message: None,
+        }));
+        state.publish_event(SessionEvent::SessionStatus(SessionStatusEvent {
+            session_id: "session-1".to_string(),
+            status: SessionStatus::Idle,
+            error_message: None,
+        }));
+
+        let EventReplay::Events(events) = state.replay_events_after(1) else {
+            panic!("recent event cursor should replay events");
+        };
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].id, 2);
+    }
+
+    #[tokio::test]
+    async fn event_replay_requires_sync_for_future_cursor() {
+        let state = test_state("event-replay-future").await;
+        state.publish_event(SessionEvent::SessionStatus(SessionStatusEvent {
+            session_id: "session-1".to_string(),
+            status: SessionStatus::Running,
+            error_message: None,
+        }));
+
+        assert!(matches!(
+            state.replay_events_after(10),
+            EventReplay::SyncRequired
+        ));
+    }
+
+    #[tokio::test]
+    async fn subscription_replay_high_watermark_prevents_duplicate_delivery() {
+        let state = test_state("event-subscription-watermark").await;
+        state.publish_event(SessionEvent::SessionStatus(SessionStatusEvent {
+            session_id: "session-1".to_string(),
+            status: SessionStatus::Running,
+            error_message: None,
+        }));
+
+        let mut subscription = state.subscribe_with_replay(Some(0));
+        let EventReplay::Events(replayed) = subscription.replay else {
+            panic!("cursor should be replayable");
+        };
+        assert_eq!(subscription.high_watermark, 1);
+        assert_eq!(
+            replayed.iter().map(|event| event.id).collect::<Vec<_>>(),
+            vec![1]
+        );
+
+        state.publish_event(SessionEvent::SessionStatus(SessionStatusEvent {
+            session_id: "session-1".to_string(),
+            status: SessionStatus::Idle,
+            error_message: None,
+        }));
+
+        let live = subscription
+            .receiver
+            .recv()
+            .await
+            .expect("new event should be broadcast");
+        assert_eq!(live.id, 2);
+        assert!(live.id > subscription.high_watermark);
+    }
+
+    #[tokio::test]
+    async fn concurrent_event_publication_preserves_event_id_delivery_order() {
+        use std::sync::{Arc as StdArc, Barrier};
+
+        let state = Arc::new(test_state("event-order").await);
+        let mut events = state.subscribe();
+        let worker_count = 16;
+        let barrier = StdArc::new(Barrier::new(worker_count));
+        let mut workers = Vec::with_capacity(worker_count);
+
+        for index in 0..worker_count {
+            let state = Arc::clone(&state);
+            let barrier = StdArc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                state.publish_event(SessionEvent::SessionStatus(SessionStatusEvent {
+                    session_id: format!("session-{index}"),
+                    status: SessionStatus::Running,
+                    error_message: None,
+                }));
+            }));
+        }
+        for worker in workers {
+            worker.join().expect("publisher thread should finish");
+        }
+
+        let mut received_ids = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            received_ids.push(events.recv().await.expect("event should be broadcast").id);
+        }
+
+        assert_eq!(received_ids, (1..=worker_count as u64).collect::<Vec<_>>());
     }
 
     #[tokio::test]
@@ -3705,7 +3966,12 @@ mod tests {
         let mut saw_complete_message = false;
         let mut saw_idle_status_after_complete_message = false;
         for _ in 0..4 {
-            match events.recv().await.expect("event should be broadcast") {
+            match events
+                .recv()
+                .await
+                .expect("event should be broadcast")
+                .event
+            {
                 SessionEvent::MessageCreated(message) if message.id == assistant_message.id => {
                     assert_eq!(message.content, "hello world");
                     saw_complete_message = true;
@@ -3784,12 +4050,15 @@ mod tests {
 
         let mut saw_final_message = false;
         for _ in 0..3 {
-            if let SessionEvent::MessageCreated(message) =
-                events.recv().await.expect("event should be broadcast")
+            if let SessionEvent::MessageCreated(message) = events
+                .recv()
+                .await
+                .expect("event should be broadcast")
+                .event
             {
                 if message.role == MessageRole::Assistant {
                     assert_eq!(message.content, "partial answer with final tail");
-                    assert_eq!(message.created_at, now);
+                    assert_eq!(message.created_at, now + chrono::TimeDelta::seconds(2));
                     saw_final_message = true;
                     break;
                 }
@@ -3803,7 +4072,95 @@ mod tests {
             .expect("messages should exist");
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].content, "partial answer with final tail");
-        assert_eq!(messages[0].created_at, now);
+        assert_eq!(messages[0].created_at, now + chrono::TimeDelta::seconds(2));
+    }
+
+    #[tokio::test]
+    async fn finish_assistant_message_discards_aggregate_when_provider_has_individual_messages() {
+        let now = Utc::now();
+        let provider = Arc::new(TestMessageProvider::new(HashMap::new()));
+        let registry = ProviderRegistry::from_map(HashMap::from([(
+            AgentKind::Codex,
+            provider.clone() as Arc<dyn AgentProvider>,
+        )]));
+        let state = test_state_with_providers("finish-provider-message-aggregate", registry).await;
+        let project = state
+            .create_project(CreateProjectInput {
+                name: "Project".to_string(),
+                root_path: std::env::temp_dir().to_string_lossy().to_string(),
+            })
+            .await;
+        let session = state
+            .create_session(CreateSessionInput {
+                project_id: project.id,
+                title: Some("Session".to_string()),
+                agent: AgentKind::Codex,
+                brief_reply_mode: false,
+                provider_id: None,
+                reasoning_effort: None,
+            })
+            .await
+            .expect("session should be created");
+        state
+            .set_provider_session_ref(&session.id, Some("codex-thread-1".to_string()))
+            .await;
+        let assistant_message = ChatMessage {
+            id: "local-assistant".to_string(),
+            session_id: session.id.clone(),
+            role: MessageRole::Assistant,
+            content: "first update\n\n---\n\nfinal answer".to_string(),
+            created_at: now,
+        };
+        state.push_message(assistant_message.clone()).await;
+        provider
+            .set_messages(
+                "codex-thread-1",
+                vec![
+                    test_message(
+                        "provider-assistant-1",
+                        "codex-thread-1",
+                        MessageRole::Assistant,
+                        "first update",
+                        now + chrono::TimeDelta::seconds(1),
+                    ),
+                    test_message(
+                        "provider-assistant-2",
+                        "codex-thread-1",
+                        MessageRole::Assistant,
+                        "final answer",
+                        now + chrono::TimeDelta::seconds(2),
+                    ),
+                ],
+            )
+            .await;
+        let mut events = state.subscribe();
+
+        state
+            .finish_assistant_message(&session.id, &assistant_message.id)
+            .await
+            .expect("assistant message should finish");
+
+        let final_message = loop {
+            if let SessionEvent::MessageCreated(message) = events
+                .recv()
+                .await
+                .expect("event should be broadcast")
+                .event
+            {
+                if message.role == MessageRole::Assistant {
+                    break message;
+                }
+            }
+        };
+        assert_eq!(final_message.content, "final answer");
+
+        let messages = state
+            .list_messages(&session.id)
+            .await
+            .expect("messages should exist");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content, "first update");
+        assert_eq!(messages[1].content, "final answer");
     }
 
     #[tokio::test]
