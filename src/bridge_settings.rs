@@ -111,8 +111,24 @@ impl BridgeSettingsStore {
     }
 
     pub async fn load_from_path_strict(path: PathBuf) -> Result<Self> {
-        let settings = load_settings_from_path(&path).await?;
-        validate_bridge_settings(&settings).map_err(anyhow::Error::msg)?;
+        let settings = match tokio::fs::read_to_string(&path).await {
+            Ok(body) => {
+                let settings = serde_json::from_str::<BridgeSettings>(&body)
+                    .with_context(|| format!("failed to parse bridge settings at {}", path.display()))?;
+                validate_bridge_settings(&settings).map_err(anyhow::Error::msg)?;
+                settings
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let settings = BridgeSettings::default();
+                write_settings(&path, &settings).await?;
+                settings
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to read bridge settings: {}", path.display())
+                })
+            }
+        };
         Ok(Self {
             path,
             settings: RwLock::new(settings),
@@ -448,6 +464,38 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("omni-code-bridge-{prefix}-{unique}.json"))
+    }
+
+    #[tokio::test]
+    async fn load_from_path_strict_creates_defaults_when_missing() {
+        let path = test_path("strict-missing-settings");
+        tokio::fs::remove_file(&path).await.ok();
+
+        let store = super::BridgeSettingsStore::load_from_path_strict(path.clone())
+            .await
+            .expect("missing settings should fall back to defaults");
+        let settings = store.get().await;
+        assert!(settings.model_providers.is_empty());
+        assert!(settings.acp_servers.is_empty());
+
+        let body = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(!body.is_empty());
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn load_from_path_strict_rejects_invalid_json() {
+        let path = test_path("strict-invalid-settings-json");
+        tokio::fs::write(&path, "{not-json")
+            .await
+            .expect("invalid settings fixture should be written");
+
+        let error = super::BridgeSettingsStore::load_from_path_strict(path.clone())
+            .await
+            .err()
+            .expect("invalid settings should be rejected");
+        assert!(error.to_string().contains("failed to parse bridge settings"));
+        let _ = tokio::fs::remove_file(&path).await;
     }
 
     #[tokio::test]
