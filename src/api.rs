@@ -10,13 +10,13 @@ use axum::{
     Json, Router,
     body::Body,
     extract::Multipart,
-    extract::{Path, Query, State, ws::WebSocketUpgrade},
+    extract::{Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{
         IntoResponse,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::{delete, get, post},
+    routing::{get, post},
 };
 use futures_util::stream::{self, Stream, StreamExt};
 use serde::Deserialize;
@@ -25,26 +25,16 @@ use tokio_stream::wrappers::BroadcastStream;
 use crate::{
     adapter,
     app_state::{AppState, EventReplay, SequencedSessionEvent},
-    asr,
-    bridge_settings::{BridgeSettings, BridgeSettingsInput},
+    bridge_settings::BridgeSettingsInput,
     models::{
         AcpAgentDiagnosticResponse, AcpHandshakeProbe, AgentCommandForwarding, AgentCommandSummary,
         AgentCommandsSummary, AgentInstallInput, AgentKind, AgentReadiness, AgentSummary, ApiError,
-        ApiResponse, AppUpdateManifest, ApprovalDecisionInput, AudioSpeechStreamResponse,
-        CancelSessionReplyResult, ClientAuthRequestInput, CreateProjectInput, CreateSessionInput,
-        FileCompletionItem, FileCompletionQuery, MessageListPage, MessageListQuery,
-        OpenAiAudioSpeechRequest, OpenAiErrorDetail, OpenAiErrorResponse, OpenAiModel,
-        OpenAiModelList, OpenAiTranscriptionResponse, OpenAiVerboseTranscriptionResponse,
-        OpenAiVerboseTranscriptionSegment, RegisterPushDeviceInput, ReplySummary, SendMessageInput,
-        SessionEvent, SpeakerFilterSettingsInput, SpeechModelDownloadInput, SpeechModelKind,
-        SpeechProfile, SpeechProfileSelectionInput, SpeechVoiceSelectionInput, SummarizeReplyInput,
+        ApiResponse, AppUpdateManifest, ApprovalDecisionInput, CancelSessionReplyResult,
+        ClientAuthRequestInput, CreateProjectInput, CreateSessionInput, FileCompletionItem,
+        FileCompletionQuery, MessageListPage, MessageListQuery, RegisterPushDeviceInput,
+        ReplySummary, SendMessageInput, SessionEvent, SummarizeReplyInput,
         TriggerClientMessageInput, UpdateSessionInput, UploadedFileResponse,
     },
-    realtime, speaker,
-    speech::{
-        self, profile_slug, set_profile_model, set_tts_model_voice, validate_tts_model_voice,
-    },
-    tts,
 };
 
 pub fn router() -> Router<Arc<AppState>> {
@@ -68,36 +58,6 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/projects/{id}/sessions", get(list_project_sessions))
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/{id}/cancel", post(cancel_session_reply))
-        .route("/v1/models", get(list_openai_models))
-        .route("/v1/audio/transcriptions", post(transcribe_audio))
-        .route("/v1/audio/speech", post(synthesize_speech))
-        .route(
-            "/v1/audio/speech/streams/{token}",
-            get(stream_synthesized_speech).head(head_synthesized_speech),
-        )
-        .route("/speech", get(get_speech_status))
-        .route("/speech/realtime", get(get_speech_realtime_descriptor))
-        .route("/speech/realtime/ws", get(connect_speech_realtime))
-        .route("/speech/models", get(list_speech_models))
-        .route("/speech/models/downloads", post(create_speech_download))
-        .route("/speech/speakers", get(list_speakers).post(enroll_speaker))
-        .route("/speech/speakers/{speaker_id}", delete(delete_speaker))
-        .route(
-            "/speech/speaker-filter",
-            get(get_speaker_filter).put(update_speaker_filter),
-        )
-        .route(
-            "/speech/models/downloads/{task_id}",
-            get(get_speech_download),
-        )
-        .route(
-            "/speech/models/{model_id}/voice",
-            get(get_speech_model_voice).put(update_speech_model_voice),
-        )
-        .route(
-            "/speech/profiles/{profile}/model",
-            get(get_speech_profile_model).put(update_speech_profile_model),
-        )
         .route(
             "/sessions/{id}/messages",
             get(list_messages).post(send_message),
@@ -497,1099 +457,6 @@ async fn get_session(
     Ok(Json(ApiResponse { data: session }))
 }
 
-async fn transcribe_audio(
-    headers: HeaderMap,
-    State(state): State<Arc<AppState>>,
-    mut multipart: Multipart,
-) -> impl IntoResponse {
-    if let Err(error) = authorize_request(&headers, &state).await {
-        return error.into_response();
-    }
-    let mut file_bytes = None;
-    let mut file_name = "speech.wav".to_string();
-    let mut content_type = None;
-    let mut model = None;
-    let mut language = None;
-    let mut prompt = None;
-    let mut response_format = None;
-    let mut stream = None;
-    let mut timestamp_granularities = Vec::new();
-
-    while let Some(field) = match multipart.next_field().await {
-        Ok(field) => field,
-        Err(error) => {
-            return openai_error_response(
-                StatusCode::BAD_REQUEST,
-                format!("invalid multipart payload: {error}"),
-                "invalid_request_error",
-                None,
-                None,
-            )
-            .into_response();
-        }
-    } {
-        let field_name = field.name().map(ToString::to_string);
-        if field_name.as_deref() == Some("model") {
-            model = Some(match field.text().await {
-                Ok(value) => value,
-                Err(error) => {
-                    return openai_error_response(
-                        StatusCode::BAD_REQUEST,
-                        format!("failed to read model field: {error}"),
-                        "invalid_request_error",
-                        Some("model"),
-                        None,
-                    )
-                    .into_response();
-                }
-            });
-            continue;
-        }
-        if field_name.as_deref() == Some("language") {
-            language = Some(match field.text().await {
-                Ok(value) => value,
-                Err(error) => {
-                    return openai_error_response(
-                        StatusCode::BAD_REQUEST,
-                        format!("failed to read language field: {error}"),
-                        "invalid_request_error",
-                        Some("language"),
-                        None,
-                    )
-                    .into_response();
-                }
-            });
-            continue;
-        }
-        if field_name.as_deref() == Some("prompt") {
-            prompt = Some(match field.text().await {
-                Ok(value) => value,
-                Err(error) => {
-                    return openai_error_response(
-                        StatusCode::BAD_REQUEST,
-                        format!("failed to read prompt field: {error}"),
-                        "invalid_request_error",
-                        Some("prompt"),
-                        None,
-                    )
-                    .into_response();
-                }
-            });
-            continue;
-        }
-        if field_name.as_deref() == Some("response_format") {
-            response_format = Some(match field.text().await {
-                Ok(value) => value,
-                Err(error) => {
-                    return openai_error_response(
-                        StatusCode::BAD_REQUEST,
-                        format!("failed to read response_format field: {error}"),
-                        "invalid_request_error",
-                        Some("response_format"),
-                        None,
-                    )
-                    .into_response();
-                }
-            });
-            continue;
-        }
-        if field_name.as_deref() == Some("stream") {
-            stream = Some(match field.text().await {
-                Ok(value) => value,
-                Err(error) => {
-                    return openai_error_response(
-                        StatusCode::BAD_REQUEST,
-                        format!("failed to read stream field: {error}"),
-                        "invalid_request_error",
-                        Some("stream"),
-                        None,
-                    )
-                    .into_response();
-                }
-            });
-            continue;
-        }
-        if field_name.as_deref() == Some("timestamp_granularities[]") {
-            timestamp_granularities.push(match field.text().await {
-                Ok(value) => value,
-                Err(error) => {
-                    return openai_error_response(
-                        StatusCode::BAD_REQUEST,
-                        format!("failed to read timestamp_granularities[] field: {error}"),
-                        "invalid_request_error",
-                        Some("timestamp_granularities[]"),
-                        None,
-                    )
-                    .into_response();
-                }
-            });
-            continue;
-        }
-
-        if field_name.as_deref() != Some("file") {
-            continue;
-        }
-
-        if let Some(name) = field.file_name() {
-            file_name = name.to_string();
-        }
-        content_type = field.content_type().map(ToString::to_string);
-        file_bytes = Some(match field.bytes().await {
-            Ok(bytes) => bytes.to_vec(),
-            Err(error) => {
-                return openai_error_response(
-                    StatusCode::BAD_REQUEST,
-                    format!("failed to read audio file: {error}"),
-                    "invalid_request_error",
-                    Some("file"),
-                    None,
-                )
-                .into_response();
-            }
-        });
-    }
-
-    let Some(bytes) = file_bytes else {
-        return openai_error_response(
-            StatusCode::BAD_REQUEST,
-            "missing multipart field 'file'",
-            "invalid_request_error",
-            Some("file"),
-            None,
-        )
-        .into_response();
-    };
-
-    let requested_model = model
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    let normalized_language = match normalize_transcription_language(language.as_deref()) {
-        Ok(language) => language,
-        Err(error) => {
-            return openai_error_response(
-                StatusCode::BAD_REQUEST,
-                error,
-                "invalid_request_error",
-                Some("language"),
-                None,
-            )
-            .into_response();
-        }
-    };
-    let normalized_response_format =
-        normalize_transcription_response_format(response_format.as_deref());
-
-    if let Err(error) = validate_transcription_options(
-        requested_model.as_deref(),
-        normalized_language.as_deref(),
-        prompt.as_deref(),
-        normalized_response_format,
-        stream.as_deref(),
-        &timestamp_granularities,
-    ) {
-        return openai_error_response(
-            StatusCode::BAD_REQUEST,
-            error,
-            "invalid_request_error",
-            None,
-            None,
-        )
-        .into_response();
-    }
-
-    let settings = state.bridge_settings().await;
-    let model_id =
-        match resolve_asr_request_model(&state, &settings, requested_model.as_deref()).await {
-            Ok(model_id) => model_id,
-            Err(error) => {
-                return openai_error_response(
-                    StatusCode::PRECONDITION_FAILED,
-                    error,
-                    "invalid_request_error",
-                    Some("model"),
-                    None,
-                )
-                .into_response();
-            }
-        };
-
-    let transcription = match asr::transcribe_audio(
-        state.speech(),
-        settings.speech_profiles,
-        &model_id,
-        bytes,
-        file_name,
-        content_type,
-        normalized_language.clone(),
-        settings.speaker_filter,
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(error) => {
-            return openai_error_response(
-                StatusCode::BAD_GATEWAY,
-                error,
-                "server_error",
-                None,
-                None,
-            )
-            .into_response();
-        }
-    };
-
-    transcription_response(
-        normalized_response_format,
-        normalized_language.as_deref(),
-        transcription.text,
-        transcription.duration_secs,
-    )
-    .into_response()
-}
-
-async fn synthesize_speech(
-    headers: HeaderMap,
-    State(state): State<Arc<AppState>>,
-    Json(input): Json<OpenAiAudioSpeechRequest>,
-) -> impl IntoResponse {
-    if let Err(error) = authorize_request(&headers, &state).await {
-        return error.into_response();
-    }
-    let model = input
-        .model
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let response_format = input
-        .response_format
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string);
-    let stream = input.stream.unwrap_or(false);
-    if let Err(error) = validate_speech_options(
-        model,
-        input.input.as_str(),
-        input.voice.as_deref(),
-        input.instructions.as_deref(),
-        response_format.as_deref(),
-        input.speed,
-    ) {
-        return openai_error_response(
-            StatusCode::BAD_REQUEST,
-            error,
-            "invalid_request_error",
-            None,
-            None,
-        )
-        .into_response();
-    }
-    let settings = state.bridge_settings().await;
-    let model_id = match resolve_tts_request_model(&state, &settings, model).await {
-        Ok(model_id) => model_id,
-        Err(error) => {
-            return openai_error_response(
-                StatusCode::PRECONDITION_FAILED,
-                error,
-                "invalid_request_error",
-                Some("model"),
-                None,
-            )
-            .into_response();
-        }
-    };
-    let voice = input
-        .voice
-        .as_deref()
-        .is_some_and(|voice| !voice.trim().is_empty())
-        .then_some(input.voice)
-        .flatten()
-        .or_else(|| settings.speech_voices.tts_by_model.get(&model_id).cloned());
-    if stream {
-        let session = state
-            .create_tts_stream_session(
-                model_id,
-                input.input,
-                voice,
-                input.speed,
-                response_format,
-                "audio/wav".to_string(),
-            )
-            .await;
-        return (
-            StatusCode::OK,
-            Json(ApiResponse {
-                data: AudioSpeechStreamResponse {
-                    stream_url: format!("/v1/audio/speech/streams/{}", session.token),
-                    content_type: session.content_type,
-                },
-            }),
-        )
-            .into_response();
-    }
-    let (audio_bytes, content_type) = match tts::synthesize_speech(
-        state.speech(),
-        &model_id,
-        input.input,
-        voice,
-        input.speed,
-        response_format,
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(error) => {
-            return openai_error_response(
-                StatusCode::BAD_GATEWAY,
-                error,
-                "server_error",
-                None,
-                None,
-            )
-            .into_response();
-        }
-    };
-
-    (
-        StatusCode::OK,
-        [("content-type", content_type)],
-        Body::from(audio_bytes),
-    )
-        .into_response()
-}
-
-async fn stream_synthesized_speech(
-    Path(token): Path<String>,
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    let Some(session) = state.get_tts_stream_session(&token).await else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-
-    if headers.get(header::RANGE).is_some() {
-        return StatusCode::RANGE_NOT_SATISFIABLE.into_response();
-    }
-
-    let (body, content_type) = match tts::synthesize_speech_stream(
-        state.speech(),
-        &session.model_id,
-        session.input,
-        session.voice,
-        session.speed,
-        session.response_format,
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(error) => {
-            return openai_error_response(
-                StatusCode::BAD_GATEWAY,
-                error,
-                "server_error",
-                None,
-                None,
-            )
-            .into_response();
-        }
-    };
-
-    (
-        StatusCode::OK,
-        [
-            ("content-type", content_type),
-            ("cache-control", "no-store".to_string()),
-        ],
-        body,
-    )
-        .into_response()
-}
-
-async fn head_synthesized_speech(
-    Path(token): Path<String>,
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
-    let Some(session) = state.get_tts_stream_session(&token).await else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-
-    let mut response = StatusCode::OK.into_response();
-    let headers = response.headers_mut();
-    insert_header(headers, header::CONTENT_TYPE, &session.content_type);
-    insert_header(headers, header::CACHE_CONTROL, "no-store");
-    response
-}
-
-fn insert_header(headers: &mut HeaderMap, name: header::HeaderName, value: &str) {
-    if let Ok(value) = HeaderValue::from_str(value) {
-        headers.insert(name, value);
-    }
-}
-
-async fn list_openai_models(
-    headers: HeaderMap,
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
-    if let Err(error) = authorize_request(&headers, &state).await {
-        return error.into_response();
-    }
-
-    let data = state
-        .speech()
-        .list_models(state.bridge_settings().await.speech_profiles)
-        .await
-        .into_iter()
-        .filter(|model| {
-            model.installed
-                && match model.kind {
-                    SpeechModelKind::Asr => model.capabilities.batch_asr,
-                    SpeechModelKind::Tts => model.capabilities.speech_synthesis,
-                    SpeechModelKind::Vad => false,
-                    SpeechModelKind::Speaker => false,
-                }
-        })
-        .map(|model| OpenAiModel {
-            id: model.id,
-            object: "model".to_string(),
-            created: 0,
-            owned_by: "omni-code-bridge".to_string(),
-        })
-        .collect();
-
-    Json(OpenAiModelList {
-        object: "list".to_string(),
-        data,
-    })
-    .into_response()
-}
-
-async fn get_speech_status(
-    headers: HeaderMap,
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
-    if let Err(error) = authorize_request(&headers, &state).await {
-        return error.into_response();
-    }
-    let settings = state.bridge_settings().await;
-    Json(ApiResponse {
-        data: state
-            .speech()
-            .status(settings.speech_profiles, settings.speech_voices)
-            .await,
-    })
-    .into_response()
-}
-
-async fn get_speech_realtime_descriptor(
-    headers: HeaderMap,
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
-    if let Err(error) = authorize_request(&headers, &state).await {
-        return error.into_response();
-    }
-
-    Json(ApiResponse {
-        data: realtime::descriptor(&state).await,
-    })
-    .into_response()
-}
-
-async fn connect_speech_realtime(
-    headers: HeaderMap,
-    ws: WebSocketUpgrade,
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
-    if let Err(error) = authorize_request(&headers, &state).await {
-        return error.into_response();
-    }
-
-    ws.on_upgrade(move |socket| realtime::handle_socket(socket, state))
-        .into_response()
-}
-
-async fn list_speech_models(
-    headers: HeaderMap,
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
-    if let Err(error) = authorize_request(&headers, &state).await {
-        return error.into_response();
-    }
-    let settings = state.bridge_settings().await;
-    Json(ApiResponse {
-        data: state.speech().list_models(settings.speech_profiles).await,
-    })
-    .into_response()
-}
-
-async fn create_speech_download(
-    headers: HeaderMap,
-    State(state): State<Arc<AppState>>,
-    Json(input): Json<SpeechModelDownloadInput>,
-) -> Result<impl IntoResponse, ApiError> {
-    authorize_request(&headers, &state).await?;
-    let task = state
-        .speech()
-        .queue_download(&input.model_id)
-        .await
-        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
-    Ok((StatusCode::CREATED, Json(ApiResponse { data: task })))
-}
-
-async fn get_speech_download(
-    Path(task_id): Path<String>,
-    headers: HeaderMap,
-    State(state): State<Arc<AppState>>,
-) -> Result<impl IntoResponse, ApiError> {
-    authorize_request(&headers, &state).await?;
-    let task = state
-        .speech()
-        .get_download(&task_id)
-        .await
-        .ok_or(ApiError {
-            status: StatusCode::NOT_FOUND,
-            message: "speech download task not found".to_string(),
-        })?;
-    Ok(Json(ApiResponse { data: task }))
-}
-
-async fn list_speakers(
-    headers: HeaderMap,
-    State(state): State<Arc<AppState>>,
-) -> Result<impl IntoResponse, ApiError> {
-    authorize_request(&headers, &state).await?;
-    let speakers = speaker::list_speakers()
-        .await
-        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    Ok(Json(ApiResponse { data: speakers }))
-}
-
-async fn enroll_speaker(
-    headers: HeaderMap,
-    State(state): State<Arc<AppState>>,
-    mut multipart: Multipart,
-) -> Result<impl IntoResponse, ApiError> {
-    authorize_request(&headers, &state).await?;
-    let mut file_bytes = None;
-    let mut file_name = "speaker.wav".to_string();
-    let mut content_type = None;
-    let mut name = None;
-
-    while let Some(field) = multipart.next_field().await.map_err(|error| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("invalid multipart payload: {error}"),
-        )
-    })? {
-        let field_name = field.name().map(ToString::to_string);
-        if field_name.as_deref() == Some("name") {
-            name = Some(field.text().await.map_err(|error| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    format!("failed to read name field: {error}"),
-                )
-            })?);
-            continue;
-        }
-
-        if field_name.as_deref() != Some("file") {
-            continue;
-        }
-
-        if let Some(value) = field.file_name() {
-            file_name = value.to_string();
-        }
-        content_type = field.content_type().map(ToString::to_string);
-        file_bytes = Some(
-            field
-                .bytes()
-                .await
-                .map_err(|error| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        format!("failed to read speaker audio: {error}"),
-                    )
-                })?
-                .to_vec(),
-        );
-    }
-
-    let bytes = file_bytes.ok_or((
-        StatusCode::BAD_REQUEST,
-        "missing multipart field 'file'".to_string(),
-    ))?;
-    let name = name
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .ok_or((StatusCode::BAD_REQUEST, "missing speaker name".to_string()))?;
-    let result = speaker::enroll_speaker(state.speech(), name, bytes, file_name, content_type)
-        .await
-        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
-    Ok((StatusCode::CREATED, Json(ApiResponse { data: result })))
-}
-
-async fn delete_speaker(
-    Path(speaker_id): Path<String>,
-    headers: HeaderMap,
-    State(state): State<Arc<AppState>>,
-) -> Result<impl IntoResponse, ApiError> {
-    authorize_request(&headers, &state).await?;
-    speaker::delete_speaker(&speaker_id)
-        .await
-        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    let current = state.bridge_settings().await.speaker_filter;
-    if current.speaker_id.as_deref() == Some(speaker_id.as_str()) {
-        let mut updated = current;
-        updated.enabled = false;
-        updated.speaker_id = None;
-        state
-            .update_speaker_filter_settings(speaker::normalize_speaker_filter(updated))
-            .await
-            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
-    }
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn get_speaker_filter(
-    headers: HeaderMap,
-    State(state): State<Arc<AppState>>,
-) -> Result<impl IntoResponse, ApiError> {
-    authorize_request(&headers, &state).await?;
-    Ok(Json(ApiResponse {
-        data: state.bridge_settings().await.speaker_filter,
-    }))
-}
-
-async fn update_speaker_filter(
-    headers: HeaderMap,
-    State(state): State<Arc<AppState>>,
-    Json(input): Json<SpeakerFilterSettingsInput>,
-) -> Result<impl IntoResponse, ApiError> {
-    authorize_request(&headers, &state).await?;
-    let settings = speaker::normalize_speaker_filter(crate::models::SpeakerFilterSettings {
-        enabled: input.enabled,
-        speaker_id: input.speaker_id,
-        threshold: input.threshold,
-    });
-    if let Some(speaker_id) = settings.speaker_id.as_deref() {
-        let speakers = speaker::list_speakers()
-            .await
-            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-        if !speakers.iter().any(|speaker| speaker.id == speaker_id) {
-            return Err(ApiError {
-                status: StatusCode::BAD_REQUEST,
-                message: "unknown speaker_id".to_string(),
-            });
-        }
-    }
-    let settings = state
-        .update_speaker_filter_settings(settings)
-        .await
-        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?
-        .speaker_filter;
-    Ok(Json(ApiResponse { data: settings }))
-}
-
-async fn get_speech_model_voice(
-    Path(model_id): Path<String>,
-    headers: HeaderMap,
-    State(state): State<Arc<AppState>>,
-) -> Result<impl IntoResponse, ApiError> {
-    authorize_request(&headers, &state).await?;
-    validate_tts_model_voice(&state.speech(), &model_id, None)
-        .await
-        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
-    let settings = state.bridge_settings().await;
-    Ok(Json(ApiResponse {
-        data: serde_json::json!({
-            "model_id": model_id,
-            "voice": settings.speech_voices.tts_by_model.get(&model_id),
-        }),
-    }))
-}
-
-async fn update_speech_model_voice(
-    Path(model_id): Path<String>,
-    headers: HeaderMap,
-    State(state): State<Arc<AppState>>,
-    Json(input): Json<SpeechVoiceSelectionInput>,
-) -> Result<impl IntoResponse, ApiError> {
-    authorize_request(&headers, &state).await?;
-    let voices = set_tts_model_voice(
-        state.settings_store(),
-        &state.speech(),
-        &model_id,
-        input.voice,
-    )
-    .await
-    .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
-    Ok(Json(ApiResponse { data: voices }))
-}
-
-async fn get_speech_profile_model(
-    Path(profile): Path<String>,
-    headers: HeaderMap,
-    State(state): State<Arc<AppState>>,
-) -> Result<impl IntoResponse, ApiError> {
-    authorize_request(&headers, &state).await?;
-    let profile = speech::profile_from_slug(&profile).ok_or(ApiError {
-        status: StatusCode::BAD_REQUEST,
-        message: "unknown speech profile".to_string(),
-    })?;
-    let settings = state.bridge_settings().await;
-    Ok(Json(ApiResponse {
-        data: serde_json::json!({
-            "profile": profile_slug(profile),
-            "model_id": settings.speech_profiles.model_for_profile(profile),
-        }),
-    }))
-}
-
-async fn update_speech_profile_model(
-    Path(profile): Path<String>,
-    headers: HeaderMap,
-    State(state): State<Arc<AppState>>,
-    Json(input): Json<SpeechProfileSelectionInput>,
-) -> Result<impl IntoResponse, ApiError> {
-    authorize_request(&headers, &state).await?;
-    let profile = speech::profile_from_slug(&profile).ok_or(ApiError {
-        status: StatusCode::BAD_REQUEST,
-        message: "unknown speech profile".to_string(),
-    })?;
-    let profiles = set_profile_model(
-        state.settings_store(),
-        &state.speech(),
-        profile,
-        input.model_id,
-    )
-    .await
-    .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
-    Ok(Json(ApiResponse { data: profiles }))
-}
-
-async fn resolve_asr_request_model(
-    state: &Arc<AppState>,
-    settings: &BridgeSettings,
-    requested_model: Option<&str>,
-) -> Result<String, String> {
-    if let Some(model_id) = requested_model.filter(|value| !value.trim().is_empty()) {
-        state.speech().resolve_model_by_id(model_id.trim()).await?;
-        validate_requested_model_for_profile(&state, model_id.trim(), SpeechProfile::AsrBatch)?;
-        return Ok(model_id.trim().to_string());
-    }
-
-    state
-        .speech()
-        .verify_profile(
-            &settings.speech_profiles,
-            crate::models::SpeechProfile::AsrBatch,
-        )
-        .await
-        .map(|_| {
-            settings
-                .speech_profiles
-                .asr_batch
-                .clone()
-                .expect("asr_batch must exist after verify_profile succeeds")
-        })
-}
-
-async fn resolve_tts_request_model(
-    state: &Arc<AppState>,
-    settings: &BridgeSettings,
-    requested_model: Option<&str>,
-) -> Result<String, String> {
-    if let Some(model_id) = requested_model.filter(|value| !value.trim().is_empty()) {
-        state.speech().resolve_model_by_id(model_id.trim()).await?;
-        validate_requested_model_kind(&state, model_id.trim(), SpeechModelKind::Tts)?;
-        return Ok(model_id.trim().to_string());
-    }
-
-    match state
-        .speech()
-        .verify_profile(
-            &settings.speech_profiles,
-            crate::models::SpeechProfile::TtsDefault,
-        )
-        .await
-    {
-        Ok(_) => Ok(settings
-            .speech_profiles
-            .tts_default
-            .clone()
-            .expect("tts_default must exist after verify_profile succeeds")),
-        Err(_) => infer_installed_tts_model(state, settings)
-            .await
-            .ok_or_else(|| {
-                format!(
-                    "configure speech profile {} by calling PUT /speech/profiles/{}/model",
-                    profile_slug(crate::models::SpeechProfile::TtsDefault),
-                    profile_slug(crate::models::SpeechProfile::TtsDefault)
-                )
-            }),
-    }
-}
-
-async fn infer_installed_tts_model(
-    state: &Arc<AppState>,
-    settings: &BridgeSettings,
-) -> Option<String> {
-    let models = state
-        .speech()
-        .list_models(settings.speech_profiles.clone())
-        .await;
-    let mut candidates = models
-        .into_iter()
-        .filter(|model| {
-            model.installed
-                && model
-                    .supports_profiles
-                    .contains(&crate::models::SpeechProfile::TtsDefault)
-        })
-        .collect::<Vec<_>>();
-
-    candidates.sort_by_key(|model| if model.id.contains("kokoro") { 0 } else { 1 });
-    candidates.into_iter().map(|model| model.id).next()
-}
-
-fn validate_transcription_options(
-    model: Option<&str>,
-    language: Option<&str>,
-    _prompt: Option<&str>,
-    response_format: Option<&str>,
-    stream: Option<&str>,
-    timestamp_granularities: &[String],
-) -> Result<(), String> {
-    if let Some(language) = language {
-        if !supported_sensevoice_languages().contains(&language) {
-            return Err(format!(
-                "unsupported language '{}'; supported values are auto, zh, en, yue, ja, ko",
-                language
-            ));
-        }
-    }
-
-    if let Some(format) = response_format {
-        let allowed = ["json", "text", "verbose_json"];
-        if !allowed.contains(&format.trim()) {
-            return Err(format!(
-                "unsupported response_format '{}'; supported values are json, text, verbose_json",
-                format.trim()
-            ));
-        }
-    }
-
-    if let Some(stream) = stream {
-        let value = stream.trim().to_ascii_lowercase();
-        if value == "true" || value == "1" {
-            return Err("stream=true is not supported on /v1/audio/transcriptions yet".to_string());
-        }
-    }
-
-    for granularity in timestamp_granularities {
-        let value = granularity.trim();
-        match value {
-            "" | "segment" => {}
-            "word" => {
-                return Err(
-                    "timestamp_granularities[]=word is not supported by the current local ASR backend"
-                        .to_string(),
-                );
-            }
-            _ => {
-                return Err(format!(
-                    "unsupported timestamp_granularities[] value '{}'; supported values are segment",
-                    value
-                ));
-            }
-        }
-    }
-
-    if let Some(model) = model {
-        if model.trim().is_empty() {
-            return Err("model must not be empty".to_string());
-        }
-    }
-
-    Ok(())
-}
-
-fn normalize_transcription_language(language: Option<&str>) -> Result<Option<String>, String> {
-    let Some(language) = language.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Ok(None);
-    };
-    let normalized = language.to_ascii_lowercase().replace('_', "-");
-    let normalized = match normalized.as_str() {
-        "auto" => "auto",
-        "zh" | "zh-cn" | "zh-hans" | "cmn" => "zh",
-        "en" | "en-us" | "en-gb" => "en",
-        "yue" | "zh-hk" | "zh-hant" => "yue",
-        "ja" | "jp" => "ja",
-        "ko" | "kr" => "ko",
-        _ => {
-            return Err(format!(
-                "unsupported language '{}'; supported values are auto, zh, en, yue, ja, ko",
-                language
-            ));
-        }
-    };
-    Ok(Some(normalized.to_string()))
-}
-
-fn supported_sensevoice_languages() -> &'static [&'static str] {
-    &["auto", "zh", "en", "yue", "ja", "ko"]
-}
-
-fn validate_speech_options(
-    model: Option<&str>,
-    input: &str,
-    voice: Option<&str>,
-    instructions: Option<&str>,
-    response_format: Option<&str>,
-    speed: Option<f32>,
-) -> Result<(), String> {
-    if let Some(model) = model {
-        if model.trim().is_empty() {
-            return Err("model must not be empty".to_string());
-        }
-    }
-
-    if input.trim().is_empty() {
-        return Err("input is required".to_string());
-    }
-
-    if let Some(voice) = voice.map(str::trim).filter(|value| !value.is_empty()) {
-        if voice.parse::<i32>().is_err() {
-            return Err("voice must be a numeric speaker id".to_string());
-        }
-    }
-
-    if let Some(speed) = speed {
-        if !(0.25..=4.0).contains(&speed) {
-            return Err("speed must be between 0.25 and 4.0".to_string());
-        }
-    }
-
-    if let Some(format) = response_format {
-        let value = format.trim();
-        if value != "wav" {
-            return Err(format!(
-                "unsupported response_format '{}'; local TTS currently supports wav only",
-                value
-            ));
-        }
-    }
-
-    if instructions
-        .map(|value| !value.trim().is_empty())
-        .unwrap_or(false)
-    {
-        return Err("instructions is not supported by the current local TTS backend".to_string());
-    }
-
-    Ok(())
-}
-
-fn normalize_transcription_response_format(response_format: Option<&str>) -> Option<&str> {
-    response_format
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-}
-
-fn transcription_response(
-    response_format: Option<&str>,
-    language: Option<&str>,
-    text: String,
-    duration_secs: f32,
-) -> impl IntoResponse {
-    match response_format.unwrap_or("json") {
-        "text" => (
-            StatusCode::OK,
-            [("content-type", "text/plain; charset=utf-8")],
-            Body::from(text),
-        )
-            .into_response(),
-        "verbose_json" => {
-            let response = OpenAiVerboseTranscriptionResponse {
-                task: "transcribe".to_string(),
-                language: language
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or("auto")
-                    .to_string(),
-                duration: duration_secs,
-                segments: vec![OpenAiVerboseTranscriptionSegment {
-                    id: 0,
-                    seek: 0,
-                    start: 0.0,
-                    end: duration_secs,
-                    text: text.clone(),
-                }],
-                text,
-            };
-            (StatusCode::OK, Json(response)).into_response()
-        }
-        _ => (StatusCode::OK, Json(OpenAiTranscriptionResponse { text })).into_response(),
-    }
-}
-
-fn validate_requested_model_for_profile(
-    state: &Arc<AppState>,
-    model_id: &str,
-    profile: SpeechProfile,
-) -> Result<(), String> {
-    let kind = match state.speech().model_kind(model_id) {
-        Some(kind) => kind,
-        None => return Err(format!("unknown speech model: {model_id}")),
-    };
-
-    if kind != SpeechModelKind::Asr {
-        return Err(format!(
-            "model {model_id} is not an ASR model and cannot be used for /v1/audio/transcriptions"
-        ));
-    }
-
-    if !state.speech().supports_profile(model_id, profile) {
-        return Err(format!(
-            "model {model_id} does not support batch transcription; choose a model compatible with profile {}",
-            profile_slug(profile)
-        ));
-    }
-
-    Ok(())
-}
-
-fn validate_requested_model_kind(
-    state: &Arc<AppState>,
-    model_id: &str,
-    expected_kind: SpeechModelKind,
-) -> Result<(), String> {
-    match state.speech().model_kind(model_id) {
-        Some(kind) if kind == expected_kind => Ok(()),
-        Some(_) => Err(format!("model {model_id} cannot be used for this endpoint")),
-        None => Err(format!("unknown speech model: {model_id}")),
-    }
-}
-
-fn openai_error_response(
-    status: StatusCode,
-    message: impl Into<String>,
-    error_type: &str,
-    param: Option<&str>,
-    code: Option<&str>,
-) -> impl IntoResponse {
-    (
-        status,
-        Json(OpenAiErrorResponse {
-            error: OpenAiErrorDetail {
-                message: message.into(),
-                error_type: error_type.to_string(),
-                param: param.map(ToString::to_string),
-                code: code.map(ToString::to_string),
-            },
-        }),
-    )
-}
-
 async fn trigger_client_message(
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
@@ -1607,8 +474,8 @@ async fn trigger_client_message(
 async fn list_messages(
     Path(id): Path<String>,
     headers: HeaderMap,
-    Query(query): Query<MessageListQuery>,
     State(state): State<Arc<AppState>>,
+    Query(query): Query<MessageListQuery>,
 ) -> Result<Json<ApiResponse<MessageListPage>>, ApiError> {
     authorize_request_status(&headers, &state).await?;
     let messages = state.list_messages(&id).await.ok_or(ApiError {
@@ -2983,10 +1850,8 @@ mod tests {
         AcpDiagnosticQuery, absolute_url_from_headers, agent_commands_summary, agent_summary,
         completion_search_scope, content_type_for_path, content_type_for_upload_name,
         encode_session_event, get_acp_agent_diagnostic, list_completion_items,
-        normalize_completion_prefix, normalize_transcription_language,
-        normalize_transcription_response_format, paginate_messages, resolve_path_within_root,
-        sanitize_upload_file_name, sanitize_upload_lookup_id, transcription_response, uploads_dir,
-        validate_speech_options, validate_transcription_options,
+        normalize_completion_prefix, paginate_messages, resolve_path_within_root,
+        sanitize_upload_file_name, sanitize_upload_lookup_id, uploads_dir,
     };
     use crate::{
         app_state::AppState,
@@ -3272,68 +2137,6 @@ for line in sys.stdin:
         );
         let stored_path = uploads_dir().join("file.png");
         assert!(stored_path.ends_with("uploads/file.png"));
-    }
-
-    #[test]
-    fn transcription_options_allow_missing_model_for_profile_fallback() {
-        assert!(validate_transcription_options(None, None, None, None, None, &[]).is_ok());
-    }
-
-    #[test]
-    fn transcription_options_reject_word_timestamps() {
-        let error = validate_transcription_options(
-            None,
-            None,
-            None,
-            Some("verbose_json"),
-            None,
-            &["word".to_string()],
-        )
-        .unwrap_err();
-        assert!(error.contains("timestamp_granularities[]=word"));
-    }
-
-    #[test]
-    fn transcription_language_normalizes_common_sensevoice_aliases() {
-        assert_eq!(
-            normalize_transcription_language(Some(" zh-CN ")).unwrap(),
-            Some("zh".to_string())
-        );
-        assert_eq!(
-            normalize_transcription_language(Some("zh_HK")).unwrap(),
-            Some("yue".to_string())
-        );
-        assert_eq!(normalize_transcription_language(Some("   ")).unwrap(), None);
-    }
-
-    #[test]
-    fn transcription_options_reject_unsupported_language() {
-        let error =
-            normalize_transcription_language(Some("fr")).expect_err("fr should be unsupported");
-        assert!(error.contains("unsupported language 'fr'"));
-    }
-
-    #[test]
-    fn speech_options_allow_missing_model_for_profile_fallback() {
-        assert!(validate_speech_options(None, "hello", None, None, None, None).is_ok());
-    }
-
-    #[test]
-    fn speech_options_require_non_empty_input() {
-        let error = validate_speech_options(None, "   ", None, None, None, None).unwrap_err();
-        assert_eq!(error, "input is required");
-    }
-
-    #[test]
-    fn speech_options_reject_non_numeric_voice() {
-        let error =
-            validate_speech_options(None, "hello", Some("alloy"), None, None, None).unwrap_err();
-        assert_eq!(error, "voice must be a numeric speaker id");
-    }
-
-    #[test]
-    fn speech_options_allow_numeric_voice_for_model_level_fallback() {
-        assert!(validate_speech_options(None, "hello", Some("48"), None, None, None).is_ok());
     }
 
     #[test]
@@ -3742,9 +2545,6 @@ for line in sys.stdin:
                     headers: Vec::new(),
                     env: Vec::new(),
                 }]),
-                speech_profiles: None,
-                speech_voices: None,
-                speaker_filter: None,
             })
             .await
             .expect("settings update should succeed");
@@ -3821,9 +2621,6 @@ for line in sys.stdin:
                         env: Vec::new(),
                     },
                 ]),
-                speech_profiles: None,
-                speech_voices: None,
-                speaker_filter: None,
             })
             .await
             .expect("settings update should succeed");
@@ -3876,9 +2673,6 @@ for line in sys.stdin:
                     headers: Vec::new(),
                     env: Vec::new(),
                 }]),
-                speech_profiles: None,
-                speech_voices: None,
-                speaker_filter: None,
             })
             .await
             .expect("settings update should succeed");
@@ -3988,9 +2782,6 @@ for line in sys.stdin:
                         env: Vec::new(),
                     },
                 ]),
-                speech_profiles: None,
-                speech_voices: None,
-                speaker_filter: None,
             })
             .await
             .expect("settings update should succeed");
@@ -4071,9 +2862,6 @@ for line in sys.stdin:
                     headers: Vec::new(),
                     env: Vec::new(),
                 }]),
-                speech_profiles: None,
-                speech_voices: None,
-                speaker_filter: None,
             })
             .await
             .expect("settings update should succeed");
@@ -4140,9 +2928,6 @@ for line in sys.stdin:
                         env: Vec::new(),
                     },
                 ]),
-                speech_profiles: None,
-                speech_voices: None,
-                speaker_filter: None,
             })
             .await
             .expect("settings update should succeed");
@@ -4205,9 +2990,6 @@ for line in sys.stdin:
                     headers: Vec::new(),
                     env: Vec::new(),
                 }]),
-                speech_profiles: None,
-                speech_voices: None,
-                speaker_filter: None,
             })
             .await
             .expect("settings update should succeed");
@@ -4307,9 +3089,6 @@ for line in sys.stdin:
                     }],
                     env: Vec::new(),
                 }]),
-                speech_profiles: None,
-                speech_voices: None,
-                speaker_filter: None,
             })
             .await
             .expect("settings update should succeed");
@@ -4414,9 +3193,6 @@ data: {\"type\":\"done\"}\n\n",
                     headers: Vec::new(),
                     env: Vec::new(),
                 }]),
-                speech_profiles: None,
-                speech_voices: None,
-                speaker_filter: None,
             })
             .await
             .expect("settings update should succeed");
@@ -4495,9 +3271,6 @@ data: {\"type\":\"done\"}\n\n",
                     headers: Vec::new(),
                     env: Vec::new(),
                 }]),
-                speech_profiles: None,
-                speech_voices: None,
-                speaker_filter: None,
             })
             .await
             .expect("settings update should succeed");
@@ -4547,44 +3320,6 @@ data: {\"type\":\"done\"}\n\n",
                 .unwrap_or_default()
                 .contains("probe turn")
         );
-    }
-
-    #[tokio::test]
-    async fn transcription_response_returns_text_body() {
-        let response =
-            transcription_response(Some("text"), None, "hello".to_string(), 1.25).into_response();
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response.headers().get(header::CONTENT_TYPE).unwrap(),
-            "text/plain; charset=utf-8"
-        );
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(std::str::from_utf8(&body).unwrap(), "hello");
-    }
-
-    #[tokio::test]
-    async fn transcription_response_returns_verbose_json_body() {
-        let response =
-            transcription_response(Some("verbose_json"), Some("zh"), "你好".to_string(), 2.5)
-                .into_response();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let json: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["task"], "transcribe");
-        assert_eq!(json["language"], "zh");
-        assert_eq!(json["text"], "你好");
-        assert_eq!(json["duration"], 2.5);
-        assert_eq!(json["segments"][0]["start"], 0.0);
-        assert_eq!(json["segments"][0]["end"], 2.5);
-    }
-
-    #[test]
-    fn normalize_transcription_response_format_trims_empty_values() {
-        assert_eq!(
-            normalize_transcription_response_format(Some(" json ")),
-            Some("json")
-        );
-        assert_eq!(normalize_transcription_response_format(Some("   ")), None);
     }
 
     fn test_dir(prefix: &str) -> PathBuf {

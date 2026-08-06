@@ -68,11 +68,5 @@
       ],
       "env": []
     }
-  ],
-  "speech_profiles": {},
-  "speech_voices": {},
-  "speaker_filter": {
-    "enabled": false,
-    "threshold": 0.45
-  }
+  ]
 }

@@ -66,15 +66,6 @@ Agent 二进制路径可以通过 `ECHO_MATE_CODEX_BIN` 和 `ECHO_MATE_OPENCODE_
 | `GET /sessions/{id}/messages` | 列出会话消息；支持 `limit`、`before_id`、`after_id` |
 | `GET /app-update/manifest` | APK 更新 manifest |
 | `GET /app-update/apk` | 下载最新 APK |
-| `GET /speech`, `GET /speech/models` | 本地语音模型管理 |
-| `POST /speech/models/downloads` | 下载语音模型 |
-| `GET /speech/models/downloads/{task_id}` | 轮询下载状态 |
-| `GET/PUT /speech/profiles/{profile}/model` | 绑定模型到 profile |
-| `GET /speech/realtime` | 实时语音 descriptor |
-| `GET /speech/realtime/ws` | Websocket 实时/通话模式语音 |
-| `GET /v1/models` | OpenAI 兼容模型列表 |
-| `POST /v1/audio/transcriptions` | OpenAI 兼容 ASR |
-| `POST /v1/audio/speech` | OpenAI 兼容 TTS |
 
 `GET /sessions/{id}/messages` 按存储顺序返回消息。未传 cursor 时返回最新一页：
 `limit` 默认 `50`，并限制在 `1..=200`，因此正在生成中的 assistant 回复会保留在默认页。
@@ -295,110 +286,6 @@ settings 里没有对应 ACP server，接口会直接返回 `400 Bad Request`。
 Codex 会收到 `model_reasoning_effort`，Claude Code 会收到 `--effort`。OpenCode 当前会忽略
 这个字段，因为 bridge 使用的 headless prompt API 还没有暴露对应选项。
 
-## 本地语音接口
-
-桥接服务现在可以通过 `sherpa-onnx` 跑本地 ASR 和 TTS，并提供两层 API：
-
-- `/speech/*` 模型管理接口，供客户端列出、下载、查看、选择本地语音模型
-- `/v1/*` OpenAI 兼容接口，供客户端复用标准音频请求流程
-
-当前内置模型目录包括：
-
-- 批量转写 ASR：`sensevoice-small-int8`
-- 实时/通话模式 ASR 候选：`streaming-paraformer-zh-en`、`funasr-streaming-paraformer-zh-yue-en`
-- TTS：`vits-melo-tts-zh-en`、`kokoro-int8-multi-lang-v1_1`
-- VAD：`silero-vad`
-
-`GET /speech/models` 会返回客户端可直接用于过滤的信息，包括：
-
-- `kind`、`runtime`、`backend`
-- `capabilities`，例如 `streaming`、`batch_asr`、`realtime_asr`、`speech_synthesis`、`vad`
-- `features`、`languages`、`download_size_mb`、`memory_hint`、`notes`
-- `sample_rate_hz`、`default_voice`、`voices`，用于客户端 TTS 参数设置
-  目前本地 TTS 的 `voice` 仍使用数字 speaker ID。`vits-melo-tts-zh-en` 只有 `0` 这一个音色，
-  `kokoro-int8-multi-lang-v1_1` 则会暴露多个 speaker。
-- `supports_profiles`、`recommended_profiles`、`selected_by`
-
-### 推荐接入流程
-
-1. 调用 `GET /speech/models`
-2. 选择兼容模型并通过 `POST /speech/models/downloads` 发起下载
-3. 轮询 `GET /speech/models/downloads/{task_id}` 直到 `completed`
-4. 通过 `PUT /speech/profiles/{profile}/model` 把已安装模型绑定到 profile
-5. 调用 `/v1/audio/transcriptions` 或 `/v1/audio/speech`
-
-Speech profile 绑定默认持久化保存到 `~/.omni-code/settings.json`。可以通过
-`ECHO_MATE_SETTINGS_PATH` 覆盖设置文件位置。
-TTS 音色通过 `GET/PUT /speech/models/{model_id}/voice` 按模型保存，因此在单音色和多音色
-TTS 模型之间切换时不会复用不兼容的 voice。
-
-### OpenAI 兼容语音行为
-
-- `GET /v1/models` 只返回已经安装且可被 OpenAI 兼容音频接口使用的本地模型
-- `POST /v1/audio/transcriptions` 接收标准 multipart 字段，例如 `file`、`model`、`language`、`prompt`、`response_format`、`timestamp_granularities[]`
-- `POST /v1/audio/speech` 接收 OpenAI 风格 JSON，包括 `model`、`input`、`voice`、`response_format`、`speed`
-- 两个 `/v1/audio/*` 接口里的 `model` 都是可选的；如果不传，会回退到当前已选择的 speech profile 模型
-
-当前兼容限制：
-
-- `/v1/audio/transcriptions` 支持 `response_format=json|text|verbose_json`
-- `/v1/audio/transcriptions` 暂不支持 `stream=true`
-- `/v1/audio/transcriptions` 目前只支持 `timestamp_granularities[]=segment`，不支持 `word`
-- `/v1/audio/speech` 目前只支持 `response_format=wav`
-- `/v1/audio/speech` 暂不支持 `instructions`
-
-## 实时语音接口
-
-实时语音接口和 `/v1/audio/*` 分开提供，因为它面向后续通话模式，而不是批量推理兼容层。
-
-- `GET /speech/realtime` 返回 websocket descriptor、音频要求、默认 profile 绑定、命令名和事件名
-- `GET /speech/realtime/ws` 升级为 websocket 会话
-- Websocket 鉴权和其他受保护接口一致：
-  `Authorization: Bearer <token>` 和 `x-omni-code-client-id: <client_id>`
-
-### 实时协议约束
-
-- 客户端通过 websocket binary frame 发送原始 `pcm_s16le`
-- 采样率固定为 `16000`
-- 声道支持 `1` 或 `2`；服务端会把双声道下混为单声道
-- `session.update` 可覆盖 `asr_model`、`vad_model`、`channels`、`sample_rate_hz`、`enable_vad`
-- `input_audio_buffer.commit` 用于提交并冲刷当前话语
-- `input_audio_buffer.clear` 用于清空当前话语状态
-
-### 服务端事件
-
-- `session.created`
-- `session.updated`
-- `input_audio_buffer.committed`
-- `input_audio_buffer.cleared`
-- `input_audio_buffer.speech_started`
-- `input_audio_buffer.speech_stopped`
-- `response.audio_transcript.delta`
-- `response.audio_transcript.completed`
-- `error`
-
-### 客户端模型过滤
-
-- 先调用 `GET /speech/models`
-- 保留 `installed == true` 的模型
-- 实时 ASR 用 `capabilities.realtime_asr == true` 过滤
-- VAD 用 `capabilities.vad == true` 过滤
-
-`session.update` 示例：
-
-```json
-{
-  "type": "session.update",
-  "session": {
-    "asr_model": "funasr-streaming-paraformer-zh-yue-en",
-    "vad_model": "silero-vad",
-    "sample_rate_hz": 16000,
-    "channels": 1,
-    "enable_vad": true
-  }
-}
-```
-
 ## 客户端授权
 
 客户端通过 CLI 申请并审批授权：
@@ -496,48 +383,6 @@ omni-code-bridge session-trace --session "<会话 id 或标题>" --limit 10
 ```
 
 `--session` 支持会话 id、标题精确匹配，或标题模糊匹配。`--limit` 可选，默认是 `5`。
-
-### 语音烟测脚本
-
-仓库里现在提供了一套本地端到端语音烟测脚本：
-
-```bash
-scripts/speech-smoke.sh --keep-artifacts
-```
-
-这套脚本会：
-
-- 检查 `GET /health`
-- 在没有提供 `BRIDGE_CLIENT_ID` 和 `BRIDGE_TOKEN` 时，自动申请并批准本机 client auth
-- 通过 `/speech/models/downloads` 下载缺失的 ASR/TTS 模型
-- 绑定 `asr.batch` 和 `tts.default`
-- 通过 `/v1/audio/speech` 合成一段 wav
-- 再通过 `/v1/audio/transcriptions` 用 profile 回退和显式模型两种方式转写这段 wav
-
-常用选项：
-
-| 选项 | 说明 |
-| --- | --- |
-| `--with-call-models` | 额外安装并绑定 `asr.realtime` 和 `vad.default` |
-| `--with-realtime` | 额外执行 websocket realtime ASR 烟测 example |
-| `--skip-download` | 如果模型未安装则直接失败 |
-| `--output-dir DIR` | 把生成的产物固定写到指定目录 |
-| `--no-auto-auth` | 强制要求先提供现成的 `BRIDGE_CLIENT_ID` 和 `BRIDGE_TOKEN` |
-
-脚本依赖 `curl` 和 `jq`。
-
-另外还提供了一个 realtime websocket 烟测 example：
-
-```bash
-cargo run --example speech_realtime_smoke -- \
-  --bridge-url http://127.0.0.1:8787 \
-  --client-id "$BRIDGE_CLIENT_ID" \
-  --token "$BRIDGE_TOKEN" \
-  --wav /tmp/omni-code-bridge-speech-smoke-12345/tts.wav
-```
-
-这个 example 会读取本地 wav，重采样到 `16 kHz`，流式发送到
-`/speech/realtime/ws`，并打印收到的 realtime 事件和最终转写结果。
 
 ### ACP Smoke Test
 

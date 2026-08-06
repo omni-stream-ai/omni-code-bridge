@@ -2200,9 +2200,6 @@ data: {\"type\":\"done\"}\n\n",
                     headers: Vec::<HeaderKeyValue>::new(),
                     env: Vec::<HeaderKeyValue>::new(),
                 }]),
-                speech_profiles: None,
-                speech_voices: None,
-                speaker_filter: None,
             })
             .await
             .expect("mock ACP settings should update");
@@ -2227,9 +2224,6 @@ data: {\"type\":\"done\"}\n\n",
                     headers: Vec::<HeaderKeyValue>::new(),
                     env: Vec::<HeaderKeyValue>::new(),
                 }]),
-                speech_profiles: None,
-                speech_voices: None,
-                speaker_filter: None,
             })
             .await
             .expect("mock generic HTTP ACP settings should update");

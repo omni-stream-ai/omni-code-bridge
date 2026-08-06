@@ -4,7 +4,6 @@ mod ai_approval;
 mod api;
 mod app_state;
 mod approval_policy;
-mod asr;
 mod bridge_settings;
 mod claude_hook;
 mod claude_store;
@@ -13,14 +12,9 @@ mod device_store;
 mod message_projection;
 mod models;
 mod push;
-mod realtime;
 mod secret_store;
 mod session_store;
 mod session_trace;
-mod speaker;
-mod speech;
-mod tts;
-mod vad;
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 

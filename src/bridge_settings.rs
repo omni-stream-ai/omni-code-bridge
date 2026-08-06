@@ -4,10 +4,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-use crate::models::{
-    AcpServerConfig, ModelProviderConfig, SpeakerFilterSettings, SpeechProfileSelection,
-    SpeechVoiceSelection,
-};
+use crate::models::{AcpServerConfig, ModelProviderConfig};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiApprovalSettings {
@@ -28,12 +25,6 @@ pub struct BridgeSettings {
     /// Experimental ACP agent server configurations (sorted by priority)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub acp_servers: Vec<AcpServerConfig>,
-    #[serde(default)]
-    pub speech_profiles: SpeechProfileSelection,
-    #[serde(default)]
-    pub speech_voices: SpeechVoiceSelection,
-    #[serde(default)]
-    pub speaker_filter: SpeakerFilterSettings,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -45,12 +36,6 @@ pub struct BridgeSettingsInput {
     /// ACP agent server configurations (replaces existing list when set)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acp_servers: Option<Vec<AcpServerConfig>>,
-    #[serde(default)]
-    pub speech_profiles: Option<SpeechProfileSelection>,
-    #[serde(default)]
-    pub speech_voices: Option<SpeechVoiceSelection>,
-    #[serde(default)]
-    pub speaker_filter: Option<SpeakerFilterSettings>,
 }
 
 pub struct BridgeSettingsStore {
@@ -81,9 +66,6 @@ impl Default for BridgeSettings {
             ai_approval: AiApprovalSettings::default(),
             model_providers: Vec::new(),
             acp_servers: Vec::new(),
-            speech_profiles: SpeechProfileSelection::default(),
-            speech_voices: SpeechVoiceSelection::default(),
-            speaker_filter: SpeakerFilterSettings::default(),
         }
     }
 }
@@ -113,8 +95,10 @@ impl BridgeSettingsStore {
     pub async fn load_from_path_strict(path: PathBuf) -> Result<Self> {
         let settings = match tokio::fs::read_to_string(&path).await {
             Ok(body) => {
-                let settings = serde_json::from_str::<BridgeSettings>(&body)
-                    .with_context(|| format!("failed to parse bridge settings at {}", path.display()))?;
+                let settings =
+                    serde_json::from_str::<BridgeSettings>(&body).with_context(|| {
+                        format!("failed to parse bridge settings at {}", path.display())
+                    })?;
                 validate_bridge_settings(&settings).map_err(anyhow::Error::msg)?;
                 settings
             }
@@ -126,7 +110,7 @@ impl BridgeSettingsStore {
             Err(error) => {
                 return Err(error).with_context(|| {
                     format!("failed to read bridge settings: {}", path.display())
-                })
+                });
             }
         };
         Ok(Self {
@@ -371,9 +355,8 @@ fn env_bool(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        AiApprovalSettings, BridgeSettings, BridgeSettingsInput, BridgeSettingsStore,
-        ModelProviderConfig, default_home_dir, validate_acp_servers, validate_bridge_settings,
-        validate_model_providers,
+        AiApprovalSettings, BridgeSettings, BridgeSettingsStore, ModelProviderConfig,
+        default_home_dir, validate_acp_servers, validate_bridge_settings, validate_model_providers,
     };
     use std::{
         path::PathBuf,
@@ -396,24 +379,6 @@ mod tests {
         assert_eq!(default_home_dir(), expected);
     }
 
-    #[test]
-    fn settings_input_preserves_missing_speech_settings_as_none() {
-        let input: BridgeSettingsInput = serde_json::from_str(
-            r#"{
-                "ai_approval": {
-                    "enabled": true,
-                    "base_url": "https://example.test/v1",
-                    "model": "review-model",
-                    "max_risk": "medium"
-                }
-            }"#,
-        )
-        .unwrap();
-
-        assert!(input.speech_profiles.is_none());
-        assert!(input.speech_voices.is_none());
-    }
-
     #[tokio::test]
     async fn update_persists_mutated_settings() {
         let store = BridgeSettingsStore {
@@ -422,39 +387,18 @@ mod tests {
                 ai_approval: AiApprovalSettings::default(),
                 model_providers: Vec::new(),
                 acp_servers: Vec::new(),
-                speech_profiles: Default::default(),
-                speech_voices: Default::default(),
-                speaker_filter: Default::default(),
             }),
         };
 
         let updated = store
-            .update(|settings| {
-                settings.speech_profiles.tts_default = Some("kokoro-int8-multi-lang-v1_1".into());
-                settings
-                    .speech_voices
-                    .tts_by_model
-                    .insert("kokoro-int8-multi-lang-v1_1".into(), "48".into());
-            })
+            .update(|settings| settings.ai_approval.enabled = true)
             .await
             .unwrap();
 
-        assert_eq!(
-            updated.speech_profiles.tts_default.as_deref(),
-            Some("kokoro-int8-multi-lang-v1_1")
-        );
-        assert_eq!(
-            updated
-                .speech_voices
-                .tts_by_model
-                .get("kokoro-int8-multi-lang-v1_1")
-                .map(String::as_str),
-            Some("48")
-        );
+        assert!(updated.ai_approval.enabled);
 
         let body = tokio::fs::read_to_string(&store.path).await.unwrap();
-        assert!(body.contains("kokoro-int8-multi-lang-v1_1"));
-        assert!(body.contains("\"48\""));
+        assert!(body.contains("\"enabled\": true"));
         let _ = tokio::fs::remove_file(&store.path).await;
     }
 
@@ -494,7 +438,11 @@ mod tests {
             .await
             .err()
             .expect("invalid settings should be rejected");
-        assert!(error.to_string().contains("failed to parse bridge settings"));
+        assert!(
+            error
+                .to_string()
+                .contains("failed to parse bridge settings")
+        );
         let _ = tokio::fs::remove_file(&path).await;
     }
 
@@ -813,9 +761,6 @@ mod tests {
                     env: Vec::new(),
                 },
             ],
-            speech_profiles: Default::default(),
-            speech_voices: Default::default(),
-            speaker_filter: Default::default(),
         };
 
         assert!(validate_bridge_settings(&settings).is_ok());

@@ -66,15 +66,6 @@ Agent binary paths can be overridden with `ECHO_MATE_CODEX_BIN` and `ECHO_MATE_O
 | `GET /sessions/{id}/messages` | List session messages; supports `limit`, `before_id`, `after_id` |
 | `GET /app-update/manifest` | APK update manifest |
 | `GET /app-update/apk` | Download latest APK |
-| `GET /speech`, `GET /speech/models` | Local speech model management |
-| `POST /speech/models/downloads` | Download a speech model |
-| `GET /speech/models/downloads/{task_id}` | Poll download status |
-| `GET/PUT /speech/profiles/{profile}/model` | Bind model to profile |
-| `GET /speech/realtime` | Realtime speech descriptor |
-| `GET /speech/realtime/ws` | Websocket realtime/call-mode speech |
-| `GET /v1/models` | OpenAI-compatible model list |
-| `POST /v1/audio/transcriptions` | OpenAI-compatible ASR |
-| `POST /v1/audio/speech` | OpenAI-compatible TTS |
 
 `GET /sessions/{id}/messages` returns messages in stored order. Without a cursor it returns the
 latest page (`limit` defaults to `50` and is clamped to `1..=200`), so an in-progress assistant
@@ -301,112 +292,6 @@ Codex receives this as `model_reasoning_effort`, Claude Code receives it as `--e
 OpenCode currently ignores the field because the headless prompt API used by the bridge does not
 expose a matching option.
 
-## Local Speech API
-
-The bridge can run local ASR and TTS through `sherpa-onnx` and exposes two API layers:
-
-- Model management endpoints under `/speech/*` for the client to list, download, inspect, and select local speech models
-- OpenAI-compatible inference endpoints under `/v1/*` so the client can reuse standard audio request flows
-
-Current bundled model catalog includes:
-
-- Batch ASR: `sensevoice-small-int8`
-- Realtime/call-mode ASR candidates: `streaming-paraformer-zh-en`, `funasr-streaming-paraformer-zh-yue-en`
-- TTS: `vits-melo-tts-zh-en`, `kokoro-int8-multi-lang-v1_1`
-- VAD: `silero-vad`
-
-`GET /speech/models` returns installation state plus metadata the client can use for filtering, including:
-
-- `kind`, `runtime`, `backend`
-- `capabilities` such as `streaming`, `batch_asr`, `realtime_asr`, `speech_synthesis`, `vad`
-- `features`, `languages`, `download_size_mb`, `memory_hint`, `notes`
-- `sample_rate_hz`, `default_voice`, `voices` for client-side TTS settings
-  Local TTS voice selection currently uses numeric speaker IDs. `vits-melo-tts-zh-en` exposes a
-  single voice (`0`), while `kokoro-int8-multi-lang-v1_1` exposes multiple speakers.
-- `supports_profiles`, `recommended_profiles`, `selected_by`
-
-### Setup Flow
-
-1. Call `GET /speech/models`
-2. Pick a compatible model and start download with `POST /speech/models/downloads`
-3. Poll `GET /speech/models/downloads/{task_id}` until `completed`
-4. Bind the installed model to a profile with `PUT /speech/profiles/{profile}/model`
-5. Call `/v1/audio/transcriptions` or `/v1/audio/speech`
-
-Speech profile bindings are persisted in `~/.omni-code/settings.json` by default. Set
-`ECHO_MATE_SETTINGS_PATH` to override the settings file location.
-TTS voice selections are stored per model through `GET/PUT /speech/models/{model_id}/voice`, so
-switching between single-speaker and multi-speaker TTS models does not reuse an incompatible voice.
-
-### OpenAI-Compatible Speech Behavior
-
-- `GET /v1/models` returns installed local speech models that are usable by OpenAI-compatible audio endpoints
-- `POST /v1/audio/transcriptions` accepts standard multipart form fields such as `file`, `model`, `language`, `prompt`, `response_format`, and `timestamp_granularities[]`
-- `POST /v1/audio/speech` accepts OpenAI-style JSON with `model`, `input`, `voice`, `response_format`, and `speed`
-- `model` is optional on both `/v1/audio/*` endpoints. If omitted, the bridge falls back to the selected speech profile model
-
-Current compatibility limits:
-
-- `/v1/audio/transcriptions` supports `response_format=json|text|verbose_json`
-- `/v1/audio/transcriptions` rejects `stream=true`
-- `/v1/audio/transcriptions` only supports `timestamp_granularities[]=segment`; `word` is not supported yet
-- `/v1/audio/speech` currently supports `response_format=wav` only
-- `/v1/audio/speech` does not support `instructions` yet
-
-## Realtime Speech API
-
-Realtime speech is exposed separately from `/v1/audio/*` because it is aimed at
-future call mode rather than batch inference compatibility.
-
-- `GET /speech/realtime` returns the websocket descriptor, audio requirements,
-  default profile bindings, command names, and event names
-- `GET /speech/realtime/ws` upgrades to a websocket session
-- Websocket auth is the same as the rest of the protected API:
-  `Authorization: Bearer <token>` and `x-omni-code-client-id: <client_id>`
-
-### Realtime Contract
-
-- Client sends binary websocket frames as raw `pcm_s16le`
-- Sample rate is fixed at `16000`
-- Channels can be `1` or `2`; stereo is downmixed to mono on the server
-- `session.update` can override `asr_model`, `vad_model`, `channels`, `sample_rate_hz`, and `enable_vad`
-- `input_audio_buffer.commit` flushes the current utterance
-- `input_audio_buffer.clear` resets the current utterance state
-
-### Server Events
-
-- `session.created`
-- `session.updated`
-- `input_audio_buffer.committed`
-- `input_audio_buffer.cleared`
-- `input_audio_buffer.speech_started`
-- `input_audio_buffer.speech_stopped`
-- `response.audio_transcript.delta`
-- `response.audio_transcript.completed`
-- `error`
-
-### Client-Side Filtering
-
-- Use `GET /speech/models`
-- Keep models where `installed == true`
-- For realtime ASR, filter on `capabilities.realtime_asr == true`
-- For VAD, filter on `capabilities.vad == true`
-
-Example `session.update`:
-
-```json
-{
-  "type": "session.update",
-  "session": {
-    "asr_model": "funasr-streaming-paraformer-zh-yue-en",
-    "vad_model": "silero-vad",
-    "sample_rate_hz": 16000,
-    "channels": 1,
-    "enable_vad": true
-  }
-}
-```
-
 ## Client Authorization
 
 Clients register and get approved via CLI:
@@ -503,49 +388,6 @@ omni-code-bridge session-trace --session "<session-id-or-title>" --limit 10
 
 `--session` accepts a session id, an exact title, or a partial title. `--limit` is optional and
 defaults to `5`.
-
-### Speech Smoke Test
-
-For local validation there is an end-to-end smoke test script:
-
-```bash
-scripts/speech-smoke.sh --keep-artifacts
-```
-
-What it does:
-
-- Checks `GET /health`
-- Auto-provisions a local client auth token when `BRIDGE_CLIENT_ID` and `BRIDGE_TOKEN` are not set
-- Downloads missing ASR/TTS models through `/speech/models/downloads`
-- Binds `asr.batch` and `tts.default`
-- Synthesizes a wav file through `/v1/audio/speech`
-- Transcribes that wav through `/v1/audio/transcriptions` using both profile fallback and explicit model selection
-
-Useful options:
-
-| Option | Description |
-| --- | --- |
-| `--with-call-models` | Also install and bind `asr.realtime` and `vad.default` |
-| `--with-realtime` | Also run the websocket realtime ASR smoke example |
-| `--skip-download` | Fail if required models are missing |
-| `--output-dir DIR` | Store generated artifacts in a fixed directory |
-| `--no-auto-auth` | Require an existing `BRIDGE_CLIENT_ID` and `BRIDGE_TOKEN` |
-
-The script requires `curl` and `jq`.
-
-There is also a realtime websocket smoke example:
-
-```bash
-cargo run --example speech_realtime_smoke -- \
-  --bridge-url http://127.0.0.1:8787 \
-  --client-id "$BRIDGE_CLIENT_ID" \
-  --token "$BRIDGE_TOKEN" \
-  --wav /tmp/omni-code-bridge-speech-smoke-12345/tts.wav
-```
-
-The example expects a local wav file, resamples it to `16 kHz`, streams it to
-`/speech/realtime/ws`, and prints the observed realtime events and completed
-transcript.
 
 ### ACP Smoke Test
 

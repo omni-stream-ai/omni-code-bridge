@@ -29,13 +29,11 @@ use crate::{
         GitStatusDetail, InputMode, MessageRole, MessageSnapshotEvent, ModelProviderConfig,
         ProjectGitStatus, ProjectSummary, PushDeviceRegistration, RegisterPushDeviceInput,
         ResolvedProviderConfig, SendMessageInput, SessionDetail, SessionEvent, SessionStatus,
-        SessionStatusEvent, SessionSummary, SpeakerFilterSettings, TriggerClientMessageInput,
-        TriggerClientMessageResult,
+        SessionStatusEvent, SessionSummary, TriggerClientMessageInput, TriggerClientMessageResult,
     },
     push::PushService,
     secret_store::SecretStore,
     session_store::project_id_for_path,
-    speech::SpeechService,
 };
 
 #[derive(Default)]
@@ -147,18 +145,6 @@ struct AggregatedListCache {
     sessions_by_id: HashMap<String, SessionSummary>,
 }
 
-#[derive(Debug, Clone)]
-pub struct TtsStreamSession {
-    pub token: String,
-    pub model_id: String,
-    pub input: String,
-    pub voice: Option<String>,
-    pub speed: Option<f32>,
-    pub response_format: Option<String>,
-    pub content_type: String,
-    pub expires_at: Instant,
-}
-
 pub struct AppState {
     projects: RwLock<HashMap<String, ProjectSummary>>,
     sessions: RwLock<HashMap<String, SessionSummary>>,
@@ -172,11 +158,9 @@ pub struct AppState {
     event_stream: StdMutex<EventStreamState>,
     providers: ProviderRegistry,
     settings: BridgeSettingsStore,
-    speech: Arc<SpeechService>,
     client_auth: ClientAuthStore,
     secret_store: SecretStore,
     push: PushService,
-    tts_stream_sessions: Mutex<HashMap<String, TtsStreamSession>>,
     runtime_store_path: PathBuf,
     session_metadata_store_path: PathBuf,
 }
@@ -276,11 +260,9 @@ impl AppState {
             }),
             providers: ProviderRegistry::new(),
             settings: BridgeSettingsStore::load_from_path(settings_path).await,
-            speech: Arc::new(SpeechService::load().await),
             client_auth: ClientAuthStore::load().await,
             secret_store: SecretStore::load().await,
             push: PushService::new(),
-            tts_stream_sessions: Mutex::new(HashMap::new()),
             runtime_store_path,
             session_metadata_store_path,
         }
@@ -332,11 +314,9 @@ impl AppState {
             }),
             providers,
             settings: BridgeSettingsStore::load_from_path(settings_path).await,
-            speech: Arc::new(SpeechService::load().await),
             client_auth: ClientAuthStore::load().await,
             secret_store: SecretStore::load().await,
             push: PushService::new(),
-            tts_stream_sessions: Mutex::new(HashMap::new()),
             runtime_store_path,
             session_metadata_store_path,
         }
@@ -386,49 +366,12 @@ impl AppState {
             }),
             providers: ProviderRegistry::new(),
             settings: BridgeSettingsStore::load_from_path_strict(settings_path).await?,
-            speech: Arc::new(SpeechService::load().await),
             client_auth: ClientAuthStore::load().await,
             secret_store: SecretStore::load().await,
             push: PushService::new(),
-            tts_stream_sessions: Mutex::new(HashMap::new()),
             runtime_store_path,
             session_metadata_store_path,
         })
-    }
-
-    pub async fn create_tts_stream_session(
-        &self,
-        model_id: String,
-        input: String,
-        voice: Option<String>,
-        speed: Option<f32>,
-        response_format: Option<String>,
-        content_type: String,
-    ) -> TtsStreamSession {
-        const TTS_STREAM_TTL: Duration = Duration::from_secs(120);
-        let mut sessions = self.tts_stream_sessions.lock().await;
-        let now = Instant::now();
-        sessions.retain(|_, session| session.expires_at > now);
-        let token = Uuid::new_v4().to_string().replace('-', "");
-        let session = TtsStreamSession {
-            token: token.clone(),
-            model_id,
-            input,
-            voice,
-            speed,
-            response_format,
-            content_type,
-            expires_at: now + TTS_STREAM_TTL,
-        };
-        sessions.insert(token, session.clone());
-        session
-    }
-
-    pub async fn get_tts_stream_session(&self, token: &str) -> Option<TtsStreamSession> {
-        let mut sessions = self.tts_stream_sessions.lock().await;
-        let now = Instant::now();
-        sessions.retain(|_, session| session.expires_at > now);
-        sessions.get(token).cloned()
     }
 
     pub async fn is_runtime_client_id_allowed(&self, client_id: &str) -> bool {
@@ -511,35 +454,9 @@ impl AppState {
                 if let Some(acp_servers) = input.acp_servers {
                     settings.acp_servers = acp_servers;
                 }
-                if let Some(speech_profiles) = input.speech_profiles {
-                    settings.speech_profiles = speech_profiles;
-                }
-                if let Some(speech_voices) = input.speech_voices {
-                    settings.speech_voices = speech_voices;
-                }
-                if let Some(speaker_filter) = input.speaker_filter {
-                    settings.speaker_filter =
-                        crate::speaker::normalize_speaker_filter(speaker_filter);
-                }
             })
             .await
             .map_err(|error| error.to_string())
-    }
-
-    pub async fn update_speaker_filter_settings(
-        &self,
-        input: SpeakerFilterSettings,
-    ) -> Result<BridgeSettings, String> {
-        self.settings
-            .update(|settings| {
-                settings.speaker_filter = crate::speaker::normalize_speaker_filter(input);
-            })
-            .await
-            .map_err(|error| error.to_string())
-    }
-
-    pub fn speech(&self) -> Arc<SpeechService> {
-        Arc::clone(&self.speech)
     }
 
     pub fn settings_store(&self) -> &BridgeSettingsStore {
@@ -3029,33 +2946,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tts_stream_session_can_be_read_multiple_times_until_ttl() {
-        let state = test_state("tts-stream-session").await;
-        let session = state
-            .create_tts_stream_session(
-                "model".to_string(),
-                "hello".to_string(),
-                Some("48".to_string()),
-                None,
-                None,
-                "audio/wav".to_string(),
-            )
-            .await;
-
-        let first = state.get_tts_stream_session(&session.token).await;
-        let second = state.get_tts_stream_session(&session.token).await;
-
-        assert_eq!(
-            first.as_ref().map(|value| value.token.as_str()),
-            Some(session.token.as_str())
-        );
-        assert_eq!(
-            second.as_ref().map(|value| value.token.as_str()),
-            Some(session.token.as_str())
-        );
-    }
-
-    #[tokio::test]
     async fn list_messages_refreshes_provider_messages_even_with_cached_session_messages() {
         let now = Utc::now();
         let provider = Arc::new(TestMessageProvider::new(HashMap::new()));
@@ -3850,9 +3740,6 @@ mod tests {
                     priority: 0,
                 }]),
                 acp_servers: None,
-                speech_profiles: None,
-                speech_voices: None,
-                speaker_filter: None,
             })
             .await
             .expect("settings update should succeed");
@@ -4591,9 +4478,6 @@ mod tests {
                     },
                 ]),
                 acp_servers: None,
-                speech_profiles: None,
-                speech_voices: None,
-                speaker_filter: None,
             })
             .await
             .expect("settings update should succeed");
@@ -4650,9 +4534,6 @@ mod tests {
                     },
                 ]),
                 acp_servers: None,
-                speech_profiles: None,
-                speech_voices: None,
-                speaker_filter: None,
             })
             .await
             .expect("settings update should succeed");
