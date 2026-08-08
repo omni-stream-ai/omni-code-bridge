@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
@@ -11,6 +12,7 @@ use crate::{
 
 const DEFAULT_MODEL: &str = "gpt-4.1-mini";
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
+const AI_APPROVAL_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -28,11 +30,31 @@ pub enum AiApprovalRisk {
     High,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AiApprovalReasonKind {
+    #[default]
+    AiReview,
+    RiskThreshold,
+    HardBlock,
+}
+
+impl AiApprovalReasonKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AiReview => "ai_review",
+            Self::RiskThreshold => "risk_threshold",
+            Self::HardBlock => "hard_block",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct AiApprovalDecision {
     pub decision: AiApprovalDecisionKind,
     pub risk: AiApprovalRisk,
     pub reason: String,
+    #[serde(skip, default)]
+    pub reason_kind: AiApprovalReasonKind,
 }
 
 #[derive(Debug, Clone)]
@@ -42,6 +64,8 @@ struct AiApprovalConfig {
     api_key: String,
     model: String,
     max_auto_risk: AiApprovalRisk,
+    prompt: String,
+    project_prompt: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -80,9 +104,9 @@ struct ChatCompletionMessage {
 }
 
 pub fn is_enabled() -> bool {
-    AiApprovalConfig::from_settings_or_env()
-        .map(|config| config.enabled)
-        .unwrap_or(false)
+    load_file_settings()
+        .map(|settings| settings.ai_approval.enabled)
+        .unwrap_or_else(|| env_bool("OMNI_CODE_AI_APPROVAL"))
 }
 
 pub async fn review_request(
@@ -100,15 +124,16 @@ pub async fn review_request(
     if !is_enabled() {
         return Ok(None);
     }
-    if has_hard_block(command, project_root) {
+    if is_hard_blocked(command, project_root) {
         return Ok(Some(AiApprovalDecision {
             decision: AiApprovalDecisionKind::AskUser,
             risk: AiApprovalRisk::High,
             reason: "Command matched a hard safety block".to_string(),
+            reason_kind: AiApprovalReasonKind::HardBlock,
         }));
     }
 
-    let config = AiApprovalConfig::from_settings_or_env()?;
+    let config = AiApprovalConfig::from_settings_or_env(project_root)?;
     if !config.enabled {
         return Ok(None);
     }
@@ -117,52 +142,62 @@ pub async fn review_request(
         return Ok(Some(AiApprovalDecision {
             decision: AiApprovalDecisionKind::AskUser,
             risk: decision.risk,
-            reason: format!(
-                "AI rated risk above auto-approval threshold: {}",
-                decision.reason
-            ),
+            reason: decision.reason,
+            reason_kind: AiApprovalReasonKind::RiskThreshold,
         }));
     }
     Ok(Some(decision))
 }
 
 impl AiApprovalConfig {
-    fn from_settings_or_env() -> Result<Self> {
+    fn from_settings_or_env(project_root: &Path) -> Result<Self> {
         if let Some(settings) = load_file_settings() {
-            return Self::from_ai_settings(settings.ai_approval);
+            let project = settings
+                .project_ai_approval
+                .get(&project_root.to_string_lossy().to_string())
+                .cloned()
+                .unwrap_or_default();
+            return Self::from_ai_settings(settings.ai_approval, project);
         }
         Self::from_env()
     }
 
     fn from_env() -> Result<Self> {
-        let api_key = std::env::var("ECHO_MATE_AI_APPROVAL_API_KEY")
+        let api_key = std::env::var("OMNI_CODE_AI_APPROVAL_API_KEY")
             .or_else(|_| std::env::var("OPENAI_API_KEY"))
             .context(
-                "ECHO_MATE_AI_APPROVAL_API_KEY or OPENAI_API_KEY is required for AI approval",
+                "OMNI_CODE_AI_APPROVAL_API_KEY or OPENAI_API_KEY is required for AI approval",
             )?;
-        let base_url = std::env::var("ECHO_MATE_AI_APPROVAL_BASE_URL")
+        let base_url = std::env::var("OMNI_CODE_AI_APPROVAL_BASE_URL")
             .unwrap_or_else(|_| DEFAULT_BASE_URL.to_string())
             .trim_end_matches('/')
             .to_string();
-        let model = std::env::var("ECHO_MATE_AI_APPROVAL_MODEL")
+        let model = std::env::var("OMNI_CODE_AI_APPROVAL_MODEL")
             .unwrap_or_else(|_| DEFAULT_MODEL.to_string());
-        let max_auto_risk = parse_risk_env("ECHO_MATE_AI_APPROVAL_MAX_RISK", AiApprovalRisk::Low)?;
+        let max_auto_risk = parse_risk_env("OMNI_CODE_AI_APPROVAL_MAX_RISK", AiApprovalRisk::Low)?;
         Ok(Self {
-            enabled: env_bool("ECHO_MATE_AI_APPROVAL"),
+            enabled: env_bool("OMNI_CODE_AI_APPROVAL"),
             base_url,
             api_key,
             model,
             max_auto_risk,
+            prompt: String::new(),
+            project_prompt: String::new(),
         })
     }
 
-    fn from_ai_settings(settings: AiApprovalSettings) -> Result<Self> {
+    fn from_ai_settings(
+        settings: AiApprovalSettings,
+        project: crate::bridge_settings::ProjectAiApprovalSettings,
+    ) -> Result<Self> {
         Ok(Self {
             enabled: settings.enabled,
             base_url: settings.base_url.trim().trim_end_matches('/').to_string(),
             api_key: settings.api_key.trim().to_string(),
             model: settings.model.trim().to_string(),
             max_auto_risk: parse_risk_value(&settings.max_risk)?,
+            prompt: settings.prompt,
+            project_prompt: project.prompt,
         })
     }
 }
@@ -211,13 +246,17 @@ async fn call_openai_compatible(
     command: &str,
     project_root: &Path,
 ) -> Result<AiApprovalDecision> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(AI_APPROVAL_TIMEOUT)
+        .build()
+        .context("failed to build AI approval HTTP client")?;
     let body = ChatCompletionRequest {
         model: &config.model,
         messages: vec![
             ChatMessageRequest {
                 role: "system",
-                content: system_prompt(),
+                content: system_prompt(config),
             },
             ChatMessageRequest {
                 role: "user",
@@ -264,14 +303,20 @@ fn normalize_decision(mut decision: AiApprovalDecision) -> AiApprovalDecision {
     if decision.reason.trim().is_empty() {
         decision.reason = "No reason provided".to_string();
     }
-    if decision.decision == AiApprovalDecisionKind::Accept && decision.risk != AiApprovalRisk::Low {
-        decision.decision = AiApprovalDecisionKind::AskUser;
-    }
     decision
 }
 
-fn system_prompt() -> String {
-    "You are a conservative command approval reviewer for a coding agent. Return only JSON with keys decision, risk, reason. decision must be one of accept, decline, ask_user. risk must be one of low, medium, high. Only accept low-risk commands that are clearly project-local, reversible, and routine for software development. Ask the user for anything ambiguous, destructive, credential-related, system-level, network-installing, or outside the project. Decline commands that are clearly malicious or destructive.".to_string()
+fn system_prompt(config: &AiApprovalConfig) -> String {
+    let mut prompt = "You are a conservative command approval reviewer for a coding agent. Return only JSON with keys decision, risk, reason. decision must be one of accept, decline, ask_user. risk must be one of low, medium, high. Accept only commands that are clearly project-local, reversible, and routine for software development, and assign their actual risk level. Ask the user for anything ambiguous, destructive, credential-related, system-level, network-installing, or outside the project. Decline commands that are clearly malicious or destructive. Hard safety rules cannot be overridden. Global instructions supplement these rules. Project instructions take precedence over conflicting global instructions, but cannot override hard safety rules. Write reason as a concise, natural, user-facing explanation with no labels or boilerplate. Use the same language as the request Reason when that language is detectable.".to_string();
+    if !config.prompt.trim().is_empty() {
+        prompt.push_str("\n\nGlobal approval instructions:\n");
+        prompt.push_str(config.prompt.trim());
+    }
+    if !config.project_prompt.trim().is_empty() {
+        prompt.push_str("\n\nProject approval instructions:\n");
+        prompt.push_str(config.project_prompt.trim());
+    }
+    prompt
 }
 
 fn user_prompt(request: &ApprovalRequest, command: &str, project_root: &Path) -> String {
@@ -291,7 +336,7 @@ fn user_prompt(request: &ApprovalRequest, command: &str, project_root: &Path) ->
     )
 }
 
-fn has_hard_block(command: &str, project_root: &Path) -> bool {
+pub fn is_hard_blocked(command: &str, project_root: &Path) -> bool {
     let lower = command.to_ascii_lowercase();
     if [
         "sudo",
@@ -390,6 +435,80 @@ fn mentions_absolute_path_outside_project(command: &str, project_root: &Path) ->
             return false;
         }
         let path = PathBuf::from(trimmed);
-        !path.starts_with(project_root)
+        let Some(normalized_root) = normalize_without_fs(project_root) else {
+            return true;
+        };
+        let Some(normalized_path) = normalize_without_fs(&path) else {
+            return true;
+        };
+        !normalized_path.starts_with(normalized_root)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn system_prompt_combines_global_and_project_instructions() {
+        let config = AiApprovalConfig {
+            enabled: true,
+            base_url: String::new(),
+            api_key: String::new(),
+            model: String::new(),
+            max_auto_risk: AiApprovalRisk::Low,
+            prompt: "Follow company policy".to_string(),
+            project_prompt: "Allow repository checks unless a hard safety block applies"
+                .to_string(),
+        };
+
+        let prompt = system_prompt(&config);
+        assert!(prompt.contains("Follow company policy"));
+        assert!(prompt.contains("Allow repository checks"));
+        assert!(prompt.contains("unless a hard safety block applies"));
+        assert!(prompt.contains("concise, natural, user-facing explanation"));
+        assert!(prompt.contains("same language as the request Reason"));
+        assert!(prompt.contains("Project instructions take precedence"));
+    }
+
+    #[test]
+    fn model_decision_defaults_to_ai_review_reason_kind() {
+        let decision: AiApprovalDecision = serde_json::from_value(serde_json::json!({
+            "decision": "ask_user",
+            "risk": "medium",
+            "reason": "这个操作会访问项目外部资源。"
+        }))
+        .unwrap();
+
+        assert_eq!(decision.reason_kind, AiApprovalReasonKind::AiReview);
+        assert_eq!(decision.reason, "这个操作会访问项目外部资源。");
+    }
+
+    #[test]
+    fn normalization_preserves_medium_and_high_accept_risk() {
+        let medium = normalize_decision(AiApprovalDecision {
+            decision: AiApprovalDecisionKind::Accept,
+            risk: AiApprovalRisk::Medium,
+            reason: "Routine but moderate risk".to_string(),
+            reason_kind: AiApprovalReasonKind::AiReview,
+        });
+        let high = normalize_decision(AiApprovalDecision {
+            decision: AiApprovalDecisionKind::Accept,
+            risk: AiApprovalRisk::High,
+            reason: "High risk".to_string(),
+            reason_kind: AiApprovalReasonKind::AiReview,
+        });
+
+        assert_eq!(medium.decision, AiApprovalDecisionKind::Accept);
+        assert_eq!(high.decision, AiApprovalDecisionKind::Accept);
+    }
+
+    #[test]
+    fn hard_blocks_detect_dangerous_commands_before_auto_approval() {
+        let root = Path::new("/workspace/project");
+
+        assert!(is_hard_blocked("sudo rm -rf /tmp", root));
+        assert!(is_hard_blocked("cat /etc/passwd", root));
+        assert!(!is_hard_blocked("cat ./README.md", root));
+    }
 }

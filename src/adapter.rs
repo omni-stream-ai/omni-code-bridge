@@ -34,6 +34,7 @@ use crate::{
         claude_state_dir, ensure_runtime_dirs, request_path, response_from_choice, response_path,
     },
     claude_store::{load_claude_archive_summary, load_claude_messages},
+    debug_log,
     models::{
         AcpAgentDiagnostic, AcpHandshakeProbe, AcpProfile, AgentKind, ApprovalChoice, ApprovalKind,
         ApprovalRequest, ChatMessage, ProjectSummary, ReasoningEffort, ResolvedProviderConfig,
@@ -45,6 +46,7 @@ use crate::{
 const CODEX_IDLE_TICK_SECONDS: u64 = 15;
 const CODEX_COMMAND_SOFT_RECOVERY_IDLE_TICKS: u32 = 8;
 const CODEX_COMMAND_STALLED_IDLE_TICKS: u32 = 20;
+const CODEX_BACKGROUND_TASK_MAX_SECONDS: u64 = 30 * 60;
 const ACP_JSON_RPC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const ACP_READINESS_TIMEOUT: Duration = Duration::from_secs(5);
 const AGENT_READINESS_CACHE_TTL: Duration = Duration::from_secs(5);
@@ -632,6 +634,37 @@ mod tests {
     }
 
     #[test]
+    fn codex_streaming_state_tracks_goal_until_terminal_status() {
+        let mut state = CodexAppServerStreamingState::default();
+
+        let active = state.ingest_value(&serde_json::json!({
+            "method": "thread/goal/updated",
+            "params": {
+                "threadId": "thread-1",
+                "goal": {
+                    "objective": "finish the task",
+                    "status": "active"
+                }
+            }
+        }));
+        assert!(matches!(active, CodexAppServerEvent::Status(_)));
+        assert!(!state.goal_is_terminal());
+
+        let complete = state.ingest_value(&serde_json::json!({
+            "method": "thread/goal/updated",
+            "params": {
+                "threadId": "thread-1",
+                "goal": {
+                    "objective": "finish the task",
+                    "status": "complete"
+                }
+            }
+        }));
+        assert!(matches!(complete, CodexAppServerEvent::Status(_)));
+        assert!(state.goal_is_terminal());
+    }
+
+    #[test]
     fn codex_streaming_state_renders_multiple_partial_blocks_in_order() {
         let mut state = CodexAppServerStreamingState::default();
 
@@ -788,6 +821,19 @@ mod tests {
         }
 
         match state.ingest_value(&serde_json::json!({
+            "method": "process/outputDelta",
+            "params": {
+                "processHandle": "proc-1",
+                "stream": "stdout",
+                "deltaBase64": "b2sK"
+            }
+        })) {
+            CodexAppServerEvent::Status(status) => assert_eq!(status, "[process]:stdout ok"),
+            _ => panic!("expected process output status"),
+        }
+        assert!(state.has_background_processes());
+
+        match state.ingest_value(&serde_json::json!({
             "method": "process/exited",
             "params": {
                 "processHandle": "proc-1",
@@ -803,6 +849,7 @@ mod tests {
             }
             _ => panic!("expected process exit status"),
         }
+        assert!(!state.has_background_processes());
 
         match state.ingest_value(&serde_json::json!({
             "method": "warning",
@@ -870,6 +917,7 @@ mod tests {
                     "id": "cmd-1",
                     "type": "commandExecution",
                     "command": "flutter test",
+                    "processId": "pty-42",
                     "status": "inProgress"
                 }
             }
@@ -881,8 +929,8 @@ mod tests {
             state
                 .running_command
                 .as_ref()
-                .map(|item| item.command.as_str()),
-            Some("flutter test")
+                .map(|item| (item.command.as_str(), item.process_id.as_deref())),
+            Some(("flutter test", Some("pty-42")))
         );
 
         for _ in 1..CODEX_COMMAND_SOFT_RECOVERY_IDLE_TICKS {
@@ -909,11 +957,24 @@ mod tests {
         }
 
         match state.mark_idle_waiting(false) {
-            Some(CommandWatchdogAction::Stalled { command }) => {
+            Some(CommandWatchdogAction::Probe { item_id, command }) => {
+                assert_eq!(item_id, "cmd-1");
                 assert_eq!(command, "flutter test");
             }
-            _ => panic!("expected stalled command"),
+            _ => panic!("expected command status probe"),
         }
+        assert_eq!(
+            state.current_status(),
+            Some("[command:stalled] flutter test (no completion event yet; continuing to wait)")
+        );
+        assert_eq!(
+            state
+                .running_command
+                .as_ref()
+                .map(|command| (command.idle_ticks, command.recovery_requested)),
+            Some((0, false))
+        );
+        assert!(state.mark_idle_waiting(false).is_none());
     }
 
     #[test]
@@ -946,6 +1007,59 @@ mod tests {
             }
         }));
         assert!(state.running_command.is_none());
+    }
+
+    #[test]
+    fn codex_command_status_snapshot_reads_live_command_and_latest_turn() {
+        let response = serde_json::json!({
+            "thread": {
+                "turns": [{
+                    "id": "turn-1",
+                    "status": "inProgress",
+                    "items": [{
+                        "id": "cmd-1",
+                        "type": "commandExecution",
+                        "command": "curl https://example.test",
+                        "processId": "pty-42",
+                        "status": "inProgress"
+                    }]
+                }]
+            }
+        });
+
+        assert_eq!(
+            command_status_snapshot(&response, "cmd-1"),
+            CommandStatusSnapshot {
+                command_status: Some("inProgress".to_string()),
+                process_id: Some("pty-42".to_string()),
+                turn_status: Some("inProgress".to_string()),
+                turn_error: None,
+            }
+        );
+    }
+
+    #[test]
+    fn codex_command_status_snapshot_recovers_missed_terminal_event() {
+        let response = serde_json::json!({
+            "thread": {
+                "turns": [{
+                    "id": "turn-1",
+                    "status": "completed",
+                    "items": [{
+                        "id": "cmd-1",
+                        "type": "commandExecution",
+                        "command": "cargo test",
+                        "processId": null,
+                        "status": "completed",
+                        "exitCode": 0
+                    }]
+                }]
+            }
+        });
+
+        let snapshot = command_status_snapshot(&response, "cmd-1");
+        assert_eq!(snapshot.command_status.as_deref(), Some("completed"));
+        assert_eq!(snapshot.turn_status.as_deref(), Some("completed"));
     }
 
     #[test]
@@ -1159,21 +1273,39 @@ mod tests {
     }
 
     #[test]
-    fn codex_thread_action_resumes_when_provider_matches_even_if_model_changes() {
+    fn codex_thread_action_migrates_when_model_changes() {
         assert_eq!(
-            decide_codex_thread_action(Some("thread-1"), Some("provider-a"), Some("provider-a")),
-            CodexThreadDecision::Resume
+            decide_codex_thread_action(
+                Some("thread-1"),
+                Some("provider-a"),
+                Some("provider-a"),
+                Some("model-a"),
+                Some("model-b"),
+            ),
+            CodexThreadDecision::StartWithMigration
         );
     }
 
     #[test]
     fn codex_thread_action_migrates_when_provider_changes() {
         assert_eq!(
-            decide_codex_thread_action(Some("thread-1"), Some("provider-a"), Some("provider-b")),
+            decide_codex_thread_action(
+                Some("thread-1"),
+                Some("provider-a"),
+                Some("provider-b"),
+                Some("model-a"),
+                Some("model-a"),
+            ),
             CodexThreadDecision::StartWithMigration
         );
         assert_eq!(
-            decide_codex_thread_action(None, Some("provider-a"), Some("provider-a")),
+            decide_codex_thread_action(
+                None,
+                Some("provider-a"),
+                Some("provider-a"),
+                Some("model-a"),
+                Some("model-a"),
+            ),
             CodexThreadDecision::StartFresh
         );
     }
@@ -1181,13 +1313,38 @@ mod tests {
     #[test]
     fn codex_thread_action_resumes_when_provider_metadata_is_missing() {
         assert_eq!(
-            decide_codex_thread_action(Some("thread-1"), None, Some("provider-a")),
+            decide_codex_thread_action(
+                Some("thread-1"),
+                None,
+                Some("provider-a"),
+                Some("model-a"),
+                Some("model-a"),
+            ),
             CodexThreadDecision::Resume
         );
         assert_eq!(
-            decide_codex_thread_action(Some("thread-1"), Some("provider-a"), None),
+            decide_codex_thread_action(
+                Some("thread-1"),
+                Some("provider-a"),
+                None,
+                Some("model-a"),
+                Some("model-a"),
+            ),
             CodexThreadDecision::Resume
         );
+    }
+
+    #[test]
+    fn codex_stream_retry_is_limited_to_empty_transient_failures() {
+        let transient =
+            anyhow::anyhow!("stream disconnected before completion: Upstream request failed");
+        let permanent = anyhow::anyhow!("codex exited with status 1: invalid request");
+
+        assert!(should_retry_codex_stream(&transient, true, 0));
+        assert!(should_retry_codex_stream(&transient, true, 1));
+        assert!(!should_retry_codex_stream(&transient, true, 2));
+        assert!(!should_retry_codex_stream(&transient, false, 0));
+        assert!(!should_retry_codex_stream(&permanent, true, 0));
     }
 
     #[test]
@@ -1257,7 +1414,19 @@ mod tests {
             classify_codex_slash_command("/clear-goal"),
             Some(CodexSlashAction::GoalClear)
         );
-        assert_eq!(classify_codex_slash_command("/model gpt-5"), None);
+        assert_eq!(
+            classify_codex_slash_command("/model gpt-5"),
+            Some(CodexSlashAction::ModelSet { model: "gpt-5" })
+        );
+        assert_eq!(
+            classify_codex_slash_command("/model"),
+            Some(CodexSlashAction::Unsupported { name: "model" })
+        );
+        assert_eq!(
+            classify_codex_slash_command("/unknown"),
+            Some(CodexSlashAction::Unsupported { name: "unknown" })
+        );
+        assert_eq!(classify_codex_slash_command("regular prompt"), None);
     }
 
     #[tokio::test]
@@ -1315,6 +1484,7 @@ mod tests {
             .await;
         let session = state
             .create_session(crate::models::CreateSessionInput {
+                client_session_id: uuid::Uuid::new_v4().to_string(),
                 project_id: project.id,
                 title: Some("Kiro ACP".to_string()),
                 agent: AgentKind::Acp,
@@ -1335,6 +1505,7 @@ mod tests {
                     client_message_id: None,
                     provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                     reasoning_effort: None,
+                    model: None,
                 },
             )
             .await
@@ -1380,6 +1551,7 @@ mod tests {
             .await;
         let session = state
             .create_session(crate::models::CreateSessionInput {
+                client_session_id: uuid::Uuid::new_v4().to_string(),
                 project_id: project.id,
                 title: Some("Kiro ACP Cancel".to_string()),
                 agent: AgentKind::Acp,
@@ -1400,6 +1572,7 @@ mod tests {
                     client_message_id: None,
                     provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                     reasoning_effort: None,
+                    model: None,
                 },
             )
             .await
@@ -1431,6 +1604,7 @@ mod tests {
             .await;
         let session = state
             .create_session(crate::models::CreateSessionInput {
+                client_session_id: uuid::Uuid::new_v4().to_string(),
                 project_id: project.id,
                 title: Some("Kiro ACP Secret Storage".to_string()),
                 agent: AgentKind::Acp,
@@ -1451,6 +1625,7 @@ mod tests {
                     client_message_id: None,
                     provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                     reasoning_effort: None,
+                    model: None,
                 },
             )
             .await
@@ -1488,6 +1663,7 @@ mod tests {
             .await;
         let session = state
             .create_session(crate::models::CreateSessionInput {
+                client_session_id: uuid::Uuid::new_v4().to_string(),
                 project_id: project.id,
                 title: Some("Kiro ACP Load Fallback".to_string()),
                 agent: AgentKind::Acp,
@@ -1511,6 +1687,7 @@ mod tests {
                     client_message_id: None,
                     provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                     reasoning_effort: None,
+                    model: None,
                 },
             )
             .await
@@ -1585,6 +1762,7 @@ mod tests {
             .await;
         let session = state
             .create_session(crate::models::CreateSessionInput {
+                client_session_id: uuid::Uuid::new_v4().to_string(),
                 project_id: project.id,
                 title: Some("Generic HTTP JSON".to_string()),
                 agent: AgentKind::Acp,
@@ -1605,6 +1783,7 @@ mod tests {
                     client_message_id: None,
                     provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                     reasoning_effort: None,
+                    model: None,
                 },
             )
             .await
@@ -1634,6 +1813,7 @@ mod tests {
                 client_message_id: None,
                 provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                 reasoning_effort: None,
+                model: None,
             },
         )
         .await
@@ -1715,6 +1895,7 @@ data: {\"type\":\"done\"}\n\n",
             .await;
         let session = state
             .create_session(crate::models::CreateSessionInput {
+                client_session_id: uuid::Uuid::new_v4().to_string(),
                 project_id: project.id,
                 title: Some("Generic HTTP SSE".to_string()),
                 agent: AgentKind::Acp,
@@ -1735,6 +1916,7 @@ data: {\"type\":\"done\"}\n\n",
                     client_message_id: None,
                     provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                     reasoning_effort: None,
+                    model: None,
                 },
             )
             .await
@@ -1849,6 +2031,7 @@ data: {\"type\":\"done\"}\n\n",
             .await;
         let session = state
             .create_session(crate::models::CreateSessionInput {
+                client_session_id: uuid::Uuid::new_v4().to_string(),
                 project_id: project.id,
                 title: Some("Generic HTTP Approval".to_string()),
                 agent: AgentKind::Acp,
@@ -1869,6 +2052,7 @@ data: {\"type\":\"done\"}\n\n",
                     client_message_id: None,
                     provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                     reasoning_effort: None,
+                    model: None,
                 },
             )
             .await
@@ -2000,6 +2184,7 @@ data: {\"type\":\"done\"}\n\n",
             .await;
         let session = state
             .create_session(crate::models::CreateSessionInput {
+                client_session_id: uuid::Uuid::new_v4().to_string(),
                 project_id: project.id,
                 title: Some("Generic HTTP Cancel".to_string()),
                 agent: AgentKind::Acp,
@@ -2020,6 +2205,7 @@ data: {\"type\":\"done\"}\n\n",
                     client_message_id: None,
                     provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                     reasoning_effort: None,
+                    model: None,
                 },
             )
             .await
@@ -2060,6 +2246,7 @@ data: {\"type\":\"done\"}\n\n",
             .await;
         let session = state
             .create_session(crate::models::CreateSessionInput {
+                client_session_id: uuid::Uuid::new_v4().to_string(),
                 project_id: project.id,
                 title: Some("Kiro ACP Timeout".to_string()),
                 agent: AgentKind::Acp,
@@ -2080,6 +2267,7 @@ data: {\"type\":\"done\"}\n\n",
                     client_message_id: None,
                     provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                     reasoning_effort: None,
+                    model: None,
                 },
             )
             .await
@@ -2115,6 +2303,7 @@ data: {\"type\":\"done\"}\n\n",
             .await;
         let session = state
             .create_session(crate::models::CreateSessionInput {
+                client_session_id: uuid::Uuid::new_v4().to_string(),
                 project_id: project.id,
                 title: Some("Kiro ACP Exit".to_string()),
                 agent: AgentKind::Acp,
@@ -2135,6 +2324,7 @@ data: {\"type\":\"done\"}\n\n",
                     client_message_id: None,
                     provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                     reasoning_effort: None,
+                    model: None,
                 },
             )
             .await
@@ -2184,7 +2374,7 @@ data: {\"type\":\"done\"}\n\n",
         let script = mock_kiro_acp_script_path();
         state
             .update_bridge_settings(BridgeSettingsInput {
-                ai_approval: AiApprovalSettings::default(),
+                ai_approval: Some(AiApprovalSettings::default()),
                 model_providers: None,
                 acp_servers: Some(vec![AcpServerConfig {
                     id: "kiro-mock".to_string(),
@@ -2208,7 +2398,7 @@ data: {\"type\":\"done\"}\n\n",
     async fn configure_mock_generic_http_acp(state: &Arc<AppState>, endpoint: &str) {
         state
             .update_bridge_settings(BridgeSettingsInput {
-                ai_approval: AiApprovalSettings::default(),
+                ai_approval: Some(AiApprovalSettings::default()),
                 model_providers: None,
                 acp_servers: Some(vec![AcpServerConfig {
                     id: "generic-http-mock".to_string(),
@@ -2971,16 +3161,38 @@ impl AgentProvider for CodexProvider {
         provider_config: Option<ResolvedProviderConfig>,
         reasoning_effort: Option<ReasoningEffort>,
     ) -> Result<()> {
-        run_codex(
-            state,
-            &session,
-            &input,
-            system_prompt.as_deref(),
-            &reply,
-            provider_config,
-            reasoning_effort,
-        )
-        .await
+        let mut last_error = None;
+        for attempt in 0..=2 {
+            match run_codex(
+                state.clone(),
+                &session,
+                &input,
+                system_prompt.as_deref(),
+                &reply,
+                provider_config.clone(),
+                reasoning_effort,
+            )
+            .await
+            {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    let turn_can_retry = state.codex_turn_can_retry(&session.id, &reply.id).await;
+                    if !should_retry_codex_stream(&error, turn_can_retry, attempt) {
+                        return Err(error);
+                    }
+                    let delay = Duration::from_secs(1 << attempt);
+                    debug_log!(
+                        "[codex] transient upstream stream failure; retrying attempt {}/2 after {:?}: {}",
+                        attempt + 1,
+                        delay,
+                        error
+                    );
+                    sleep(delay).await;
+                    last_error = Some(error);
+                }
+            }
+        }
+        Err(last_error.expect("retry loop must retain the last error"))
     }
 
     async fn summarize_reply(
@@ -2991,6 +3203,23 @@ impl AgentProvider for CodexProvider {
     ) -> Result<String> {
         summarize_with_codex(state, &session, &content).await
     }
+}
+
+fn is_retryable_codex_stream_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    [
+        "stream disconnected before completion",
+        "upstream request failed",
+        "connection reset",
+        "connection closed",
+        "broken pipe",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
+}
+
+fn should_retry_codex_stream(error: &anyhow::Error, turn_can_retry: bool, attempt: usize) -> bool {
+    attempt < 2 && turn_can_retry && is_retryable_codex_stream_error(error)
 }
 
 #[derive(Clone)]
@@ -3730,7 +3959,7 @@ fn spawn_codex_app_server_with_config(
             );
         }
     }
-    eprintln!("[codex] full -c args: {c_overrides:#?}");
+    debug_log!("[codex] full -c args: {c_overrides:#?}");
 
     command
         .spawn()
@@ -3920,7 +4149,7 @@ fn log_codex_thread_response(session_id: &str, response: &Value) {
         .or_else(|| response.pointer("/approvals_reviewer"))
         .and_then(Value::as_str)
         .unwrap_or("<missing>");
-    eprintln!(
+    debug_log!(
         "[codex] thread response session={session_id} thread={thread_id} approvalPolicy={approval_policy} approvalsReviewer={approvals_reviewer}"
     );
 }
@@ -4025,6 +4254,8 @@ fn decide_codex_thread_action(
     existing_runtime_ref: Option<&str>,
     stored_provider_name: Option<&str>,
     current_provider_name: Option<&str>,
+    stored_model: Option<&str>,
+    current_model: Option<&str>,
 ) -> CodexThreadDecision {
     if existing_runtime_ref.is_none() {
         return CodexThreadDecision::StartFresh;
@@ -4034,6 +4265,7 @@ fn decide_codex_thread_action(
         (Some(stored), Some(current)) if stored != current => {
             CodexThreadDecision::StartWithMigration
         }
+        _ if stored_model != current_model => CodexThreadDecision::StartWithMigration,
         _ => CodexThreadDecision::Resume,
     }
 }
@@ -4051,7 +4283,7 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 }
 
 fn codex_binary_path() -> PathBuf {
-    if let Some(path) = std::env::var_os("ECHO_MATE_CODEX_BIN")
+    if let Some(path) = std::env::var_os("OMNI_CODE_CODEX_BIN")
         .map(PathBuf::from)
         .filter(|path| !path.as_os_str().is_empty())
     {
@@ -4088,7 +4320,7 @@ fn codex_binary_path() -> PathBuf {
 }
 
 fn opencode_binary_path() -> PathBuf {
-    if let Some(path) = std::env::var_os("ECHO_MATE_OPENCODE_BIN")
+    if let Some(path) = std::env::var_os("OMNI_CODE_OPENCODE_BIN")
         .map(PathBuf::from)
         .filter(|path| !path.as_os_str().is_empty())
     {
@@ -4214,7 +4446,7 @@ impl OpenCodeHttpClient {
             match write_opencode_overlay_config(config) {
                 Ok(path) => {
                     command.env("OPENCODE_CONFIG", &path);
-                    eprintln!(
+                    debug_log!(
                         "[opencode] using overlay config: base_url={}",
                         config.base_url
                     );
@@ -4568,7 +4800,7 @@ async fn run_codex(
         let mut reader = BufReader::new(stderr).lines();
         let mut output = String::new();
         while let Some(line) = reader.next_line().await? {
-            eprintln!("[codex:stderr] {line}");
+            debug_log!("[codex:stderr] {line}");
             if !output.is_empty() {
                 output.push('\n');
             }
@@ -4627,19 +4859,28 @@ async fn run_codex(
         existing_runtime_ref.as_deref(),
         stored_provider_name.as_deref(),
         codex_provider_name.as_deref(),
+        stored_model.as_deref(),
+        current_model.as_deref(),
     );
     let base_developer_instructions = turn_system_prompt(session, system_prompt);
     let developer_instructions = base_developer_instructions.clone();
 
     if thread_decision == CodexThreadDecision::StartWithMigration {
-        eprintln!(
+        debug_log!(
             "[codex] forking thread for session={}: provider changed old_provider={:?} new_provider={:?} old_model={:?} new_model={:?}",
-            session.id, stored_provider_name, codex_provider_name, stored_model, current_model,
+            session.id,
+            stored_provider_name,
+            codex_provider_name,
+            stored_model,
+            current_model,
         );
     } else if thread_decision == CodexThreadDecision::Resume && stored_model != current_model {
-        eprintln!(
+        debug_log!(
             "[codex] attempting thread/resume across model change for session={}: provider={:?} old_model={:?} new_model={:?}",
-            session.id, codex_provider_name, stored_model, current_model,
+            session.id,
+            codex_provider_name,
+            stored_model,
+            current_model,
         );
     }
     let thread_response = if thread_decision == CodexThreadDecision::StartWithMigration {
@@ -4876,9 +5117,24 @@ async fn run_codex(
             .await?,
             Some(format!("[codex] running /review {}", instructions)),
         ),
+        Some(CodexSlashAction::GoalSet { objective }) => (
+            send_json_rpc_request(
+                &mut stdin,
+                &mut next_request_id,
+                "thread/goal/set",
+                serde_json::json!({
+                    "threadId": thread_id,
+                    "objective": objective,
+                    "status": "active",
+                }),
+            )
+            .await?,
+            Some(format!("[codex] goal started: {objective}")),
+        ),
         Some(CodexSlashAction::Rename { .. })
-        | Some(CodexSlashAction::GoalSet { .. })
-        | Some(CodexSlashAction::GoalClear) => unreachable!("handled above"),
+        | Some(CodexSlashAction::GoalClear)
+        | Some(CodexSlashAction::ModelSet { .. })
+        | Some(CodexSlashAction::Unsupported { .. }) => unreachable!("handled above"),
         None => (
             send_json_rpc_request(
                 &mut stdin,
@@ -4906,8 +5162,20 @@ async fn run_codex(
     tokio::pin!(idle_sleep);
     let mut pending_approval: Option<PendingApproval> = None;
     let mut queued_approvals: VecDeque<PendingApproval> = VecDeque::new();
+    let mut command_status_probe: Option<CommandStatusProbe> = None;
     let mut turn_finished = false;
     let mut last_rendered = String::new();
+    let background_deadline =
+        tokio::time::sleep(Duration::from_secs(CODEX_BACKGROUND_TASK_MAX_SECONDS));
+    tokio::pin!(background_deadline);
+    let mut background_waiting = false;
+    let goal_mode = matches!(
+        classify_codex_slash_command(&input.content),
+        Some(CodexSlashAction::GoalSet { .. })
+    );
+    if goal_mode {
+        parsed.goal_status = Some("active".to_string());
+    }
 
     loop {
         tokio::select! {
@@ -4916,7 +5184,7 @@ async fn run_codex(
                     break;
                 };
                 let line = line.map_err(anyhow::Error::msg)?;
-                eprintln!("[codex:stdout] {line}");
+                debug_log!("[codex:stdout] {line}");
                 idle_sleep.as_mut().reset(tokio::time::Instant::now() + idle_deadline);
                 if !raw_stdout.is_empty() {
                     raw_stdout.push('\n');
@@ -4925,6 +5193,79 @@ async fn run_codex(
 
                 let value = serde_json::from_str::<Value>(&line)
                     .unwrap_or_else(|_| serde_json::json!({ "raw_line": line }));
+                let previous_status = parsed.current_status().map(ToString::to_string);
+                if value.get("method").and_then(Value::as_str) == Some("turn/started") {
+                    turn_finished = false;
+                }
+                let probe_response = command_status_probe.as_ref().is_some_and(|probe| {
+                    value.get("id").and_then(jsonrpc_id_to_string).as_deref()
+                        == Some(&probe.request_id.to_string())
+                });
+                if probe_response {
+                    let probe = command_status_probe
+                        .take()
+                        .context("command status probe disappeared unexpectedly")?;
+                    if let Some(error) = value.get("error") {
+                        debug_log!(
+                            "[codex:watchdog] session={} thread/read failed for command {}: {}",
+                            session.id,
+                            probe.command,
+                            error
+                                .get("message")
+                                .and_then(Value::as_str)
+                                .unwrap_or("unknown error")
+                        );
+                    } else {
+                        let snapshot = command_status_snapshot(
+                            value.get("result").unwrap_or(&Value::Null),
+                            &probe.item_id,
+                        );
+                        match snapshot.command_status.as_deref() {
+                            Some("inProgress") => {
+                                if let Some(running) = parsed.running_command.as_mut() {
+                                    running.process_id = snapshot.process_id.clone();
+                                }
+                                debug_log!(
+                                    "[codex:watchdog] session={} command is still in progress process_id={:?}: {}",
+                                    session.id, snapshot.process_id, probe.command
+                                );
+                                parsed.latest_status = Some(render_command_stalled_summary(
+                                    &probe.command,
+                                    "confirmed in progress; continuing to wait",
+                                ));
+                            }
+                            Some(status) => {
+                                debug_log!(
+                                    "[codex:watchdog] session={} recovered terminal command status={}: {}",
+                                    session.id, status, probe.command
+                                );
+                                parsed.running_command = None;
+                                parsed.latest_status = Some(render_command_summary(
+                                    &probe.command,
+                                    status,
+                                    None,
+                                ));
+                            }
+                            None => {
+                                debug_log!(
+                                    "[codex:watchdog] session={} thread/read did not contain command item={}",
+                                    session.id, probe.item_id
+                                );
+                            }
+                        }
+                        match snapshot.turn_status.as_deref() {
+                            Some("completed" | "interrupted") => turn_finished = true,
+                            Some("failed") => bail!(
+                                "{}",
+                                snapshot
+                                    .turn_error
+                                    .as_deref()
+                                    .unwrap_or("codex turn failed")
+                            ),
+                            _ => {}
+                        }
+                    }
+                }
                 if value.get("id").and_then(jsonrpc_id_to_string).as_deref()
                     == Some(&turn_request_id.to_string())
                 {
@@ -4938,7 +5279,6 @@ async fn run_codex(
                     continue;
                 }
 
-                let previous_status = parsed.current_status().map(ToString::to_string);
                 match parsed.ingest_value(&value) {
                     CodexAppServerEvent::None => {}
                     CodexAppServerEvent::Content(text) => {
@@ -4947,8 +5287,8 @@ async fn run_codex(
                     CodexAppServerEvent::Status(status) => {
                         parsed.latest_status = Some(status);
                     }
-                    CodexAppServerEvent::ApprovalRequested(pending) => {
-                        if let Some(choice) = auto_approve_codex_request(&pending.request, &project_root).await? {
+                    CodexAppServerEvent::ApprovalRequested(mut pending) => {
+                        if let Some(choice) = auto_approve_codex_request(&mut pending.request, &project_root).await? {
                             send_json_rpc_response(
                                 &mut stdin,
                                 &pending.request.request_id,
@@ -4990,7 +5330,27 @@ async fn run_codex(
                     }
                     CodexAppServerEvent::TurnCompleted => {
                         turn_finished = true;
-                        break;
+                        if !parsed.has_background_processes()
+                            && (!goal_mode || parsed.goal_is_terminal())
+                        {
+                            break;
+                        }
+                        if parsed.has_background_processes() && !background_waiting {
+                            background_waiting = true;
+                            state
+                                .emit_system_message(
+                                    &session.id,
+                                    "[codex] turn completed; waiting for background tasks",
+                                )
+                                .await;
+                        } else if goal_mode && !parsed.goal_is_terminal() {
+                            state
+                                .emit_system_message(
+                                    &session.id,
+                                    "[codex] goal active; waiting for automatic continuation",
+                                )
+                                .await;
+                        }
                     }
                     CodexAppServerEvent::TurnFailed(message) => {
                         bail!("{message}");
@@ -5001,6 +5361,12 @@ async fn run_codex(
                     state
                         .emit_system_message(&session.id, next_status.unwrap_or_default())
                         .await;
+                }
+                if turn_finished
+                    && !parsed.has_background_processes()
+                    && (!goal_mode || parsed.goal_is_terminal())
+                {
+                    break;
                 }
             }
             Some(choice) = approval_rx.recv(), if pending_approval.is_some() => {
@@ -5020,17 +5386,31 @@ async fn run_codex(
                 let watchdog_action = parsed.mark_idle_waiting(pending_approval.is_some());
                 match watchdog_action {
                     Some(CommandWatchdogAction::SoftRecovery { command }) => {
-                        eprintln!(
+                        debug_log!(
                             "[codex:watchdog] session={} command stalled; waiting once more: {}",
                             session.id, command
                         );
                     }
-                    Some(CommandWatchdogAction::Stalled { command }) => {
-                        let message = format!(
-                            "codex command stalled without a completion event: {command}"
+                    Some(CommandWatchdogAction::Probe { item_id, command }) => {
+                        let request_id = send_json_rpc_request(
+                            &mut stdin,
+                            &mut next_request_id,
+                            "thread/read",
+                            serde_json::json!({
+                                "threadId": thread_id,
+                                "includeTurns": true,
+                            }),
+                        )
+                        .await?;
+                        command_status_probe = Some(CommandStatusProbe {
+                            request_id,
+                            item_id,
+                            command: command.clone(),
+                        });
+                        debug_log!(
+                            "[codex:watchdog] session={} checking command status after missing completion event: {}",
+                            session.id, command
                         );
-                        eprintln!("[codex:watchdog] session={} {message}", session.id);
-                        bail!(message);
                     }
                     None => {}
                 }
@@ -5041,6 +5421,9 @@ async fn run_codex(
                         .await;
                 }
                 idle_sleep.as_mut().reset(tokio::time::Instant::now() + idle_deadline);
+            }
+            _ = &mut background_deadline, if background_waiting && parsed.has_background_processes() => {
+                bail!("codex background tasks did not exit within {} minutes", CODEX_BACKGROUND_TASK_MAX_SECONDS / 60);
             }
         }
     }
@@ -5108,16 +5491,7 @@ async fn handle_codex_immediate_slash_command(
             format!("Session renamed to: {title}"),
             Some(title.to_string()),
         ),
-        CodexSlashAction::GoalSet { objective } => (
-            "thread/goal/set",
-            serde_json::json!({
-                "threadId": thread_id,
-                "objective": objective,
-                "status": "active",
-            }),
-            format!("Goal set: {objective}"),
-            None,
-        ),
+        CodexSlashAction::GoalSet { .. } => return Ok(None),
         CodexSlashAction::GoalClear => (
             "thread/goal/clear",
             serde_json::json!({
@@ -5126,6 +5500,20 @@ async fn handle_codex_immediate_slash_command(
             "Goal cleared.".to_string(),
             None,
         ),
+        CodexSlashAction::ModelSet { model } => (
+            "thread/settings/update",
+            serde_json::json!({
+                "threadId": thread_id,
+                "model": model,
+            }),
+            format!("Model changed to: {model}"),
+            None,
+        ),
+        CodexSlashAction::Unsupported { name } => {
+            return Ok(Some(format!(
+                "Unsupported Codex command: /{name}. Supported commands: /compact, /review, /rename, /goal, /clear-goal, /model <id>."
+            )));
+        }
         CodexSlashAction::Compact
         | CodexSlashAction::ReviewUncommittedChanges
         | CodexSlashAction::ReviewCustom { .. } => return Ok(None),
@@ -5146,6 +5534,15 @@ async fn handle_codex_immediate_slash_command(
             .update_session_title(&session.id, title)
             .await
             .map_err(anyhow::Error::msg)?;
+    }
+    if let CodexSlashAction::ModelSet { model } = command {
+        state
+            .update_session_settings(&session.id, None, None, Some(Some(model.to_string())))
+            .await
+            .map_err(anyhow::Error::msg)?;
+        state
+            .set_codex_model(&session.id, Some(model.to_string()))
+            .await;
     }
     Ok(Some(response_text))
 }
@@ -5177,9 +5574,13 @@ async fn run_claude_code(
     let should_fork_existing_session =
         existing_runtime_ref.is_some() && !can_resume_existing_session;
     if should_fork_existing_session {
-        eprintln!(
+        debug_log!(
             "[claude] forking session for session={}: provider/model changed old_provider={:?} new_provider={:?} old_model={:?} new_model={:?}",
-            session.id, stored_provider_id, current_provider_id, stored_model, current_model,
+            session.id,
+            stored_provider_id,
+            current_provider_id,
+            stored_model,
+            current_model,
         );
     }
     let runtime_ref = select_claude_runtime_ref(
@@ -5369,8 +5770,8 @@ async fn run_claude_code(
                 }
                 if pending_approval.is_none() {
                     if let Some(request) = next_claude_permission_request(&state_dir, &run_id, &mut seen_permission_requests).await? {
-                        let approval = request.as_approval_request();
-                        if let Some(choice) = auto_approve_codex_request(&approval, &project_root).await? {
+                        let mut approval = request.as_approval_request();
+                        if let Some(choice) = auto_approve_codex_request(&mut approval, &project_root).await? {
                             let mut response = response_from_choice(&choice);
                             response.request_id = approval.request_id.clone();
                             tokio::fs::write(
@@ -5555,8 +5956,8 @@ async fn run_opencode(
                         }
                     }
                     "permission.asked" => {
-                        let request = opencode_permission_to_approval(properties);
-                        if let Some(choice) = auto_approve_opencode_request(&request, &project_root).await? {
+                        let mut request = opencode_permission_to_approval(properties);
+                        if let Some(choice) = auto_approve_opencode_request(&mut request, &project_root).await? {
                             client.reply_permission(&request.request_id, &choice).await?;
                             state.resolve_approval(&session.id, &request.request_id, choice).await;
                         } else {
@@ -5583,7 +5984,7 @@ async fn run_opencode(
                     "session.idle" => break,
                     _ => {
                         if let Some(status) = render_opencode_event_status(event_type, properties) {
-                            eprintln!(
+                            debug_log!(
                                 "[opencode] system event session={} type={} status={}",
                                 opencode_session_id,
                                 event_type,
@@ -5791,9 +6192,9 @@ async fn run_acp_http(
                                 .set_provider_session_ref(&session.id, Some(runtime_ref))
                                 .await;
                         }
-                        if let Some(request) = acp_event_to_approval(&event) {
+                        if let Some(mut request) = acp_event_to_approval(&event) {
                             if let Some(choice) =
-                                auto_approve_codex_request(&request, &project_root).await?
+                                auto_approve_codex_request(&mut request, &project_root).await?
                             {
                                 send_acp_http_approval_decision(
                                     &client,
@@ -6236,8 +6637,8 @@ async fn run_stdio_acp(
                         .and_then(jsonrpc_id_to_string)
                         .context("ACP stdio permission request did not include id")?;
                     let params = value.get("params").unwrap_or(&Value::Null);
-                    let request = acp_permission_request_to_approval(&request_id, params);
-                    if let Some(choice) = auto_approve_codex_request(&request, &project_root).await? {
+                    let mut request = acp_permission_request_to_approval(&request_id, params);
+                    if let Some(choice) = auto_approve_codex_request(&mut request, &project_root).await? {
                         send_json_rpc_response(
                             &mut stdin,
                             &request_id,
@@ -6895,6 +7296,8 @@ struct CodexAppServerStreamingState {
     latest_status: Option<String>,
     session_id: Option<String>,
     running_command: Option<RunningCommand>,
+    background_processes: HashSet<String>,
+    goal_status: Option<String>,
 }
 
 enum CodexAppServerEvent {
@@ -6911,8 +7314,23 @@ enum CodexAppServerEvent {
 struct RunningCommand {
     item_id: String,
     command: String,
+    process_id: Option<String>,
     idle_ticks: u32,
     recovery_requested: bool,
+}
+
+struct CommandStatusProbe {
+    request_id: u64,
+    item_id: String,
+    command: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CommandStatusSnapshot {
+    command_status: Option<String>,
+    process_id: Option<String>,
+    turn_status: Option<String>,
+    turn_error: Option<String>,
 }
 
 #[derive(Clone)]
@@ -6921,7 +7339,7 @@ struct PendingApproval {
     last_choice: Option<ApprovalChoice>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CodexSlashAction<'a> {
     Compact,
     ReviewUncommittedChanges,
@@ -6929,6 +7347,8 @@ enum CodexSlashAction<'a> {
     Rename { title: &'a str },
     GoalSet { objective: &'a str },
     GoalClear,
+    ModelSet { model: &'a str },
+    Unsupported { name: &'a str },
 }
 
 fn classify_codex_slash_command(input: &str) -> Option<CodexSlashAction<'_>> {
@@ -6946,7 +7366,10 @@ fn classify_codex_slash_command(input: &str) -> Option<CodexSlashAction<'_>> {
             objective: command.args,
         }),
         "clear-goal" if command.args.is_empty() => Some(CodexSlashAction::GoalClear),
-        _ => None,
+        "model" if !command.args.is_empty() => Some(CodexSlashAction::ModelSet {
+            model: command.args,
+        }),
+        _ => Some(CodexSlashAction::Unsupported { name: command.name }),
     }
 }
 
@@ -6979,8 +7402,35 @@ impl CodexAppServerStreamingState {
                 "thread/tokenUsage/updated" | "account/rateLimits/updated" => {
                     CodexAppServerEvent::None
                 }
+                "thread/goal/updated" => {
+                    self.goal_status = params
+                        .pointer("/goal/status")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string);
+                    render_codex_status_notification(method, params)
+                        .map(CodexAppServerEvent::Status)
+                        .unwrap_or(CodexAppServerEvent::None)
+                }
+                "thread/goal/cleared" => {
+                    self.goal_status = None;
+                    render_codex_status_notification(method, params)
+                        .map(CodexAppServerEvent::Status)
+                        .unwrap_or(CodexAppServerEvent::None)
+                }
                 "item/commandExecution/outputDelta" => {
                     self.mark_command_activity(params.get("itemId").and_then(Value::as_str));
+                    render_codex_status_notification(method, params)
+                        .map(CodexAppServerEvent::Status)
+                        .unwrap_or(CodexAppServerEvent::None)
+                }
+                "process/outputDelta" => {
+                    self.track_background_process(params);
+                    render_codex_status_notification(method, params)
+                        .map(CodexAppServerEvent::Status)
+                        .unwrap_or(CodexAppServerEvent::None)
+                }
+                "process/exited" => {
+                    self.complete_background_process(params);
                     render_codex_status_notification(method, params)
                         .map(CodexAppServerEvent::Status)
                         .unwrap_or(CodexAppServerEvent::None)
@@ -7086,6 +7536,29 @@ impl CodexAppServerStreamingState {
         }
     }
 
+    fn has_background_processes(&self) -> bool {
+        !self.background_processes.is_empty()
+    }
+
+    fn goal_is_terminal(&self) -> bool {
+        matches!(
+            self.goal_status.as_deref(),
+            Some("paused" | "blocked" | "usageLimited" | "budgetLimited" | "complete") | None
+        )
+    }
+
+    fn track_background_process(&mut self, value: &Value) {
+        if let Some(handle) = process_handle(value) {
+            self.background_processes.insert(handle);
+        }
+    }
+
+    fn complete_background_process(&mut self, value: &Value) {
+        if let Some(handle) = process_handle(value) {
+            self.background_processes.remove(&handle);
+        }
+    }
+
     fn ingest_app_server_request(&mut self, value: &Value) -> CodexAppServerEvent {
         let method = value
             .get("method")
@@ -7113,6 +7586,8 @@ impl CodexAppServerStreamingState {
                         .get("reason")
                         .and_then(Value::as_str)
                         .map(ToString::to_string),
+                    auto_approval_reason: None,
+                    auto_approval_reason_kind: None,
                     allow_accept_for_session: approval_decisions_contain(
                         params.get("availableDecisions"),
                         "acceptForSession",
@@ -7135,6 +7610,8 @@ impl CodexAppServerStreamingState {
                         .and_then(Value::as_str)
                         .map(ToString::to_string)
                         .or_else(|| Some("Apply proposed edits".to_string())),
+                    auto_approval_reason: None,
+                    auto_approval_reason_kind: None,
                     allow_accept_for_session: approval_decisions_contain(
                         params.get("availableDecisions"),
                         "acceptForSession",
@@ -7166,6 +7643,8 @@ impl CodexAppServerStreamingState {
                         .get("reason")
                         .and_then(Value::as_str)
                         .map(ToString::to_string),
+                    auto_approval_reason: None,
+                    auto_approval_reason_kind: None,
                     allow_accept_for_session: true,
                     allow_cancel: true,
                     resolvable: true,
@@ -7182,6 +7661,8 @@ impl CodexAppServerStreamingState {
                         .and_then(Value::as_str)
                         .map(ToString::to_string)
                         .or_else(|| Some("Apply proposed edits".to_string())),
+                    auto_approval_reason: None,
+                    auto_approval_reason_kind: None,
                     allow_accept_for_session: true,
                     allow_cancel: true,
                     resolvable: true,
@@ -7197,6 +7678,8 @@ impl CodexAppServerStreamingState {
                         .get("reason")
                         .and_then(Value::as_str)
                         .map(ToString::to_string),
+                    auto_approval_reason: None,
+                    auto_approval_reason_kind: None,
                     allow_accept_for_session: false,
                     allow_cancel: true,
                     resolvable: true,
@@ -7266,6 +7749,10 @@ impl CodexAppServerStreamingState {
                         self.running_command = Some(RunningCommand {
                             item_id: item_id.to_string(),
                             command: command.to_string(),
+                            process_id: item
+                                .get("processId")
+                                .and_then(Value::as_str)
+                                .map(ToString::to_string),
                             idle_ticks: 0,
                             recovery_requested: false,
                         });
@@ -7336,11 +7823,19 @@ impl CodexAppServerStreamingState {
                     command: running.command.clone(),
                 });
             } else if running.idle_ticks >= CODEX_COMMAND_STALLED_IDLE_TICKS {
+                // A foreground command can legitimately stay silent for a long time (for
+                // example, curl waiting for a synchronous model-processing endpoint). The
+                // app-server owns the command lifecycle, so absence of output is not proof
+                // that it has stalled. Keep the watchdog diagnostic-only and start another
+                // observation window instead of aborting the whole bridge turn.
+                running.idle_ticks = 0;
+                running.recovery_requested = false;
                 self.latest_status = Some(render_command_stalled_summary(
                     &running.command,
-                    "no completion event after recovery wait",
+                    "no completion event yet; continuing to wait",
                 ));
-                return Some(CommandWatchdogAction::Stalled {
+                return Some(CommandWatchdogAction::Probe {
+                    item_id: running.item_id.clone(),
                     command: running.command.clone(),
                 });
             } else {
@@ -7382,9 +7877,77 @@ impl CodexAppServerStreamingState {
     }
 }
 
+fn process_handle(value: &Value) -> Option<String> {
+    let handle = ["processHandle", "processId", "process_id", "id"]
+        .into_iter()
+        .find_map(|key| {
+            value
+                .get(key)
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .or_else(|| value.get("process").and_then(process_handle))
+        .or_else(|| {
+            value
+                .get("processHandle")
+                .and_then(|value| value.as_object().and_then(|object| object.get("id")))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })?;
+    let handle = handle.trim();
+    (!handle.is_empty()).then(|| handle.to_string())
+}
+
 enum CommandWatchdogAction {
     SoftRecovery { command: String },
-    Stalled { command: String },
+    Probe { item_id: String, command: String },
+}
+
+fn command_status_snapshot(value: &Value, item_id: &str) -> CommandStatusSnapshot {
+    let thread = value.get("thread").unwrap_or(value);
+    let turns = thread
+        .get("turns")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mut snapshot = CommandStatusSnapshot {
+        command_status: None,
+        process_id: None,
+        turn_status: None,
+        turn_error: None,
+    };
+
+    for turn in turns.iter().rev() {
+        if snapshot.turn_status.is_none() {
+            snapshot.turn_status = turn
+                .get("status")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            snapshot.turn_error = turn
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+        }
+        let Some(items) = turn.get("items").and_then(Value::as_array) else {
+            continue;
+        };
+        let Some(item) = items.iter().find(|item| {
+            item.get("type").and_then(Value::as_str) == Some("commandExecution")
+                && item.get("id").and_then(Value::as_str) == Some(item_id)
+        }) else {
+            continue;
+        };
+        snapshot.command_status = item
+            .get("status")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        snapshot.process_id = item
+            .get("processId")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        break;
+    }
+    snapshot
 }
 
 async fn send_json_rpc_request(
@@ -7405,7 +7968,7 @@ async fn send_json_rpc_request(
         }),
     )
     .await?;
-    eprintln!("[codex:jsonrpc:send] id={request_id} method={method}");
+    debug_log!("[codex:jsonrpc:send] id={request_id} method={method}");
     Ok(request_id)
 }
 
@@ -7426,7 +7989,7 @@ async fn send_json_rpc_response(
         }),
     )
     .await?;
-    eprintln!("[codex:jsonrpc:send-response] id={request_id}");
+    debug_log!("[codex:jsonrpc:send-response] id={request_id}");
     Ok(())
 }
 
@@ -7451,7 +8014,7 @@ async fn send_json_rpc_error(
         }),
     )
     .await?;
-    eprintln!("[codex:jsonrpc:send-error] id={request_id} code={code} message={message}");
+    debug_log!("[codex:jsonrpc:send-error] id={request_id} code={code} message={message}");
     Ok(())
 }
 
@@ -7652,7 +8215,7 @@ async fn wait_for_json_rpc_response(
             raw_stdout.push('\n');
         }
         raw_stdout.push_str(&line);
-        eprintln!("[codex:jsonrpc:recv] {line}");
+        debug_log!("[codex:jsonrpc:recv] {line}");
         let value: Value = serde_json::from_str(&line)
             .with_context(|| "JSON-RPC runtime produced invalid JSON")?;
         if value.get("id").and_then(jsonrpc_id_to_string).as_deref()
@@ -8133,7 +8696,8 @@ fn render_codex_thread_name(params: &Value) -> Option<String> {
 
 fn render_codex_thread_goal(params: &Value, action: &str) -> Option<String> {
     let goal = params
-        .pointer("/goal/text")
+        .pointer("/goal/objective")
+        .or_else(|| params.pointer("/goal/text"))
         .or_else(|| params.pointer("/goal/title"))
         .or_else(|| params.get("goal"))
         .and_then(extract_text_from_json)
@@ -9082,6 +9646,8 @@ fn acp_event_to_approval(value: &Value) -> Option<ApprovalRequest> {
         },
         command,
         reason: Some("ACP 请求执行审批".to_string()),
+        auto_approval_reason: None,
+        auto_approval_reason_kind: None,
         allow_accept_for_session: true,
         allow_cancel: true,
         resolvable: true,
@@ -9224,6 +9790,8 @@ fn acp_permission_request_to_approval(request_id: &str, params: &Value) -> Appro
         },
         command,
         reason: Some(format!("Kiro 请求执行 {tool_name}")),
+        auto_approval_reason: None,
+        auto_approval_reason_kind: None,
         allow_accept_for_session: true,
         allow_cancel: true,
         resolvable: true,
@@ -9293,7 +9861,7 @@ struct LoadedOpenCodeArchive {
 }
 
 fn opencode_db_path() -> PathBuf {
-    if let Some(path) = env_path("ECHO_MATE_OPENCODE_DB") {
+    if let Some(path) = env_path("OMNI_CODE_OPENCODE_DB") {
         return path;
     }
 
@@ -9316,7 +9884,7 @@ fn opencode_db_path_candidates() -> Vec<PathBuf> {
     };
     opencode_db_path_candidates_from_values(
         [
-            env_path("ECHO_MATE_OPENCODE_DATA_DIR"),
+            env_path("OMNI_CODE_OPENCODE_DATA_DIR"),
             env_path("OPENCODE_DATA_DIR"),
         ]
         .into_iter()
@@ -9717,6 +10285,8 @@ fn opencode_permission_to_approval(value: &Value) -> ApprovalRequest {
         },
         command,
         reason: Some(format!("OpenCode 请求 {permission} 权限")),
+        auto_approval_reason: None,
+        auto_approval_reason_kind: None,
         allow_accept_for_session: true,
         allow_cancel: true,
         resolvable: true,
@@ -9724,7 +10294,7 @@ fn opencode_permission_to_approval(value: &Value) -> ApprovalRequest {
 }
 
 async fn auto_approve_opencode_request(
-    request: &ApprovalRequest,
+    request: &mut ApprovalRequest,
     project_root: &Path,
 ) -> Result<Option<ApprovalChoice>> {
     match auto_approve_codex_request(request, project_root).await? {
@@ -10081,7 +10651,7 @@ fn shell_quote(value: &str) -> String {
 }
 
 async fn auto_approve_codex_request(
-    request: &ApprovalRequest,
+    request: &mut ApprovalRequest,
     project_root: &std::path::Path,
 ) -> Result<Option<ApprovalChoice>> {
     match request.kind {
@@ -10089,6 +10659,13 @@ async fn auto_approve_codex_request(
             let Some(command) = request.command.as_deref() else {
                 return Ok(None);
             };
+            if ai_approval::is_hard_blocked(command, project_root) {
+                request.auto_approval_reason = Some(
+                    "This command matched a hard safety rule and requires your review.".to_string(),
+                );
+                request.auto_approval_reason_kind = Some("hard_block".to_string());
+                return Ok(None);
+            }
             if let Some(decision) = approval_policy::should_auto_approve(command, project_root) {
                 return Ok(match decision {
                     AutoApprovalDecision::Accept => Some(ApprovalChoice::Accept),
@@ -10100,13 +10677,25 @@ async fn auto_approve_codex_request(
                     eprintln!(
                         "AI approval review failed; falling back to user approval: {error:?}"
                     );
+                    request.auto_approval_reason = Some(error.to_string());
+                    request.auto_approval_reason_kind = Some("review_failed".to_string());
                     None
                 }
             };
-            Ok(match decision.map(|decision| decision.decision) {
-                Some(AiApprovalDecisionKind::Accept) => Some(ApprovalChoice::Accept),
-                Some(AiApprovalDecisionKind::Decline) => Some(ApprovalChoice::Decline),
-                Some(AiApprovalDecisionKind::AskUser) | None => None,
+            Ok(match decision {
+                Some(decision) if decision.decision == AiApprovalDecisionKind::Accept => {
+                    Some(ApprovalChoice::Accept)
+                }
+                Some(decision) if decision.decision == AiApprovalDecisionKind::Decline => {
+                    Some(ApprovalChoice::Decline)
+                }
+                Some(decision) => {
+                    request.auto_approval_reason = Some(decision.reason);
+                    request.auto_approval_reason_kind =
+                        Some(decision.reason_kind.as_str().to_string());
+                    None
+                }
+                None => None,
             })
         }
         ApprovalKind::FileChange | ApprovalKind::ApplyPatch | ApprovalKind::Permissions => Ok(None),

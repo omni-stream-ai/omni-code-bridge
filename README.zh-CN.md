@@ -53,7 +53,7 @@ cargo run
 - Agent CLI：`codex`、`claude`、`opencode` 或 `kiro-cli`
 - 本地检出 [omni-code](https://github.com/omni-stream-ai/omni-code)，用于桥接服务提供内置 APK 更新接口
 
-Agent 二进制路径可以通过 `ECHO_MATE_CODEX_BIN` 和 `ECHO_MATE_OPENCODE_BIN` 覆盖。
+Agent 二进制路径可以通过 `OMNI_CODE_CODEX_BIN` 和 `OMNI_CODE_OPENCODE_BIN` 覆盖。
 
 ## HTTP API
 
@@ -80,6 +80,8 @@ Agent 二进制路径可以通过 `ECHO_MATE_CODEX_BIN` 和 `ECHO_MATE_OPENCODE_
 
 创建会话（`POST /sessions`）、更新会话（`PATCH /sessions/{id}`）和发送消息
 （`POST /sessions/{id}/messages`）都支持 `provider_id`。
+创建会话必须提供客户端生成的 `client_session_id`。Bridge 会将其作为 canonical 会话 ID，
+重复创建请求也使用它进行幂等处理。
 
 - 不传 `provider_id`：完全跳过 bridge 侧 provider 解析
 - `provider_id: "AUTO"`：按优先级从项目级或全局 provider 自动选择
@@ -369,7 +371,7 @@ cargo run -- settings-validate --path config/settings.acp.example.json
 ```
 
 如果省略 `--path`，命令会校验当前解析出的默认 settings 路径
-（`~/.omni-code/settings.json`，或者你通过 `ECHO_MATE_SETTINGS_PATH` 指定的路径）。
+（`~/.omni-code/settings.json`，或者你通过 `OMNI_CODE_SETTINGS_PATH` 指定的路径）。
 现在生产服务启动路径也会使用同样严格的 settings 解析与校验规则；如果配置文件非法，
 服务会直接 fail fast，而不会再静默回退到默认配置。
 

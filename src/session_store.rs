@@ -90,6 +90,7 @@ pub fn load_session_messages(path: &Path) -> Option<SessionMessages> {
     let mut pending_assistant: Option<PendingAssistantMessage> = None;
     let mut pending_user_images: Vec<String> = Vec::new();
     let mut saw_agent_message = false;
+    let mut active_goal_objective: Option<String> = None;
 
     for line in content.lines() {
         let value: Value = serde_json::from_str(line).ok()?;
@@ -124,6 +125,48 @@ pub fn load_session_messages(path: &Path) -> Option<SessionMessages> {
                     &session_id.clone().unwrap_or_default(),
                     &mut pending_assistant,
                 );
+            }
+            "event_msg"
+                if payload.get("type").and_then(Value::as_str) == Some("thread_goal_updated") =>
+            {
+                if let Some(objective) = extract_goal_objective(payload) {
+                    let status = payload
+                        .pointer("/goal/status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("active");
+                    let terminal = matches!(
+                        status,
+                        "complete" | "completed" | "cancelled" | "canceled" | "failed"
+                    );
+                    let should_display =
+                        !terminal && active_goal_objective.as_deref() != Some(objective);
+                    if terminal {
+                        if active_goal_objective.as_deref() == Some(objective) {
+                            active_goal_objective = None;
+                        }
+                    } else {
+                        active_goal_objective = Some(objective.to_string());
+                    }
+                    if !should_display {
+                        continue;
+                    }
+                    flush_pending_assistant(
+                        &mut messages,
+                        &session_id.clone().unwrap_or_default(),
+                        &mut pending_assistant,
+                    );
+                    messages.push(ChatMessage {
+                        id: format!(
+                            "{}-user-{}",
+                            session_id.as_deref().unwrap_or("unknown"),
+                            messages.len()
+                        ),
+                        session_id: session_id.clone().unwrap_or_default(),
+                        role: MessageRole::User,
+                        content: format!("/goal {objective}"),
+                        created_at: timestamp,
+                    });
+                }
             }
             "event_msg" if payload.get("type").and_then(Value::as_str) == Some("user_message") => {
                 flush_pending_assistant(
@@ -263,6 +306,14 @@ fn extract_user_text(payload: &Value, response_item_images: &[String]) -> Option
         payload,
         response_item_images,
     ))
+}
+
+fn extract_goal_objective(payload: &Value) -> Option<&str> {
+    payload
+        .pointer("/goal/objective")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
 }
 
 fn render_user_message_markdown(
@@ -483,6 +534,15 @@ fn parse_session_summary_file(path: &Path) -> Option<ParsedSessionSummaryRecord>
             }
             "event_msg" if payload.get("type").and_then(Value::as_str) == Some("turn_aborted") => {
                 status = SessionStatus::Interrupted;
+            }
+            "event_msg"
+                if payload.get("type").and_then(Value::as_str) == Some("thread_goal_updated") =>
+            {
+                if let Some(objective) = extract_goal_objective(payload) {
+                    let command = format!("/goal {objective}");
+                    user_message_candidates.push(command.clone());
+                    last_preview = Some(command);
+                }
             }
             "event_msg" if payload.get("type").and_then(Value::as_str) == Some("user_message") => {
                 let text = payload
@@ -718,7 +778,7 @@ fn render_codex_function_call_output(payload: &Value) -> Option<String> {
 }
 
 fn sessions_root() -> PathBuf {
-    std::env::var("ECHO_MATE_CODEX_SESSIONS_DIR")
+    std::env::var("OMNI_CODE_CODEX_SESSIONS_DIR")
         .map(PathBuf::from)
         .or_else(|_| std::env::var("HOME").map(|home| PathBuf::from(home).join(".codex/sessions")))
         .unwrap_or_else(|_| PathBuf::from(".codex/sessions"))
@@ -788,6 +848,70 @@ mod tests {
         assert_eq!(messages[0].content, "hello codex");
         assert_eq!(messages[1].role, MessageRole::Assistant);
         assert_eq!(messages[1].content, "hello user");
+    }
+
+    #[test]
+    fn load_session_messages_renders_goal_objective_without_internal_continuation_prompt() {
+        let file = temp_jsonl_file(
+            "codex-goal-session",
+            &[
+                r#"{"timestamp":"2026-05-01T00:00:00Z","type":"session_meta","payload":{"id":"codex-goal","cwd":"/tmp/project"}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:01Z","type":"event_msg","payload":{"type":"thread_goal_updated","goal":{"objective":"fix attachment rendering","status":"active"}}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:02Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<codex_internal_context source=\"goal\">secret continuation instructions</codex_internal_context>"}]}}"#,
+            ],
+        );
+
+        let messages = load_session_messages(&file)
+            .expect("goal archive should parse")
+            .messages;
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, MessageRole::User);
+        assert_eq!(messages[0].content, "/goal fix attachment rendering");
+        assert!(!messages[0].content.contains("codex_internal_context"));
+    }
+
+    #[test]
+    fn load_session_messages_deduplicates_goal_status_updates() {
+        let file = temp_jsonl_file(
+            "codex-goal-updates",
+            &[
+                r#"{"timestamp":"2026-05-01T00:00:00Z","type":"session_meta","payload":{"id":"codex-goal","cwd":"/tmp/project"}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:01Z","type":"event_msg","payload":{"type":"thread_goal_updated","goal":{"objective":"finish task","status":"active"}}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:02Z","type":"event_msg","payload":{"type":"thread_goal_updated","goal":{"objective":"finish task","status":"complete"}}}"#,
+            ],
+        );
+
+        let messages = load_session_messages(&file)
+            .expect("goal archive should parse")
+            .messages;
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "/goal finish task");
+    }
+
+    #[test]
+    fn load_session_messages_keeps_restarted_goal_with_same_objective() {
+        let file = temp_jsonl_file(
+            "codex-restarted-goal",
+            &[
+                r#"{"timestamp":"2026-05-01T00:00:00Z","type":"session_meta","payload":{"id":"codex-goal","cwd":"/tmp/project"}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:01Z","type":"event_msg","payload":{"type":"thread_goal_updated","goal":{"objective":"finish task","status":"active"}}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:02Z","type":"event_msg","payload":{"type":"thread_goal_updated","goal":{"objective":"finish task","status":"complete"}}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:03Z","type":"event_msg","payload":{"type":"thread_goal_updated","goal":{"objective":"finish task","status":"active"}}}"#,
+            ],
+        );
+
+        let messages = load_session_messages(&file)
+            .expect("restarted goal archive should parse")
+            .messages;
+
+        assert_eq!(messages.len(), 2);
+        assert!(
+            messages
+                .iter()
+                .all(|message| message.content == "/goal finish task")
+        );
     }
 
     #[test]
@@ -931,6 +1055,25 @@ mod tests {
         assert_eq!(
             record.project.last_session_preview.as_deref(),
             Some("visible agent reply")
+        );
+    }
+
+    #[test]
+    fn parse_session_summary_file_uses_goal_as_title_and_preview() {
+        let file = temp_jsonl_file(
+            "codex-goal-summary",
+            &[
+                r#"{"timestamp":"2026-05-01T00:00:00Z","type":"session_meta","payload":{"id":"codex-goal","cwd":"/tmp/example-app"}}"#,
+                r#"{"timestamp":"2026-05-01T00:00:01Z","type":"event_msg","payload":{"type":"thread_goal_updated","goal":{"objective":"fix attachment rendering","status":"active"}}}"#,
+            ],
+        );
+
+        let record = parse_session_summary_file(&file).expect("summary should parse");
+
+        assert_eq!(record.session.title, "/goal fix attachment rendering");
+        assert_eq!(
+            record.session.last_message_preview.as_deref(),
+            Some("/goal fix attachment rendering")
         );
     }
 

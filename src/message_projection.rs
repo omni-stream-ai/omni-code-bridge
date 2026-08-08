@@ -109,6 +109,8 @@ fn is_empty_assistant_placeholder_for_same_turn(
     };
     provider_user.session_id == bridge_user.session_id
         && provider_user.content.trim() == bridge_user.content.trim()
+        && user_turn_index(provider_context, provider_user)
+            == user_turn_index(bridge_context, bridge_user)
 }
 
 fn is_final_assistant_reply_for_same_turn(
@@ -136,6 +138,8 @@ fn is_final_assistant_reply_for_same_turn(
     };
     provider_user.session_id == bridge_user.session_id
         && provider_user.content.trim() == bridge_user.content.trim()
+        && user_turn_index(provider_context, provider_user)
+            == user_turn_index(bridge_context, bridge_user)
 }
 
 fn is_last_assistant_in_turn(messages: &[ChatMessage], target: &ChatMessage) -> bool {
@@ -200,7 +204,20 @@ fn messages_are_equivalent_in_context(
     bridge_context: &[ChatMessage],
 ) -> bool {
     if messages_are_equivalent(provider_message, bridge_message) {
-        return true;
+        if provider_message.role == MessageRole::User {
+            return user_turn_index(provider_context, provider_message)
+                == user_turn_index(bridge_context, bridge_message);
+        }
+        let provider_user = nearest_user_before(provider_context, provider_message);
+        let bridge_user = nearest_user_before(bridge_context, bridge_message);
+        return match (provider_user, bridge_user) {
+            (Some(provider_user), Some(bridge_user)) => {
+                user_turn_index(provider_context, provider_user)
+                    == user_turn_index(bridge_context, bridge_user)
+            }
+            (None, None) => true,
+            _ => false,
+        };
     }
     if provider_message.role != MessageRole::Assistant
         || bridge_message.role != MessageRole::Assistant
@@ -225,6 +242,15 @@ fn messages_are_equivalent_in_context(
     };
     provider_user.session_id == bridge_user.session_id
         && provider_user.content.trim() == bridge_user.content.trim()
+        && user_turn_index(provider_context, provider_user)
+            == user_turn_index(bridge_context, bridge_user)
+}
+
+fn user_turn_index(messages: &[ChatMessage], target: &ChatMessage) -> Option<usize> {
+    messages
+        .iter()
+        .filter(|message| message.role == MessageRole::User)
+        .position(|message| message.id == target.id)
 }
 
 fn contents_are_equivalent(role: &MessageRole, a: &str, b: &str) -> bool {
@@ -607,6 +633,41 @@ mod tests {
         );
 
         assert_eq!(projected.len(), 2);
+    }
+
+    #[test]
+    fn projection_keeps_repeated_turns_and_deduplicates_each_source_pair() {
+        let now = Utc::now();
+        let provider = vec![
+            message("remote-u1", "remote", MessageRole::User, "continue", now),
+            message("remote-a1", "remote", MessageRole::Assistant, "done", now),
+            message("remote-u2", "remote", MessageRole::User, "continue", now),
+            message("remote-a2", "remote", MessageRole::Assistant, "done", now),
+        ];
+        let bridge = vec![
+            message("bridge-u1", "session", MessageRole::User, "continue", now),
+            message("bridge-a1", "session", MessageRole::Assistant, "done", now),
+            message("bridge-u2", "session", MessageRole::User, "continue", now),
+            message("bridge-a2", "session", MessageRole::Assistant, "done", now),
+        ];
+
+        let projected = MessageProjection::from_sources("session", provider, bridge);
+
+        assert_eq!(projected.len(), 4);
+        assert_eq!(
+            projected
+                .iter()
+                .filter(|message| message.role == MessageRole::User)
+                .count(),
+            2
+        );
+        assert_eq!(
+            projected
+                .iter()
+                .filter(|message| message.role == MessageRole::Assistant)
+                .count(),
+            2
+        );
     }
 
     fn message(

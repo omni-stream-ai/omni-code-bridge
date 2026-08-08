@@ -284,6 +284,9 @@ pub struct MessageListPage {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateSessionInput {
+    /// Client-generated idempotency key. When present it is also the stable,
+    /// canonical session id exposed by the bridge.
+    pub client_session_id: String,
     pub project_id: String,
     pub title: Option<String>,
     pub agent: AgentKind,
@@ -405,6 +408,9 @@ pub struct SendMessageInput {
     /// Override reasoning effort for this message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Override model for this message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -523,6 +529,10 @@ pub struct ApprovalRequest {
     pub kind: ApprovalKind,
     pub command: Option<String>,
     pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_approval_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_approval_reason_kind: Option<String>,
     pub allow_accept_for_session: bool,
     pub allow_cancel: bool,
     pub resolvable: bool,

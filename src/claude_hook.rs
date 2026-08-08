@@ -144,12 +144,18 @@ pub async fn run_permission_hook(
         .unwrap_or_else(|| payload.clone());
     let command = extract_command_from_value(&tool_input).unwrap_or_default();
     let auto_allow = load_always_allow_commands(&state_dir).await;
-    if tool_name != Some("Bash") || is_auto_allowed_bash_command(&command, &auto_allow) {
+    if tool_name != Some("Bash") {
         write_hook_decision("allow", "Allowed by omni-code Claude hook").await?;
         return Ok(());
     }
 
-    if approval_policy::should_auto_approve(&command, &project_root).is_some() {
+    let hard_blocked = ai_approval::is_hard_blocked(&command, &project_root);
+    if !hard_blocked && is_auto_allowed_bash_command(&command, &auto_allow) {
+        write_hook_decision("allow", "Allowed by omni-code Claude hook").await?;
+        return Ok(());
+    }
+
+    if !hard_blocked && approval_policy::should_auto_approve(&command, &project_root).is_some() {
         write_hook_decision("allow", "Allowed by approval policy").await?;
         return Ok(());
     }
@@ -160,6 +166,8 @@ pub async fn run_permission_hook(
         kind: ApprovalKind::ExecCommand,
         command: Some(command.clone()),
         reason: Some(format!("Claude requests {}", tool_name.unwrap_or("Bash"))),
+        auto_approval_reason: None,
+        auto_approval_reason_kind: None,
         allow_accept_for_session: false,
         allow_cancel: true,
         resolvable: true,
@@ -302,6 +310,8 @@ impl ClaudePermissionRequest {
             },
             command,
             reason,
+            auto_approval_reason: None,
+            auto_approval_reason_kind: None,
             allow_accept_for_session: self
                 .permission_suggestions
                 .as_ref()

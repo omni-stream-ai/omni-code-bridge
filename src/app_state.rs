@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::{
     sync::{Mutex, RwLock, broadcast, mpsc},
@@ -20,6 +20,7 @@ use crate::{
     adapter::ProviderRegistry,
     bridge_settings::{BridgeSettings, BridgeSettingsStore},
     client_auth_store::ClientAuthStore,
+    debug_log,
     device_store::{load_device_registrations, save_device_registrations},
     message_projection::MessageProjection,
     models::{
@@ -80,12 +81,16 @@ struct PersistedSessionRuntimeState {
 struct PersistedSessionMetadata {
     #[serde(default)]
     sessions: HashMap<String, PersistedSessionMetadataEntry>,
+    #[serde(default)]
+    projects: HashMap<String, ProjectSummary>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct PersistedSessionMetadataEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session: Option<SessionSummary>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -132,6 +137,39 @@ impl SessionRuntimeState {
             interrupted: self.interrupted,
         }
     }
+}
+
+fn provider_session_ref_chain_from_runtime(
+    runtime: &HashMap<String, SessionRuntimeState>,
+    session_id: &str,
+) -> Vec<String> {
+    let refs = runtime
+        .iter()
+        .filter_map(|(id, state)| {
+            state
+                .provider_session_ref
+                .as_ref()
+                .map(|session_ref| (id.clone(), session_ref.clone()))
+        })
+        .collect::<HashMap<_, _>>();
+    provider_session_ref_chain_from_refs(&refs, session_id)
+}
+
+fn provider_session_ref_chain_from_refs(
+    refs: &HashMap<String, String>,
+    session_id: &str,
+) -> Vec<String> {
+    let mut chain = Vec::new();
+    let mut visited = std::collections::HashSet::from([session_id.to_string()]);
+    let mut current = session_id;
+    while let Some(next) = refs.get(current) {
+        if !visited.insert(next.clone()) {
+            break;
+        }
+        chain.push(next.clone());
+        current = next;
+    }
+    chain
 }
 
 #[derive(Clone)]
@@ -189,6 +227,7 @@ pub struct EventSubscription {
 
 impl AppState {
     const LIST_CACHE_TTL: Duration = Duration::from_secs(5);
+    const STALE_RUNNING_SESSION_DAYS: i64 = 7;
 
     #[allow(dead_code)]
     pub async fn new() -> Self {
@@ -225,9 +264,16 @@ impl AppState {
         let persisted_runtime = load_persisted_runtime(&runtime_store_path).await;
         let persisted_metadata =
             load_persisted_session_metadata(&session_metadata_store_path).await;
-        Self {
-            projects: RwLock::new(HashMap::new()),
-            sessions: RwLock::new(HashMap::new()),
+        let state = Self {
+            projects: RwLock::new(persisted_metadata.projects.clone()),
+            sessions: RwLock::new(
+                persisted_metadata
+                    .sessions
+                    .values()
+                    .filter_map(|entry| entry.session.clone())
+                    .map(|session| (session.id.clone(), session))
+                    .collect(),
+            ),
             session_title_overrides: RwLock::new(
                 persisted_metadata
                     .sessions
@@ -265,7 +311,9 @@ impl AppState {
             push: PushService::new(),
             runtime_store_path,
             session_metadata_store_path,
-        }
+        };
+        state.interrupt_stale_running_sessions(Utc::now()).await;
+        state
     }
 
     #[cfg(test)]
@@ -279,9 +327,16 @@ impl AppState {
         let persisted_runtime = load_persisted_runtime(&runtime_store_path).await;
         let persisted_metadata =
             load_persisted_session_metadata(&session_metadata_store_path).await;
-        Self {
-            projects: RwLock::new(HashMap::new()),
-            sessions: RwLock::new(HashMap::new()),
+        let state = Self {
+            projects: RwLock::new(persisted_metadata.projects.clone()),
+            sessions: RwLock::new(
+                persisted_metadata
+                    .sessions
+                    .values()
+                    .filter_map(|entry| entry.session.clone())
+                    .map(|session| (session.id.clone(), session))
+                    .collect(),
+            ),
             session_title_overrides: RwLock::new(
                 persisted_metadata
                     .sessions
@@ -319,7 +374,9 @@ impl AppState {
             push: PushService::new(),
             runtime_store_path,
             session_metadata_store_path,
-        }
+        };
+        state.interrupt_stale_running_sessions(Utc::now()).await;
+        state
     }
 
     pub(crate) async fn new_with_paths_strict(
@@ -331,9 +388,16 @@ impl AppState {
         let persisted_runtime = load_persisted_runtime(&runtime_store_path).await;
         let persisted_metadata =
             load_persisted_session_metadata(&session_metadata_store_path).await;
-        Ok(Self {
-            projects: RwLock::new(HashMap::new()),
-            sessions: RwLock::new(HashMap::new()),
+        let state = Self {
+            projects: RwLock::new(persisted_metadata.projects.clone()),
+            sessions: RwLock::new(
+                persisted_metadata
+                    .sessions
+                    .values()
+                    .filter_map(|entry| entry.session.clone())
+                    .map(|session| (session.id.clone(), session))
+                    .collect(),
+            ),
             session_title_overrides: RwLock::new(
                 persisted_metadata
                     .sessions
@@ -371,7 +435,9 @@ impl AppState {
             push: PushService::new(),
             runtime_store_path,
             session_metadata_store_path,
-        })
+        };
+        state.interrupt_stale_running_sessions(Utc::now()).await;
+        Ok(state)
     }
 
     pub async fn is_runtime_client_id_allowed(&self, client_id: &str) -> bool {
@@ -447,7 +513,9 @@ impl AppState {
 
         self.settings
             .update(|settings| {
-                settings.ai_approval = input.ai_approval;
+                if let Some(ai_approval) = input.ai_approval {
+                    settings.ai_approval = ai_approval;
+                }
                 if let Some(model_providers) = input.model_providers {
                     settings.model_providers = model_providers;
                 }
@@ -463,12 +531,147 @@ impl AppState {
         &self.settings
     }
 
+    pub async fn update_ai_approval_prompt(&self, prompt: String) -> Result<String, String> {
+        let saved_prompt = prompt.trim().to_string();
+        let result = saved_prompt.clone();
+        self.settings
+            .update(|settings| settings.ai_approval.prompt = saved_prompt)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(result)
+    }
+
+    pub async fn project_ai_approval_settings(
+        &self,
+        project_id: &str,
+    ) -> Result<crate::bridge_settings::ProjectAiApprovalSettings, String> {
+        let project = self
+            .find_project(project_id)
+            .await
+            .ok_or_else(|| format!("unknown project: {project_id}"))?;
+        Ok(self
+            .settings
+            .get()
+            .await
+            .project_ai_approval
+            .get(&project.root_path)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    pub async fn update_project_ai_approval_settings(
+        &self,
+        project_id: &str,
+        input: crate::bridge_settings::ProjectAiApprovalInput,
+    ) -> Result<crate::bridge_settings::ProjectAiApprovalSettings, String> {
+        let project = self
+            .find_project(project_id)
+            .await
+            .ok_or_else(|| format!("unknown project: {project_id}"))?;
+        let project_root = project.root_path;
+        let lookup_root = project_root.clone();
+        let updated = self
+            .settings
+            .update(|settings| {
+                let project_settings = settings
+                    .project_ai_approval
+                    .entry(project_root)
+                    .or_default();
+                project_settings.prompt = input.prompt;
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(updated
+            .project_ai_approval
+            .get(&lookup_root)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    pub async fn remember_ai_approval_rule(
+        &self,
+        project_root: &std::path::Path,
+        command: &str,
+    ) -> Result<(), String> {
+        let project_root = project_root.to_string_lossy().to_string();
+        let command = command.trim().to_string();
+        if command.is_empty() {
+            return Ok(());
+        }
+        self.settings
+            .update(|settings| {
+                let project = settings
+                    .project_ai_approval
+                    .entry(project_root)
+                    .or_default();
+                let rule = always_allow_prompt_rule(&command);
+                if !project.prompt.lines().any(|line| line.trim() == rule) {
+                    if !project.prompt.trim().is_empty() {
+                        project.prompt.push_str("\n\n");
+                    }
+                    project.prompt.push_str(&rule);
+                }
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
     pub fn secret_store(&self) -> &SecretStore {
         &self.secret_store
     }
 
     pub async fn list_projects(&self) -> Vec<ProjectSummary> {
         self.ensure_list_cache().await.projects
+    }
+
+    async fn interrupt_stale_running_sessions(&self, now: DateTime<Utc>) -> usize {
+        let cutoff = now - chrono::TimeDelta::days(Self::STALE_RUNNING_SESSION_DAYS);
+        let stale_session_ids = self
+            .ensure_list_cache()
+            .await
+            .sessions
+            .into_iter()
+            .filter(|session| {
+                matches!(session.status, SessionStatus::Running) && session.updated_at < cutoff
+            })
+            .map(|session| session.id)
+            .collect::<Vec<_>>();
+        if stale_session_ids.is_empty() {
+            return 0;
+        }
+
+        let snapshot = {
+            let mut runtime = self.runtime.lock().await;
+            for session_id in &stale_session_ids {
+                let entry = runtime
+                    .entry(session_id.clone())
+                    .or_insert_with(SessionRuntimeState::default);
+                entry.interrupted = true;
+                entry.turn_in_flight = false;
+                entry.turn_abort = None;
+                entry.cancel_tx = None;
+                entry.approval_tx = None;
+                entry.pending_approval = None;
+            }
+            runtime
+                .iter()
+                .map(|(session_id, state)| (session_id.clone(), state.to_persisted()))
+                .collect::<HashMap<_, _>>()
+        };
+        if let Err(error) = write_persisted_runtime(&self.runtime_store_path, &snapshot).await {
+            eprintln!(
+                "failed to persist stale session interruption state at {}: {error}",
+                self.runtime_store_path.display()
+            );
+        }
+        self.invalidate_list_cache().await;
+        debug_log!(
+            "[startup] interrupted {} session(s) still running after more than {} days",
+            stale_session_ids.len(),
+            Self::STALE_RUNNING_SESSION_DAYS
+        );
+        stale_session_ids.len()
     }
 
     pub async fn list_sessions(&self) -> Vec<SessionSummary> {
@@ -588,14 +791,17 @@ impl AppState {
     pub async fn list_messages(&self, session_id: &str) -> Option<Vec<ChatMessage>> {
         let session = self.find_session(session_id).await?;
         let provider_messages = if let Some(provider) = self.provider_for_agent(session.agent) {
-            let provider_session_id = self
-                .provider_session_ref(session_id)
-                .await
-                .unwrap_or_else(|| session_id.to_string());
-            provider
-                .list_messages(&provider_session_id)
-                .await
-                .map(|messages| MessageProjection::normalize_provider(session_id, messages))
+            let mut provider_session_ids = vec![session_id.to_string()];
+            provider_session_ids.extend(self.provider_session_ref_chain(session_id).await);
+            let mut combined = Vec::new();
+            let mut found = false;
+            for provider_session_id in provider_session_ids {
+                if let Some(messages) = provider.list_messages(&provider_session_id).await {
+                    found = true;
+                    combined = MessageProjection::from_sources(session_id, messages, combined);
+                }
+            }
+            found.then(|| MessageProjection::normalize_provider(session_id, combined))
         } else {
             None
         };
@@ -616,6 +822,32 @@ impl AppState {
             (None, None) => Vec::new(),
         };
         Some(sort_messages(messages))
+    }
+
+    pub async fn codex_turn_can_retry(&self, session_id: &str, message_id: &str) -> bool {
+        let no_message_progress = self
+            .messages
+            .read()
+            .await
+            .get(session_id)
+            .and_then(|messages| {
+                let reply_index = messages
+                    .iter()
+                    .position(|message| message.id == message_id)?;
+                Some(
+                    messages[reply_index].content.trim().is_empty()
+                        && messages.len() == reply_index + 1,
+                )
+            })
+            .unwrap_or(false);
+        if !no_message_progress {
+            return false;
+        }
+        self.runtime
+            .lock()
+            .await
+            .get(session_id)
+            .is_some_and(|runtime| runtime.pending_approval.is_none())
     }
 
     pub async fn get_session(&self, session_id: &str) -> Option<SessionDetail> {
@@ -658,13 +890,26 @@ impl AppState {
         &self,
         input: CreateSessionInput,
     ) -> Result<SessionSummary, String> {
+        let canonical_id = input.client_session_id.trim().to_string();
+        if canonical_id.is_empty() {
+            return Err("client_session_id is required".to_string());
+        }
+        if canonical_id.len() > 128 {
+            return Err("client_session_id is too long".to_string());
+        }
+        if let Some(existing) = self.find_session(&canonical_id).await {
+            if existing.project_id != input.project_id || existing.agent != input.agent {
+                return Err("client_session_id is already used by another session".to_string());
+            }
+            return Ok(existing);
+        }
         let project = self
             .find_project(&input.project_id)
             .await
             .ok_or_else(|| format!("unknown project: {}", input.project_id))?;
 
         let session = SessionSummary {
-            id: Uuid::new_v4().to_string(),
+            id: canonical_id,
             project_id: project.id,
             title: input
                 .title
@@ -682,10 +927,16 @@ impl AppState {
             model: None,
         };
 
-        self.sessions
-            .write()
-            .await
-            .insert(session.id.clone(), session.clone());
+        {
+            let mut sessions = self.sessions.write().await;
+            if let Some(existing) = sessions.get(&session.id) {
+                if existing.project_id != session.project_id || existing.agent != session.agent {
+                    return Err("client_session_id is already used by another session".to_string());
+                }
+                return Ok(existing.clone());
+            }
+            sessions.insert(session.id.clone(), session.clone());
+        }
         self.messages
             .write()
             .await
@@ -709,6 +960,7 @@ impl AppState {
         );
         self.invalidate_list_cache().await;
         self.refresh_project_summary(&session.project_id).await;
+        self.persist_canonical_session(&session).await?;
 
         self.publish_event(SessionEvent::SessionSnapshot(session.clone()));
 
@@ -991,7 +1243,7 @@ impl AppState {
         // - explicit id => direct lookup, no fallback
         if let Some(provider_id) = requested_provider_id {
             if provider_id != AUTO_PROVIDER_ID {
-                eprintln!("[provider] looking up explicit provider_id={provider_id}");
+                debug_log!("[provider] looking up explicit provider_id={provider_id}");
                 if agent == AgentKind::Acp {
                     if let Some(config) = settings
                         .acp_servers
@@ -1035,18 +1287,20 @@ impl AppState {
                     if let Some(model) = &session.model {
                         config.model = Some(model.clone());
                     }
-                    eprintln!(
+                    debug_log!(
                         "[provider] resolved explicit provider: base_url={} model={:?} format={:?}",
-                        config.base_url, config.model, config.format
+                        config.base_url,
+                        config.model,
+                        config.format
                     );
                     return Some(config);
                 }
                 eprintln!("[provider] error: provider_id={provider_id} not found in settings");
                 return None;
             }
-            eprintln!("[provider] explicit AUTO provider requested");
+            debug_log!("[provider] explicit AUTO provider requested");
         } else {
-            eprintln!(
+            debug_log!(
                 "[provider] no provider_id requested for session={}; skipping bridge provider resolution",
                 session.id
             );
@@ -1060,9 +1314,11 @@ impl AppState {
         // 3. Project-level providers
         if let Some(project_providers) = self.load_project_providers(&session.project_id).await {
             if let Some(config) = find_best_provider(&project_providers) {
-                eprintln!(
+                debug_log!(
                     "[provider] using project-level provider for session={}: base_url={} format={:?}",
-                    session.id, config.base_url, config.format
+                    session.id,
+                    config.base_url,
+                    config.format
                 );
                 return Some(config);
             }
@@ -1071,9 +1327,11 @@ impl AppState {
         // 4. Global providers (sorted by priority)
         let config = find_best_provider(&settings.model_providers);
         if let Some(ref c) = config {
-            eprintln!(
+            debug_log!(
                 "[provider] using global provider: base_url={} model={:?} format={:?}",
-                c.base_url, c.model, c.format
+                c.base_url,
+                c.model,
+                c.format
             );
         }
         config
@@ -1093,7 +1351,7 @@ impl AppState {
         match tokio::fs::read_to_string(&config_path).await {
             Ok(body) => match serde_json::from_str::<Vec<ModelProviderConfig>>(&body) {
                 Ok(providers) => {
-                    eprintln!(
+                    debug_log!(
                         "[provider] loaded {} project-level providers from {}",
                         providers.len(),
                         config_path.display()
@@ -1101,7 +1359,7 @@ impl AppState {
                     Some(providers)
                 }
                 Err(error) => {
-                    eprintln!(
+                    debug_log!(
                         "[provider] warning: failed to parse {}: {}",
                         config_path.display(),
                         error
@@ -1110,7 +1368,7 @@ impl AppState {
                 }
             },
             Err(error) => {
-                eprintln!(
+                debug_log!(
                     "[provider] warning: failed to read {}: {}",
                     config_path.display(),
                     error
@@ -1147,9 +1405,11 @@ impl AppState {
         };
 
         if !is_compatible {
-            eprintln!(
+            debug_log!(
                 "[provider] warning: provider {} format {:?} is not compatible with agent {:?}",
-                provider_id, provider.format, agent
+                provider_id,
+                provider.format,
+                agent
             );
             // Allow it anyway but log warning
         }
@@ -1214,13 +1474,21 @@ impl AppState {
             .find_session(session_id)
             .await
             .ok_or_else(|| format!("unknown session: {session_id}"));
-        let session_snapshot = match session_snapshot {
+        let mut session_snapshot = match session_snapshot {
             Ok(session) => session,
             Err(error) => {
                 self.finish_turn(session_id).await;
                 return Err(error);
             }
         };
+        if let Some(model) = input
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            session_snapshot.model = Some(model.to_string());
+        }
 
         if matches!(session_snapshot.agent, AgentKind::Custom) {
             let user_message = ChatMessage {
@@ -1266,7 +1534,7 @@ impl AppState {
             .system_prompt
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
-        eprintln!(
+        debug_log!(
             "[messages] send session={session_id} input_mode={:?} system_prompt_present={} system_prompt_len={} message_provider_id={:?} session_provider_id={:?} reasoning_effort={:?}",
             input.input_mode,
             system_prompt.is_some(),
@@ -1313,9 +1581,11 @@ impl AppState {
             .resolve_provider_config(&session_snapshot, &input.provider_id)
             .await;
         if let Some(ref config) = provider_config {
-            eprintln!(
+            debug_log!(
                 "[provider] resolved provider for session={session_id}: base_url={} model={:?} format={:?}",
-                config.base_url, config.model, config.format
+                config.base_url,
+                config.model,
+                config.format
             );
         } else {
             self.set_codex_provider_name(session_id, None).await;
@@ -1454,8 +1724,8 @@ impl AppState {
         request_id: &str,
         choice: ApprovalChoice,
     ) -> Result<(), String> {
-        eprintln!("[approval] submit session={session_id} request={request_id} choice={choice:?}");
-        let sender = {
+        debug_log!("[approval] submit session={session_id} request={request_id} choice={choice:?}");
+        let (sender, always_allow_command) = {
             let runtime = self.runtime.lock().await;
             let session = runtime
                 .get(session_id)
@@ -1476,13 +1746,17 @@ impl AppState {
             if !pending.resolvable {
                 return Err("this approval request cannot be resolved from client".to_string());
             }
-            session.approval_tx.clone().ok_or_else(|| {
+            let sender = session.approval_tx.clone().ok_or_else(|| {
                 if already_resolved {
                     "approval already resolved".to_string()
                 } else {
                     "approval channel is not available".to_string()
                 }
-            })?
+            })?;
+            let command = matches!(choice, ApprovalChoice::AlwaysAllow)
+                .then(|| pending.command.clone())
+                .flatten();
+            (sender, command)
         };
 
         if sender.send(choice).is_err() {
@@ -1500,6 +1774,12 @@ impl AppState {
             if !already_resolved && still_pending {
                 return Err("failed to forward approval to provider process".to_string());
             }
+        }
+
+        if let Some(command) = always_allow_command {
+            let project_root = self.project_root_path_for_session(session_id).await?;
+            self.remember_ai_approval_rule(std::path::Path::new(&project_root), &command)
+                .await?;
         }
 
         Ok(())
@@ -1679,7 +1959,9 @@ impl AppState {
             session_id: current.session_id.clone(),
             role: current.role.clone(),
             content: provider_final.content,
-            created_at: provider_final.created_at,
+            // Never let provider clock skew move the reply before the bridge's
+            // turn anchor, while retaining provider order for multi-part replies.
+            created_at: provider_final.created_at.max(current.created_at),
         };
         let local_messages = self.messages.read().await.get(session_id).cloned()?;
         let merged = local_messages
@@ -1820,17 +2102,22 @@ impl AppState {
     }
 
     pub async fn provider_session_ref(&self, session_id: &str) -> Option<String> {
-        let runtime = self.runtime.lock().await;
-        if let Some(item) = runtime
-            .get(session_id)
-            .and_then(|item| item.provider_session_ref.clone())
+        if let Some(session_ref) = self
+            .provider_session_ref_chain(session_id)
+            .await
+            .into_iter()
+            .last()
         {
-            return Some(item);
+            return Some(session_ref);
         }
-        drop(runtime);
         let session = self.find_session(session_id).await?;
         let provider = self.provider_for_agent(session.agent)?;
         provider.default_runtime_ref(session_id).await
+    }
+
+    async fn provider_session_ref_chain(&self, session_id: &str) -> Vec<String> {
+        let runtime = self.runtime.lock().await;
+        provider_session_ref_chain_from_runtime(&runtime, session_id)
     }
 
     async fn resolve_session_id(&self, session_id: &str) -> String {
@@ -2000,7 +2287,7 @@ impl AppState {
         request_id: &str,
         choice: ApprovalChoice,
     ) {
-        eprintln!(
+        debug_log!(
             "[approval] resolved session={session_id} request={request_id} choice={choice:?}"
         );
         let preview = approval_choice_preview(&choice).to_string();
@@ -2110,10 +2397,12 @@ impl AppState {
         }
         if let Some(current) = session {
             let project_id = current.project_id.clone();
+            let summary = current.clone();
             self.sessions
                 .write()
                 .await
                 .insert(current.id.clone(), current);
+            let _ = self.persist_canonical_session(&summary).await;
             self.invalidate_list_cache().await;
             self.refresh_project_summary(&project_id).await;
         }
@@ -2151,6 +2440,7 @@ impl AppState {
             .insert(current.id.clone(), current);
         self.invalidate_list_cache().await;
         self.refresh_project_summary(&project_id).await;
+        let _ = self.persist_canonical_session(&summary).await;
         Ok(summary)
     }
 
@@ -2196,18 +2486,33 @@ impl AppState {
             .write()
             .await
             .insert(session_id.to_string(), title.to_string());
+        self.write_session_metadata().await
+    }
+
+    async fn persist_canonical_session(&self, session: &SessionSummary) -> Result<(), String> {
+        debug_assert!(self.sessions.read().await.contains_key(&session.id));
+        self.write_session_metadata().await
+    }
+
+    async fn write_session_metadata(&self) -> Result<(), String> {
         let entries = self.session_title_overrides.read().await.clone();
-        let metadata = PersistedSessionMetadata {
-            sessions: entries
-                .into_iter()
-                .map(|(session_id, title)| {
-                    (
-                        session_id,
-                        PersistedSessionMetadataEntry { title: Some(title) },
-                    )
-                })
-                .collect(),
+        let canonical_sessions = self.sessions.read().await.clone();
+        let mut metadata = PersistedSessionMetadata {
+            sessions: HashMap::new(),
+            projects: self.projects.read().await.clone(),
         };
+        for (session_id, session) in canonical_sessions {
+            metadata.sessions.insert(
+                session_id.clone(),
+                PersistedSessionMetadataEntry {
+                    title: entries.get(&session_id).cloned(),
+                    session: Some(session),
+                },
+            );
+        }
+        for (session_id, title) in entries {
+            metadata.sessions.entry(session_id).or_default().title = Some(title);
+        }
         write_persisted_session_metadata(&self.session_metadata_store_path, &metadata)
             .await
             .map_err(|error| {
@@ -2320,13 +2625,6 @@ impl AppState {
             }
         }
 
-        let local_session_ids = {
-            let sessions = self.sessions.read().await;
-            sessions
-                .keys()
-                .cloned()
-                .collect::<std::collections::HashSet<_>>()
-        };
         let runtime_refs = {
             let runtime = self.runtime.lock().await;
             runtime
@@ -2339,23 +2637,31 @@ impl AppState {
                 })
                 .collect::<HashMap<_, _>>()
         };
-        for (session_id, session_ref) in runtime_refs {
-            if session_id == session_ref {
-                continue;
-            }
-            if !local_session_ids.contains(&session_id) {
-                continue;
-            }
+        let visible_ids = merged_sessions.keys().cloned().collect::<HashSet<_>>();
+        let visible_descendants = runtime_refs
+            .iter()
+            .filter(|(source, target)| {
+                visible_ids.contains(*source) && visible_ids.contains(*target)
+            })
+            .map(|(_, target)| target.clone())
+            .collect::<HashSet<_>>();
+        let visible_roots = visible_ids
+            .iter()
+            .filter(|session_id| {
+                runtime_refs.contains_key(*session_id) && !visible_descendants.contains(*session_id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for session_id in visible_roots {
             let Some(local_session) = merged_sessions.get(&session_id).cloned() else {
                 continue;
             };
-            let Some(provider_session) = merged_sessions.remove(&session_ref) else {
-                continue;
-            };
-            merged_sessions.insert(
-                session_id,
-                Self::merge_linked_sessions(local_session, provider_session),
-            );
+            let linked_refs = provider_session_ref_chain_from_refs(&runtime_refs, &session_id);
+            let merged = linked_refs
+                .into_iter()
+                .filter_map(|session_ref| merged_sessions.remove(&session_ref))
+                .fold(local_session, Self::merge_linked_sessions);
+            merged_sessions.insert(session_id, merged);
         }
 
         let mut sessions = merged_sessions.into_values().collect::<Vec<_>>();
@@ -2412,13 +2718,14 @@ impl AppState {
         mut local_session: SessionSummary,
         provider_session: SessionSummary,
     ) -> SessionSummary {
+        let provider_is_newer = provider_session.updated_at > local_session.updated_at;
         if local_session.runtime_session_ref.is_none() {
             local_session.runtime_session_ref = provider_session.runtime_session_ref.clone();
         }
         local_session.status =
             Self::preferred_session_status(local_session.status, provider_session.status);
 
-        if provider_session.updated_at > local_session.updated_at {
+        if provider_is_newer {
             local_session.updated_at = provider_session.updated_at;
             local_session.unread_count = provider_session.unread_count;
         } else {
@@ -2434,10 +2741,15 @@ impl AppState {
             local_session.title = provider_session.title;
         }
 
-        if local_session
-            .last_message_preview
-            .as_deref()
-            .is_none_or(|preview| preview.trim().is_empty())
+        if (provider_is_newer
+            || local_session
+                .last_message_preview
+                .as_deref()
+                .is_none_or(|preview| preview.trim().is_empty()))
+            && provider_session
+                .last_message_preview
+                .as_deref()
+                .is_some_and(|preview| !preview.trim().is_empty())
         {
             local_session.last_message_preview = provider_session.last_message_preview;
         }
@@ -2741,6 +3053,14 @@ fn approval_choice_preview(choice: &ApprovalChoice) -> &'static str {
     }
 }
 
+fn always_allow_prompt_rule(command: &str) -> String {
+    let quoted_command =
+        serde_json::to_string(command).unwrap_or_else(|_| format!("\"{command}\""));
+    format!(
+        "Always allow commands that perform the same kind of operation as {quoted_command}, unless a hard safety block applies."
+    )
+}
+
 fn decorate_user_content(input: &SendMessageInput) -> String {
     match input.input_mode {
         InputMode::Text => input.content.clone(),
@@ -2809,6 +3129,14 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
     use tokio::sync::Mutex as TokioMutex;
+
+    #[test]
+    fn always_allow_rule_expands_to_similar_operations_and_keeps_hard_blocks() {
+        let rule = always_allow_prompt_rule("docker compose ps");
+        assert!(rule.contains("same kind of operation"));
+        assert!(rule.contains("docker compose ps"));
+        assert!(rule.contains("unless a hard safety block applies"));
+    }
 
     struct TestMessageProvider {
         sessions: TokioMutex<HashMap<String, SessionSummary>>,
@@ -2946,6 +3274,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_session_is_idempotent_for_client_session_id() {
+        let state = test_state("create-session-idempotent").await;
+        let project = state
+            .create_project(CreateProjectInput {
+                name: "Project".to_string(),
+                root_path: std::env::temp_dir().to_string_lossy().to_string(),
+            })
+            .await;
+        let input = CreateSessionInput {
+            client_session_id: "client-stable-session".to_string(),
+            project_id: project.id,
+            title: Some("Session".to_string()),
+            agent: AgentKind::Codex,
+            brief_reply_mode: false,
+            provider_id: None,
+            reasoning_effort: None,
+        };
+
+        let first = state.create_session(input.clone()).await.unwrap();
+        let second = state.create_session(input).await.unwrap();
+
+        assert_eq!(first.id, "client-stable-session");
+        assert_eq!(second.id, first.id);
+        assert_eq!(state.sessions.read().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn canonical_session_survives_state_reconstruction() {
+        let settings_path = test_path("canonical-restart-settings");
+        let runtime_path = test_path("canonical-restart-runtime");
+        let metadata_path = test_path("canonical-restart-metadata");
+        let state = AppState::new_with_paths(
+            settings_path.clone(),
+            runtime_path.clone(),
+            metadata_path.clone(),
+        )
+        .await;
+        let project = state
+            .create_project(CreateProjectInput {
+                name: "Project".to_string(),
+                root_path: std::env::temp_dir().to_string_lossy().to_string(),
+            })
+            .await;
+        let created = state
+            .create_session(CreateSessionInput {
+                client_session_id: "client-persisted-session".to_string(),
+                project_id: project.id,
+                title: Some("Persistent session".to_string()),
+                agent: AgentKind::Codex,
+                brief_reply_mode: false,
+                provider_id: None,
+                reasoning_effort: None,
+            })
+            .await
+            .unwrap();
+        drop(state);
+
+        let restored = AppState::new_with_paths(settings_path, runtime_path, metadata_path).await;
+        let session = restored.find_session(&created.id).await.unwrap();
+        assert_eq!(session.id, "client-persisted-session");
+        assert_eq!(session.title, "Persistent session");
+        let project_sessions = restored
+            .list_project_sessions(&created.project_id)
+            .await
+            .expect("canonical project should also be restored");
+        assert_eq!(project_sessions.len(), 1);
+        assert_eq!(project_sessions[0].id, created.id);
+    }
+
+    #[tokio::test]
     async fn list_messages_refreshes_provider_messages_even_with_cached_session_messages() {
         let now = Utc::now();
         let provider = Arc::new(TestMessageProvider::new(HashMap::new()));
@@ -2962,6 +3360,7 @@ mod tests {
             .await;
         let session = state
             .create_session(CreateSessionInput {
+                client_session_id: Uuid::new_v4().to_string(),
                 project_id: project.id,
                 title: Some("Session".to_string()),
                 agent: AgentKind::Custom,
@@ -3025,6 +3424,7 @@ mod tests {
             .await;
         let session = state
             .create_session(CreateSessionInput {
+                client_session_id: Uuid::new_v4().to_string(),
                 project_id: project.id,
                 title: Some("Session".to_string()),
                 agent: AgentKind::Custom,
@@ -3059,6 +3459,7 @@ mod tests {
             .await;
         let session = state
             .create_session(CreateSessionInput {
+                client_session_id: Uuid::new_v4().to_string(),
                 project_id: project.id,
                 title: Some("Session".to_string()),
                 agent: AgentKind::Codex,
@@ -3118,6 +3519,279 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_messages_follows_transitive_provider_session_refs() {
+        let now = Utc::now();
+        let provider = Arc::new(TestMessageProvider::new(HashMap::new()));
+        let registry = ProviderRegistry::from_map(HashMap::from([(
+            AgentKind::Codex,
+            provider.clone() as Arc<dyn AgentProvider>,
+        )]));
+        let state = test_state_with_providers("transitive-provider-history", registry).await;
+        let project = state
+            .create_project(CreateProjectInput {
+                name: "Project".to_string(),
+                root_path: std::env::temp_dir().to_string_lossy().to_string(),
+            })
+            .await;
+        let session = state
+            .create_session(CreateSessionInput {
+                client_session_id: Uuid::new_v4().to_string(),
+                project_id: project.id,
+                title: Some("Session".to_string()),
+                agent: AgentKind::Codex,
+                brief_reply_mode: false,
+                provider_id: None,
+                reasoning_effort: None,
+            })
+            .await
+            .expect("session should be created");
+
+        state
+            .set_provider_session_ref(&session.id, Some("old-thread".to_string()))
+            .await;
+        state
+            .set_provider_session_ref("old-thread", Some("goal-thread".to_string()))
+            .await;
+        provider
+            .set_messages(
+                "old-thread",
+                vec![test_message(
+                    "old-user",
+                    "old-thread",
+                    MessageRole::User,
+                    "previous history",
+                    now,
+                )],
+            )
+            .await;
+        provider
+            .set_messages(
+                "goal-thread",
+                vec![test_message(
+                    "goal-user",
+                    "goal-thread",
+                    MessageRole::User,
+                    "/goal finish task",
+                    now + chrono::TimeDelta::seconds(1),
+                )],
+            )
+            .await;
+
+        assert_eq!(
+            state.provider_session_ref(&session.id).await.as_deref(),
+            Some("goal-thread")
+        );
+        let messages = state
+            .list_messages(&session.id)
+            .await
+            .expect("messages should exist");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content, "previous history");
+        assert_eq!(messages[1].content, "/goal finish task");
+        assert!(
+            messages
+                .iter()
+                .all(|message| message.session_id == session.id)
+        );
+    }
+
+    #[test]
+    fn provider_session_ref_chain_stops_at_cycles() {
+        let refs = HashMap::from([
+            ("local".to_string(), "old-thread".to_string()),
+            ("old-thread".to_string(), "goal-thread".to_string()),
+            ("goal-thread".to_string(), "old-thread".to_string()),
+        ]);
+
+        assert_eq!(
+            provider_session_ref_chain_from_refs(&refs, "local"),
+            vec!["old-thread".to_string(), "goal-thread".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_sessions_collapses_transitive_provider_threads_into_local_session() {
+        let provider = Arc::new(TestMessageProvider::new(HashMap::new()));
+        let registry = ProviderRegistry::from_map(HashMap::from([(
+            AgentKind::Codex,
+            provider.clone() as Arc<dyn AgentProvider>,
+        )]));
+        let state = test_state_with_providers("transitive-session-list", registry).await;
+        let project = state
+            .create_project(CreateProjectInput {
+                name: "Project".to_string(),
+                root_path: std::env::temp_dir().to_string_lossy().to_string(),
+            })
+            .await;
+        let local = state
+            .create_session(CreateSessionInput {
+                client_session_id: Uuid::new_v4().to_string(),
+                project_id: project.id,
+                title: Some("Original conversation".to_string()),
+                agent: AgentKind::Codex,
+                brief_reply_mode: false,
+                provider_id: None,
+                reasoning_effort: None,
+            })
+            .await
+            .expect("session should be created");
+        let mut old_thread = local.clone();
+        old_thread.id = "old-thread".to_string();
+        old_thread.title = "Old imported thread".to_string();
+        let mut goal_thread = local.clone();
+        goal_thread.id = "goal-thread".to_string();
+        goal_thread.title = "/goal finish task".to_string();
+        goal_thread.last_message_preview = Some("/goal finish task".to_string());
+        goal_thread.updated_at += chrono::TimeDelta::seconds(2);
+        provider.set_session(old_thread).await;
+        provider.set_session(goal_thread).await;
+        state
+            .set_provider_session_ref(&local.id, Some("old-thread".to_string()))
+            .await;
+        state
+            .set_provider_session_ref("old-thread", Some("goal-thread".to_string()))
+            .await;
+
+        let sessions = state.list_sessions().await;
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions.iter().any(|session| session.id == local.id));
+        assert!(!sessions.iter().any(|session| session.id == "old-thread"));
+        assert!(!sessions.iter().any(|session| session.id == "goal-thread"));
+        assert_eq!(
+            sessions[0].last_message_preview.as_deref(),
+            Some("/goal finish task")
+        );
+    }
+
+    #[tokio::test]
+    async fn list_sessions_collapses_provider_threads_after_local_session_is_gone() {
+        let provider = Arc::new(TestMessageProvider::new(HashMap::new()));
+        let registry = ProviderRegistry::from_map(HashMap::from([(
+            AgentKind::Codex,
+            provider.clone() as Arc<dyn AgentProvider>,
+        )]));
+        let state = test_state_with_providers("archived-transitive-session-list", registry).await;
+        let project = state
+            .create_project(CreateProjectInput {
+                name: "Project".to_string(),
+                root_path: std::env::temp_dir().to_string_lossy().to_string(),
+            })
+            .await;
+        let template = state
+            .create_session(CreateSessionInput {
+                client_session_id: Uuid::new_v4().to_string(),
+                project_id: project.id,
+                title: Some("Original conversation".to_string()),
+                agent: AgentKind::Codex,
+                brief_reply_mode: false,
+                provider_id: None,
+                reasoning_effort: None,
+            })
+            .await
+            .expect("session should be created");
+        let mut old_thread = template.clone();
+        old_thread.id = "old-thread".to_string();
+        old_thread.title = "Previous conversation".to_string();
+        let mut goal_thread = template.clone();
+        goal_thread.id = "goal-thread".to_string();
+        goal_thread.title = "/goal finish task".to_string();
+        goal_thread.last_message_preview = Some("/goal finish task".to_string());
+        goal_thread.updated_at += chrono::TimeDelta::seconds(2);
+        provider.set_session(old_thread).await;
+        provider.set_session(goal_thread).await;
+        state.sessions.write().await.remove(&template.id);
+        state
+            .set_provider_session_ref(&template.id, Some("old-thread".to_string()))
+            .await;
+        state
+            .set_provider_session_ref("old-thread", Some("goal-thread".to_string()))
+            .await;
+
+        let sessions = state.list_sessions().await;
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "old-thread");
+        assert_eq!(
+            sessions[0].last_message_preview.as_deref(),
+            Some("/goal finish task")
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_interrupts_only_running_sessions_older_than_seven_days() {
+        let provider = Arc::new(TestMessageProvider::new(HashMap::new()));
+        let registry = ProviderRegistry::from_map(HashMap::from([(
+            AgentKind::Codex,
+            provider.clone() as Arc<dyn AgentProvider>,
+        )]));
+        let state = test_state_with_providers("stale-running-startup", registry).await;
+        let now = Utc::now();
+        let session = |id: &str, status: SessionStatus, updated_at| SessionSummary {
+            id: id.to_string(),
+            project_id: "project".to_string(),
+            title: id.to_string(),
+            agent: AgentKind::Codex,
+            brief_reply_mode: false,
+            status,
+            updated_at,
+            unread_count: 0,
+            last_message_preview: None,
+            pending_approval: None,
+            runtime_session_ref: Some(id.to_string()),
+            provider_id: None,
+            reasoning_effort: None,
+            model: None,
+        };
+        provider
+            .set_session(session(
+                "stale-running",
+                SessionStatus::Running,
+                now - chrono::TimeDelta::days(8),
+            ))
+            .await;
+        provider
+            .set_session(session(
+                "recent-running",
+                SessionStatus::Running,
+                now - chrono::TimeDelta::days(6),
+            ))
+            .await;
+        provider
+            .set_session(session(
+                "stale-approval",
+                SessionStatus::AwaitingApproval,
+                now - chrono::TimeDelta::days(8),
+            ))
+            .await;
+        state.invalidate_list_cache().await;
+
+        assert_eq!(state.interrupt_stale_running_sessions(now).await, 1);
+        let sessions = state
+            .list_sessions()
+            .await
+            .into_iter()
+            .map(|session| (session.id, session.status))
+            .collect::<HashMap<_, _>>();
+        assert!(matches!(
+            sessions.get("stale-running"),
+            Some(SessionStatus::Interrupted)
+        ));
+        assert!(matches!(
+            sessions.get("recent-running"),
+            Some(SessionStatus::Running)
+        ));
+        assert!(matches!(
+            sessions.get("stale-approval"),
+            Some(SessionStatus::AwaitingApproval)
+        ));
+        let persisted = load_persisted_runtime(&state.runtime_store_path).await;
+        assert!(
+            persisted
+                .get("stale-running")
+                .is_some_and(|entry| entry.interrupted)
+        );
+    }
+
+    #[tokio::test]
     async fn list_messages_deduplicates_equivalent_remote_and_local_messages() {
         let now = Utc::now();
         let provider = Arc::new(TestMessageProvider::new(HashMap::new()));
@@ -3134,6 +3808,7 @@ mod tests {
             .await;
         let session = state
             .create_session(CreateSessionInput {
+                client_session_id: Uuid::new_v4().to_string(),
                 project_id: project.id,
                 title: Some("Session".to_string()),
                 agent: AgentKind::Codex,
@@ -3222,6 +3897,7 @@ mod tests {
             .await;
         let session = state
             .create_session(CreateSessionInput {
+                client_session_id: Uuid::new_v4().to_string(),
                 project_id: project.id,
                 title: Some("Session".to_string()),
                 agent: AgentKind::Codex,
@@ -3287,6 +3963,7 @@ mod tests {
             .await;
         let session = state
             .create_session(CreateSessionInput {
+                client_session_id: Uuid::new_v4().to_string(),
                 project_id: project.id,
                 title: Some("Session".to_string()),
                 agent: AgentKind::Codex,
@@ -3361,6 +4038,7 @@ mod tests {
             .await;
         let session = state
             .create_session(CreateSessionInput {
+                client_session_id: Uuid::new_v4().to_string(),
                 project_id: project.id,
                 title: Some("Session".to_string()),
                 agent: AgentKind::Custom,
@@ -3378,6 +4056,7 @@ mod tests {
             client_message_id: Some("local-user-123".to_string()),
             provider_id: None,
             reasoning_effort: None,
+            model: None,
         };
         let (user_message, echoed_reply) = state
             .send_message(&session.id, input.clone())
@@ -3524,6 +4203,7 @@ mod tests {
             .await;
         let session = state
             .create_session(CreateSessionInput {
+                client_session_id: Uuid::new_v4().to_string(),
                 project_id: project.id,
                 title: Some("Session".to_string()),
                 agent: AgentKind::Codex,
@@ -3728,7 +4408,7 @@ mod tests {
         let state = test_state("provider-config-missing").await;
         state
             .update_bridge_settings(BridgeSettingsInput {
-                ai_approval: AiApprovalSettings::default(),
+                ai_approval: Some(AiApprovalSettings::default()),
                 model_providers: Some(vec![ModelProviderConfig {
                     id: "codex-primary".to_string(),
                     name: "Codex Primary".to_string(),
@@ -3776,6 +4456,7 @@ mod tests {
             .await;
         let session = state
             .create_session(CreateSessionInput {
+                client_session_id: Uuid::new_v4().to_string(),
                 project_id: project.id,
                 title: Some("Session".to_string()),
                 agent: AgentKind::Codex,
@@ -3820,6 +4501,7 @@ mod tests {
             .await;
         let session = state
             .create_session(CreateSessionInput {
+                client_session_id: Uuid::new_v4().to_string(),
                 project_id: project.id,
                 title: Some("Session".to_string()),
                 agent: AgentKind::Codex,
@@ -3896,6 +4578,7 @@ mod tests {
             .await;
         let session = state
             .create_session(CreateSessionInput {
+                client_session_id: Uuid::new_v4().to_string(),
                 project_id: project.id,
                 title: Some("Session".to_string()),
                 agent: AgentKind::Codex,
@@ -3979,6 +4662,7 @@ mod tests {
             .await;
         let session = state
             .create_session(CreateSessionInput {
+                client_session_id: Uuid::new_v4().to_string(),
                 project_id: project.id,
                 title: Some("Session".to_string()),
                 agent: AgentKind::Codex,
@@ -4061,6 +4745,7 @@ mod tests {
             .await;
         let session = state
             .create_session(CreateSessionInput {
+                client_session_id: Uuid::new_v4().to_string(),
                 project_id: project.id,
                 title: Some("Session".to_string()),
                 agent: AgentKind::OpenCode,
@@ -4106,6 +4791,7 @@ mod tests {
             .await;
         let session = state
             .create_session(CreateSessionInput {
+                client_session_id: Uuid::new_v4().to_string(),
                 project_id: project.id,
                 title: Some("Session".to_string()),
                 agent: AgentKind::Codex,
@@ -4151,6 +4837,7 @@ mod tests {
             .await;
         let session = state
             .create_session(CreateSessionInput {
+                client_session_id: Uuid::new_v4().to_string(),
                 project_id: project.id,
                 title: Some("Old".to_string()),
                 agent: AgentKind::Codex,
@@ -4199,6 +4886,7 @@ mod tests {
             .await;
         let session = state
             .create_session(CreateSessionInput {
+                client_session_id: Uuid::new_v4().to_string(),
                 project_id: project.id,
                 title: Some("Original".to_string()),
                 agent: AgentKind::Codex,
@@ -4247,6 +4935,7 @@ mod tests {
             .await;
         let session = state
             .create_session(CreateSessionInput {
+                client_session_id: Uuid::new_v4().to_string(),
                 project_id: project.id,
                 title: Some("Session".to_string()),
                 agent: AgentKind::Codex,
@@ -4292,6 +4981,7 @@ mod tests {
             .await;
         let session = state
             .create_session(CreateSessionInput {
+                client_session_id: Uuid::new_v4().to_string(),
                 project_id: project.id,
                 title: Some("Session".to_string()),
                 agent: AgentKind::Codex,
@@ -4341,6 +5031,7 @@ mod tests {
             .await;
         let session = state
             .create_session(CreateSessionInput {
+                client_session_id: Uuid::new_v4().to_string(),
                 project_id: project.id,
                 title: Some("Session".to_string()),
                 agent: AgentKind::Codex,
@@ -4419,6 +5110,7 @@ mod tests {
             .await;
         let session = state
             .create_session(CreateSessionInput {
+                client_session_id: Uuid::new_v4().to_string(),
                 project_id: project.id,
                 title: Some("Session".to_string()),
                 agent: AgentKind::Codex,
@@ -4454,7 +5146,7 @@ mod tests {
         let state = test_state("provider-config-auto").await;
         state
             .update_bridge_settings(BridgeSettingsInput {
-                ai_approval: AiApprovalSettings::default(),
+                ai_approval: Some(AiApprovalSettings::default()),
                 model_providers: Some(vec![
                     ModelProviderConfig {
                         id: "codex-secondary".to_string(),
@@ -4510,7 +5202,7 @@ mod tests {
         let state = test_state("provider-config-explicit").await;
         state
             .update_bridge_settings(BridgeSettingsInput {
-                ai_approval: AiApprovalSettings::default(),
+                ai_approval: Some(AiApprovalSettings::default()),
                 model_providers: Some(vec![
                     ModelProviderConfig {
                         id: "codex-primary".to_string(),

@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -14,11 +14,33 @@ pub struct AiApprovalSettings {
     pub api_key: String,
     pub model: String,
     pub max_risk: String,
+    #[serde(default)]
+    pub prompt: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProjectAiApprovalSettings {
+    #[serde(default)]
+    pub prompt: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProjectAiApprovalInput {
+    #[serde(default)]
+    pub prompt: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiApprovalPromptInput {
+    #[serde(default)]
+    pub prompt: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BridgeSettings {
     pub ai_approval: AiApprovalSettings,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub project_ai_approval: BTreeMap<String, ProjectAiApprovalSettings>,
     /// Global model provider configurations (sorted by priority)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub model_providers: Vec<ModelProviderConfig>,
@@ -29,7 +51,8 @@ pub struct BridgeSettings {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct BridgeSettingsInput {
-    pub ai_approval: AiApprovalSettings,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai_approval: Option<AiApprovalSettings>,
     /// Global model provider configurations (replaces existing list when set)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_providers: Option<Vec<ModelProviderConfig>>,
@@ -46,16 +69,17 @@ pub struct BridgeSettingsStore {
 impl Default for AiApprovalSettings {
     fn default() -> Self {
         Self {
-            enabled: env_bool("ECHO_MATE_AI_APPROVAL"),
-            base_url: std::env::var("ECHO_MATE_AI_APPROVAL_BASE_URL")
+            enabled: env_bool("OMNI_CODE_AI_APPROVAL"),
+            base_url: std::env::var("OMNI_CODE_AI_APPROVAL_BASE_URL")
                 .unwrap_or_else(|_| "https://api.openai.com/v1".to_string()),
-            api_key: std::env::var("ECHO_MATE_AI_APPROVAL_API_KEY")
+            api_key: std::env::var("OMNI_CODE_AI_APPROVAL_API_KEY")
                 .or_else(|_| std::env::var("OPENAI_API_KEY"))
                 .unwrap_or_default(),
-            model: std::env::var("ECHO_MATE_AI_APPROVAL_MODEL")
+            model: std::env::var("OMNI_CODE_AI_APPROVAL_MODEL")
                 .unwrap_or_else(|_| "gpt-4.1-mini".to_string()),
-            max_risk: std::env::var("ECHO_MATE_AI_APPROVAL_MAX_RISK")
+            max_risk: std::env::var("OMNI_CODE_AI_APPROVAL_MAX_RISK")
                 .unwrap_or_else(|_| "low".to_string()),
+            prompt: String::new(),
         }
     }
 }
@@ -64,6 +88,7 @@ impl Default for BridgeSettings {
     fn default() -> Self {
         Self {
             ai_approval: AiApprovalSettings::default(),
+            project_ai_approval: BTreeMap::new(),
             model_providers: Vec::new(),
             acp_servers: Vec::new(),
         }
@@ -162,7 +187,7 @@ pub fn validate_bridge_settings(settings: &BridgeSettings) -> Result<(), String>
 }
 
 pub fn settings_path() -> PathBuf {
-    std::env::var("ECHO_MATE_SETTINGS_PATH")
+    std::env::var("OMNI_CODE_SETTINGS_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
             default_home_dir()
@@ -385,6 +410,7 @@ mod tests {
             path: test_path("bridge-settings-update"),
             settings: tokio::sync::RwLock::new(BridgeSettings {
                 ai_approval: AiApprovalSettings::default(),
+                project_ai_approval: Default::default(),
                 model_providers: Vec::new(),
                 acp_servers: Vec::new(),
             }),
@@ -699,6 +725,7 @@ mod tests {
     fn validate_bridge_settings_accepts_acp_example_shape() {
         let settings = BridgeSettings {
             ai_approval: AiApprovalSettings::default(),
+            project_ai_approval: Default::default(),
             model_providers: Vec::new(),
             acp_servers: vec![
                 crate::models::AcpServerConfig {

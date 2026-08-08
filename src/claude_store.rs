@@ -470,7 +470,7 @@ fn file_fingerprint(path: &Path) -> Option<u64> {
 }
 
 fn claude_projects_root() -> PathBuf {
-    std::env::var("ECHO_MATE_CLAUDE_PROJECTS_DIR")
+    std::env::var("OMNI_CODE_CLAUDE_PROJECTS_DIR")
         .map(PathBuf::from)
         .or_else(|_| std::env::var("HOME").map(|home| PathBuf::from(home).join(".claude/projects")))
         .unwrap_or_else(|_| PathBuf::from(".claude/projects"))

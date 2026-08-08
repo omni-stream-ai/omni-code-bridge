@@ -25,7 +25,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use crate::{
     adapter,
     app_state::{AppState, EventReplay, SequencedSessionEvent},
-    bridge_settings::BridgeSettingsInput,
+    bridge_settings::{AiApprovalPromptInput, BridgeSettingsInput, ProjectAiApprovalInput},
     models::{
         AcpAgentDiagnosticResponse, AcpHandshakeProbe, AgentCommandForwarding, AgentCommandSummary,
         AgentCommandsSummary, AgentInstallInput, AgentKind, AgentReadiness, AgentSummary, ApiError,
@@ -52,7 +52,15 @@ pub fn router() -> Router<Arc<AppState>> {
             get(get_client_auth_request),
         )
         .route("/settings", get(get_settings).put(update_settings))
+        .route(
+            "/settings/ai-approval-prompt",
+            get(get_ai_approval_prompt).put(update_ai_approval_prompt),
+        )
         .route("/projects", get(list_projects).post(create_project))
+        .route(
+            "/projects/{id}/ai-approval",
+            get(get_project_ai_approval).put(update_project_ai_approval),
+        )
         .route("/devices/register", post(register_push_device))
         .route("/client/messages", post(trigger_client_message))
         .route("/projects/{id}/sessions", get(list_project_sessions))
@@ -366,6 +374,59 @@ async fn update_settings(
         .update_bridge_settings(input)
         .await
         .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    Ok(Json(ApiResponse { data: settings }))
+}
+
+async fn get_ai_approval_prompt(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, ApiError> {
+    authorize_request(&headers, &state).await?;
+    let prompt = state.bridge_settings().await.ai_approval.prompt;
+    Ok(Json(ApiResponse {
+        data: AiApprovalPromptInput { prompt },
+    }))
+}
+
+async fn update_ai_approval_prompt(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Json(input): Json<AiApprovalPromptInput>,
+) -> Result<impl IntoResponse, ApiError> {
+    authorize_request(&headers, &state).await?;
+    let prompt = state
+        .update_ai_approval_prompt(input.prompt)
+        .await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    Ok(Json(ApiResponse {
+        data: AiApprovalPromptInput { prompt },
+    }))
+}
+
+async fn get_project_ai_approval(
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, ApiError> {
+    authorize_request(&headers, &state).await?;
+    let settings = state
+        .project_ai_approval_settings(&id)
+        .await
+        .map_err(|error| (StatusCode::NOT_FOUND, error))?;
+    Ok(Json(ApiResponse { data: settings }))
+}
+
+async fn update_project_ai_approval(
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Json(input): Json<ProjectAiApprovalInput>,
+) -> Result<impl IntoResponse, ApiError> {
+    authorize_request(&headers, &state).await?;
+    let settings = state
+        .update_project_ai_approval_settings(&id, input)
+        .await
+        .map_err(|error| (StatusCode::NOT_FOUND, error))?;
     Ok(Json(ApiResponse { data: settings }))
 }
 
@@ -1059,13 +1120,19 @@ fn agent_commands_summary(kind: AgentKind) -> AgentCommandsSummary {
             AgentCommandSummary {
                 name: "/goal".to_string(),
                 args_hint: Some("<objective>".to_string()),
-                description: "Set the current thread goal".to_string(),
+                description: "Set and run a goal with automatic continuation".to_string(),
                 forwarding: AgentCommandForwarding::Native,
             },
             AgentCommandSummary {
                 name: "/clear-goal".to_string(),
                 args_hint: None,
                 description: "Clear the current thread goal".to_string(),
+                forwarding: AgentCommandForwarding::Native,
+            },
+            AgentCommandSummary {
+                name: "/model".to_string(),
+                args_hint: Some("<model-id>".to_string()),
+                description: "Switch the active model for this thread".to_string(),
                 forwarding: AgentCommandForwarding::Native,
             },
         ],
@@ -2175,6 +2242,12 @@ for line in sys.stdin:
                 .any(|command| command.name == "/compact")
         );
         assert!(codex.commands.iter().any(|command| command.name == "/goal"));
+        assert!(
+            codex
+                .commands
+                .iter()
+                .any(|command| command.name == "/model")
+        );
 
         let claude = agent_commands_summary(AgentKind::ClaudeCode);
         assert!(
@@ -2529,7 +2602,7 @@ for line in sys.stdin:
         let state = test_state("acp-summary-generic-http").await;
         state
             .update_bridge_settings(BridgeSettingsInput {
-                ai_approval: AiApprovalSettings::default(),
+                ai_approval: Some(AiApprovalSettings::default()),
                 model_providers: None,
                 acp_servers: Some(vec![AcpServerConfig {
                     id: "generic-acp".to_string(),
@@ -2586,7 +2659,7 @@ for line in sys.stdin:
         let state = test_state("acp-summary-priority").await;
         state
             .update_bridge_settings(BridgeSettingsInput {
-                ai_approval: AiApprovalSettings::default(),
+                ai_approval: Some(AiApprovalSettings::default()),
                 model_providers: None,
                 acp_servers: Some(vec![
                     AcpServerConfig {
@@ -2657,7 +2730,7 @@ for line in sys.stdin:
         let state = test_state("acp-diagnostic-endpoint").await;
         state
             .update_bridge_settings(BridgeSettingsInput {
-                ai_approval: AiApprovalSettings::default(),
+                ai_approval: Some(AiApprovalSettings::default()),
                 model_providers: None,
                 acp_servers: Some(vec![AcpServerConfig {
                     id: "generic-acp".to_string(),
@@ -2747,7 +2820,7 @@ for line in sys.stdin:
         let state = test_state("acp-diagnostic-provider-id").await;
         state
             .update_bridge_settings(BridgeSettingsInput {
-                ai_approval: AiApprovalSettings::default(),
+                ai_approval: Some(AiApprovalSettings::default()),
                 model_providers: None,
                 acp_servers: Some(vec![
                     AcpServerConfig {
@@ -2846,7 +2919,7 @@ for line in sys.stdin:
         let state = test_state("acp-diagnostic-missing-provider").await;
         state
             .update_bridge_settings(BridgeSettingsInput {
-                ai_approval: AiApprovalSettings::default(),
+                ai_approval: Some(AiApprovalSettings::default()),
                 model_providers: None,
                 acp_servers: Some(vec![AcpServerConfig {
                     id: "generic-primary".to_string(),
@@ -2896,7 +2969,7 @@ for line in sys.stdin:
         let state = test_state("acp-diagnostic-all").await;
         state
             .update_bridge_settings(BridgeSettingsInput {
-                ai_approval: AiApprovalSettings::default(),
+                ai_approval: Some(AiApprovalSettings::default()),
                 model_providers: None,
                 acp_servers: Some(vec![
                     AcpServerConfig {
@@ -2974,7 +3047,7 @@ for line in sys.stdin:
         let state = test_state("acp-diagnostic-conflict").await;
         state
             .update_bridge_settings(BridgeSettingsInput {
-                ai_approval: AiApprovalSettings::default(),
+                ai_approval: Some(AiApprovalSettings::default()),
                 model_providers: None,
                 acp_servers: Some(vec![AcpServerConfig {
                     id: "generic-primary".to_string(),
@@ -3070,7 +3143,7 @@ for line in sys.stdin:
         let state = test_state("acp-diagnostic-generic-probe").await;
         state
             .update_bridge_settings(BridgeSettingsInput {
-                ai_approval: AiApprovalSettings::default(),
+                ai_approval: Some(AiApprovalSettings::default()),
                 model_providers: None,
                 acp_servers: Some(vec![AcpServerConfig {
                     id: "generic-acp".to_string(),
@@ -3177,7 +3250,7 @@ data: {\"type\":\"done\"}\n\n",
         let state = test_state("acp-diagnostic-generic-sse-probe").await;
         state
             .update_bridge_settings(BridgeSettingsInput {
-                ai_approval: AiApprovalSettings::default(),
+                ai_approval: Some(AiApprovalSettings::default()),
                 model_providers: None,
                 acp_servers: Some(vec![AcpServerConfig {
                     id: "generic-acp-sse".to_string(),
@@ -3252,7 +3325,7 @@ data: {\"type\":\"done\"}\n\n",
         let script = mock_kiro_acp_script_path();
         state
             .update_bridge_settings(BridgeSettingsInput {
-                ai_approval: AiApprovalSettings::default(),
+                ai_approval: Some(AiApprovalSettings::default()),
                 model_providers: None,
                 acp_servers: Some(vec![AcpServerConfig {
                     id: "kiro-mock".to_string(),

@@ -53,7 +53,7 @@ The bridge listens on `http://127.0.0.1:8787` by default.
 - Agent CLIs: `codex`, `claude`, `opencode`, or `kiro-cli`
 - A local checkout of [omni-code](https://github.com/omni-stream-ai/omni-code) if you want the built-in APK update manifest endpoints to serve a local Android build
 
-Agent binary paths can be overridden with `ECHO_MATE_CODEX_BIN` and `ECHO_MATE_OPENCODE_BIN`.
+Agent binary paths can be overridden with `OMNI_CODE_CODEX_BIN` and `OMNI_CODE_OPENCODE_BIN`.
 
 ## HTTP API
 
@@ -80,6 +80,8 @@ segment counts as one even when it contains multiple `assistant`/`system` messag
 
 Session creation (`POST /sessions`), session update (`PATCH /sessions/{id}`), and message send
 (`POST /sessions/{id}/messages`) all accept `provider_id`.
+Session creation requires a client-generated `client_session_id`. The bridge uses it as the
+canonical session ID and as the idempotency key for repeated create requests.
 
 - Omit `provider_id` to skip bridge-side provider resolution entirely
 - Set `provider_id` to `"AUTO"` to auto-select from project-level or global providers by priority
@@ -373,7 +375,7 @@ cargo run -- settings-validate --path config/settings.acp.example.json
 ```
 
 If `--path` is omitted, the command validates the resolved default settings path
-(`~/.omni-code/settings.json`, or `ECHO_MATE_SETTINGS_PATH` when set).
+(`~/.omni-code/settings.json`, or `OMNI_CODE_SETTINGS_PATH` when set).
 The production server startup path now uses the same strict settings parsing and validation rules,
 so invalid settings fail fast instead of silently falling back to defaults.
 
