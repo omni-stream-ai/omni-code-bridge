@@ -53,7 +53,7 @@ cargo run
 - Agent CLI：`codex`、`claude`、`opencode` 或 `kiro-cli`
 - 本地检出 [omni-code](https://github.com/omni-stream-ai/omni-code)，用于桥接服务提供内置 APK 更新接口
 
-Agent 二进制路径可以通过 `ECHO_MATE_CODEX_BIN` 和 `ECHO_MATE_OPENCODE_BIN` 覆盖。
+Agent 二进制路径可以通过 `OMNI_CODE_CODEX_BIN` 和 `OMNI_CODE_OPENCODE_BIN` 覆盖。
 
 ## HTTP API
 
@@ -66,15 +66,6 @@ Agent 二进制路径可以通过 `ECHO_MATE_CODEX_BIN` 和 `ECHO_MATE_OPENCODE_
 | `GET /sessions/{id}/messages` | 列出会话消息；支持 `limit`、`before_id`、`after_id` |
 | `GET /app-update/manifest` | APK 更新 manifest |
 | `GET /app-update/apk` | 下载最新 APK |
-| `GET /speech`, `GET /speech/models` | 本地语音模型管理 |
-| `POST /speech/models/downloads` | 下载语音模型 |
-| `GET /speech/models/downloads/{task_id}` | 轮询下载状态 |
-| `GET/PUT /speech/profiles/{profile}/model` | 绑定模型到 profile |
-| `GET /speech/realtime` | 实时语音 descriptor |
-| `GET /speech/realtime/ws` | Websocket 实时/通话模式语音 |
-| `GET /v1/models` | OpenAI 兼容模型列表 |
-| `POST /v1/audio/transcriptions` | OpenAI 兼容 ASR |
-| `POST /v1/audio/speech` | OpenAI 兼容 TTS |
 
 `GET /sessions/{id}/messages` 按存储顺序返回消息。未传 cursor 时返回最新一页：
 `limit` 默认 `50`，并限制在 `1..=200`，因此正在生成中的 assistant 回复会保留在默认页。
@@ -89,6 +80,8 @@ Agent 二进制路径可以通过 `ECHO_MATE_CODEX_BIN` 和 `ECHO_MATE_OPENCODE_
 
 创建会话（`POST /sessions`）、更新会话（`PATCH /sessions/{id}`）和发送消息
 （`POST /sessions/{id}/messages`）都支持 `provider_id`。
+创建会话必须提供客户端生成的 `client_session_id`。Bridge 会将其作为 canonical 会话 ID，
+重复创建请求也使用它进行幂等处理。
 
 - 不传 `provider_id`：完全跳过 bridge 侧 provider 解析
 - `provider_id: "AUTO"`：按优先级从项目级或全局 provider 自动选择
@@ -127,21 +120,23 @@ Agent 二进制路径可以通过 `ECHO_MATE_CODEX_BIN` 和 `ECHO_MATE_OPENCODE_
 [`config/settings.acp.example.json`](config/settings.acp.example.json)
 拷贝一份，再按本地环境做修改。
 
-当前 bridge 支持两个 ACP profile：
+当前 bridge 支持这些 ACP profile：
 
-- `kiro`：通过 `kiro-cli acp` 走本地 `stdio + JSON-RPC`
+- `stdio`：本地 ACP `stdio + JSON-RPC` runtime，例如 `kiro-cli acp` 或其他 ACP 兼容 CLI 命令
+- `kiro`：旧版 Kiro 专用 stdio profile 的兼容别名
 - `generic_http`：实验性的 HTTP/SSE ACP endpoint 兼容模式
 
-使用 `kiro` profile 前，请先确认已经安装并登录 `kiro-cli`：
+通过 `stdio` 或 `kiro` 使用 Kiro 前，请先确认已经安装并登录 `kiro-cli`：
 
 ```bash
 kiro-cli login
 ```
 
 对于 `AgentKind::Acp`，可以把 `provider_id` 设为某个 `acp_servers[].id`，也可以传 `"AUTO"`
-按优先级自动选择启用中的 ACP server。
+按优先级自动选择启用中的 ACP server。Codex 和 OpenCode ACP 应该作为这里的 ACP stdio
+server 来验证；bridge 不需要为了这个再走单独的 Codex/OpenCode 接入路径。
 
-Kiro ACP 配置示例：
+stdio ACP 配置示例：
 
 ```json
 {
@@ -157,7 +152,7 @@ Kiro ACP 配置示例：
     {
       "id": "kiro-local",
       "name": "Kiro Local ACP",
-      "profile": "kiro",
+      "profile": "stdio",
       "command": "kiro-cli",
       "args": ["acp"],
       "default_model": "claude-sonnet-4",
@@ -165,10 +160,36 @@ Kiro ACP 配置示例：
       "priority": 0,
       "headers": [],
       "env": []
+    },
+    {
+      "id": "opencode-acp",
+      "name": "OpenCode ACP",
+      "profile": "stdio",
+      "command": "opencode",
+      "args": ["acp"],
+      "enabled": false,
+      "priority": 20,
+      "headers": [],
+      "env": []
+    },
+    {
+      "id": "codex-acp",
+      "name": "Codex ACP",
+      "profile": "stdio",
+      "command": "codex",
+      "args": ["acp"],
+      "enabled": false,
+      "priority": 30,
+      "headers": [],
+      "env": []
     }
   ]
 }
 ```
+
+请按本机实际 ACP runtime 调整 `command` 和 `args`。可以先保留 disabled 验证模板，再用
+`GET /agents/acp/diagnostic?provider_id=<id>&probe=true&refresh=true` 定向探测，确认后再按
+priority 启用。
 
 generic HTTP ACP 配置示例：
 
@@ -205,7 +226,7 @@ generic HTTP ACP 配置示例：
 ```json
 {
   "project_id": "my-project",
-  "title": "Try Kiro ACP",
+  "title": "Try ACP",
   "agent": "acp",
   "provider_id": "kiro-local"
 }
@@ -229,7 +250,8 @@ generic HTTP ACP 配置示例：
 
 `GET /agents` 现在除了报告 binary 是否存在，也会返回结构化的 readiness 状态。对于
 Kiro 型 ACP，如果 `kiro-cli` 已安装但还没有完成 `kiro-cli login`，`readiness` 会变成
-`attention_required`，同时 `readiness_message` 会直接提示下一步动作。ACP 条目还会带上
+`attention_required`，同时 `readiness_message` 会直接提示下一步动作。通用 `stdio` 条目只
+检查配置的 command 是否存在；真实 ACP 握手请用 `?probe=true`。ACP 条目还会带上
 `acp_diagnostic`，描述当前实际会选中的 enabled server，包括它的 `server_id`、名称、
 `profile`、`command`/`args` 或 `endpoint`、auth/model/header/env 摘要，以及当前启用了
 多少个 ACP server。
@@ -241,21 +263,18 @@ Kiro 型 ACP，如果 `kiro-cli` 已安装但还没有完成 `kiro-cli login`，
 `?provider_id=<acp_server_id>` 来定向诊断某个已配置的 ACP server，包括低优先级或
 disabled 的条目。不传时，响应会自动回填最终命中的 `provider_id`。如果需要批量排查，
 可以传 `?all=true` 一次返回所有已配置 ACP server 的诊断结果。如果需要一次最小真实运行
-探测，可以传 `?probe=true`，响应里会多出 `handshake_probe`。当前它会对 Kiro 型 ACP
-执行一次实时的 `initialize -> session/new -> session/prompt` 最小 probe turn 检查；对
-`generic_http` 则会执行一次真实的 turn-creation `POST` 探测。probe 结果里现在还会带上
-`mode` 和 `stage`，方便客户端区分“完整 stdio probe turn”与“尽力模拟真实 turn 请求的
-HTTP 探测”。需要注意的是，
-`generic_http` 的 probe 现在会沿用真实运行链路的候选 turn URL 去发请求，但它仍然是
-轻量健康检查；它现在既能验证 JSON 响应，也能验证 SSE 流式 turn 响应，但仍不代表完整
-ACP 对话已经端到端验证通过。
-对于 `generic_http`，诊断结果现在还会直接带上 `turn_url_candidates`、
-`approval_reply_url_templates`、`cancel_url_templates`，方便排障时直接确认 bridge 真实会
-尝试哪些 URL 模板，而不需要再翻源码。
-如果传了 `provider_id` 但 settings 里没有对应 ACP server，接口会直接返回
-`400 Bad Request`。批量结果里还会带上 `is_default_selected`，方便客户端判断当前默认会
-选中哪条 ACP 配置。`all=true` 和 `provider_id` 互斥，同时使用时也会返回
-`400 Bad Request`。
+探测，可以传 `?probe=true`，响应里会多出 `handshake_probe`。当前它会对 `stdio`/`kiro`
+ACP 执行一次实时的 `initialize -> session/new -> session/prompt` 最小 probe turn 检查；对
+`generic_http` 则会执行一次真实的 turn-creation `POST` 探测。probe 结果里会带上 `mode`
+和 `stage`，方便客户端区分“完整 stdio probe turn”与“尽力模拟真实 turn 请求的 HTTP 探测”。
+需要注意的是，`generic_http` 的 probe 会沿用真实运行链路的候选 turn URL 去发请求，但它
+仍然是轻量健康检查；它既能验证 JSON 响应，也能验证 SSE 流式 turn 响应，但仍不代表完整
+ACP 对话已经端到端验证通过。对于 `generic_http`，诊断结果还会直接带上
+`turn_url_candidates`、`approval_reply_url_templates`、`cancel_url_templates`，方便排障时
+直接确认 bridge 真实会尝试哪些 URL 模板，而不需要再翻源码。如果传了 `provider_id` 但
+settings 里没有对应 ACP server，接口会直接返回 `400 Bad Request`。批量结果里还会带上
+`is_default_selected`，方便客户端判断当前默认会选中哪条 ACP 配置。`all=true` 和
+`provider_id` 互斥，同时使用时也会返回 `400 Bad Request`。
 
 ### 思考等级
 
@@ -268,110 +287,6 @@ ACP 对话已经端到端验证通过。
 
 Codex 会收到 `model_reasoning_effort`，Claude Code 会收到 `--effort`。OpenCode 当前会忽略
 这个字段，因为 bridge 使用的 headless prompt API 还没有暴露对应选项。
-
-## 本地语音接口
-
-桥接服务现在可以通过 `sherpa-onnx` 跑本地 ASR 和 TTS，并提供两层 API：
-
-- `/speech/*` 模型管理接口，供客户端列出、下载、查看、选择本地语音模型
-- `/v1/*` OpenAI 兼容接口，供客户端复用标准音频请求流程
-
-当前内置模型目录包括：
-
-- 批量转写 ASR：`sensevoice-small-int8`
-- 实时/通话模式 ASR 候选：`streaming-paraformer-zh-en`、`funasr-streaming-paraformer-zh-yue-en`
-- TTS：`vits-melo-tts-zh-en`、`kokoro-int8-multi-lang-v1_1`
-- VAD：`silero-vad`
-
-`GET /speech/models` 会返回客户端可直接用于过滤的信息，包括：
-
-- `kind`、`runtime`、`backend`
-- `capabilities`，例如 `streaming`、`batch_asr`、`realtime_asr`、`speech_synthesis`、`vad`
-- `features`、`languages`、`download_size_mb`、`memory_hint`、`notes`
-- `sample_rate_hz`、`default_voice`、`voices`，用于客户端 TTS 参数设置
-  目前本地 TTS 的 `voice` 仍使用数字 speaker ID。`vits-melo-tts-zh-en` 只有 `0` 这一个音色，
-  `kokoro-int8-multi-lang-v1_1` 则会暴露多个 speaker。
-- `supports_profiles`、`recommended_profiles`、`selected_by`
-
-### 推荐接入流程
-
-1. 调用 `GET /speech/models`
-2. 选择兼容模型并通过 `POST /speech/models/downloads` 发起下载
-3. 轮询 `GET /speech/models/downloads/{task_id}` 直到 `completed`
-4. 通过 `PUT /speech/profiles/{profile}/model` 把已安装模型绑定到 profile
-5. 调用 `/v1/audio/transcriptions` 或 `/v1/audio/speech`
-
-Speech profile 绑定默认持久化保存到 `~/.omni-code/settings.json`。可以通过
-`ECHO_MATE_SETTINGS_PATH` 覆盖设置文件位置。
-TTS 音色通过 `GET/PUT /speech/models/{model_id}/voice` 按模型保存，因此在单音色和多音色
-TTS 模型之间切换时不会复用不兼容的 voice。
-
-### OpenAI 兼容语音行为
-
-- `GET /v1/models` 只返回已经安装且可被 OpenAI 兼容音频接口使用的本地模型
-- `POST /v1/audio/transcriptions` 接收标准 multipart 字段，例如 `file`、`model`、`language`、`prompt`、`response_format`、`timestamp_granularities[]`
-- `POST /v1/audio/speech` 接收 OpenAI 风格 JSON，包括 `model`、`input`、`voice`、`response_format`、`speed`
-- 两个 `/v1/audio/*` 接口里的 `model` 都是可选的；如果不传，会回退到当前已选择的 speech profile 模型
-
-当前兼容限制：
-
-- `/v1/audio/transcriptions` 支持 `response_format=json|text|verbose_json`
-- `/v1/audio/transcriptions` 暂不支持 `stream=true`
-- `/v1/audio/transcriptions` 目前只支持 `timestamp_granularities[]=segment`，不支持 `word`
-- `/v1/audio/speech` 目前只支持 `response_format=wav`
-- `/v1/audio/speech` 暂不支持 `instructions`
-
-## 实时语音接口
-
-实时语音接口和 `/v1/audio/*` 分开提供，因为它面向后续通话模式，而不是批量推理兼容层。
-
-- `GET /speech/realtime` 返回 websocket descriptor、音频要求、默认 profile 绑定、命令名和事件名
-- `GET /speech/realtime/ws` 升级为 websocket 会话
-- Websocket 鉴权和其他受保护接口一致：
-  `Authorization: Bearer <token>` 和 `x-omni-code-client-id: <client_id>`
-
-### 实时协议约束
-
-- 客户端通过 websocket binary frame 发送原始 `pcm_s16le`
-- 采样率固定为 `16000`
-- 声道支持 `1` 或 `2`；服务端会把双声道下混为单声道
-- `session.update` 可覆盖 `asr_model`、`vad_model`、`channels`、`sample_rate_hz`、`enable_vad`
-- `input_audio_buffer.commit` 用于提交并冲刷当前话语
-- `input_audio_buffer.clear` 用于清空当前话语状态
-
-### 服务端事件
-
-- `session.created`
-- `session.updated`
-- `input_audio_buffer.committed`
-- `input_audio_buffer.cleared`
-- `input_audio_buffer.speech_started`
-- `input_audio_buffer.speech_stopped`
-- `response.audio_transcript.delta`
-- `response.audio_transcript.completed`
-- `error`
-
-### 客户端模型过滤
-
-- 先调用 `GET /speech/models`
-- 保留 `installed == true` 的模型
-- 实时 ASR 用 `capabilities.realtime_asr == true` 过滤
-- VAD 用 `capabilities.vad == true` 过滤
-
-`session.update` 示例：
-
-```json
-{
-  "type": "session.update",
-  "session": {
-    "asr_model": "funasr-streaming-paraformer-zh-yue-en",
-    "vad_model": "silero-vad",
-    "sample_rate_hz": 16000,
-    "channels": 1,
-    "enable_vad": true
-  }
-}
-```
 
 ## 客户端授权
 
@@ -456,7 +371,7 @@ cargo run -- settings-validate --path config/settings.acp.example.json
 ```
 
 如果省略 `--path`，命令会校验当前解析出的默认 settings 路径
-（`~/.omni-code/settings.json`，或者你通过 `ECHO_MATE_SETTINGS_PATH` 指定的路径）。
+（`~/.omni-code/settings.json`，或者你通过 `OMNI_CODE_SETTINGS_PATH` 指定的路径）。
 现在生产服务启动路径也会使用同样严格的 settings 解析与校验规则；如果配置文件非法，
 服务会直接 fail fast，而不会再静默回退到默认配置。
 
@@ -470,48 +385,6 @@ omni-code-bridge session-trace --session "<会话 id 或标题>" --limit 10
 ```
 
 `--session` 支持会话 id、标题精确匹配，或标题模糊匹配。`--limit` 可选，默认是 `5`。
-
-### 语音烟测脚本
-
-仓库里现在提供了一套本地端到端语音烟测脚本：
-
-```bash
-scripts/speech-smoke.sh --keep-artifacts
-```
-
-这套脚本会：
-
-- 检查 `GET /health`
-- 在没有提供 `BRIDGE_CLIENT_ID` 和 `BRIDGE_TOKEN` 时，自动申请并批准本机 client auth
-- 通过 `/speech/models/downloads` 下载缺失的 ASR/TTS 模型
-- 绑定 `asr.batch` 和 `tts.default`
-- 通过 `/v1/audio/speech` 合成一段 wav
-- 再通过 `/v1/audio/transcriptions` 用 profile 回退和显式模型两种方式转写这段 wav
-
-常用选项：
-
-| 选项 | 说明 |
-| --- | --- |
-| `--with-call-models` | 额外安装并绑定 `asr.realtime` 和 `vad.default` |
-| `--with-realtime` | 额外执行 websocket realtime ASR 烟测 example |
-| `--skip-download` | 如果模型未安装则直接失败 |
-| `--output-dir DIR` | 把生成的产物固定写到指定目录 |
-| `--no-auto-auth` | 强制要求先提供现成的 `BRIDGE_CLIENT_ID` 和 `BRIDGE_TOKEN` |
-
-脚本依赖 `curl` 和 `jq`。
-
-另外还提供了一个 realtime websocket 烟测 example：
-
-```bash
-cargo run --example speech_realtime_smoke -- \
-  --bridge-url http://127.0.0.1:8787 \
-  --client-id "$BRIDGE_CLIENT_ID" \
-  --token "$BRIDGE_TOKEN" \
-  --wav /tmp/omni-code-bridge-speech-smoke-12345/tts.wav
-```
-
-这个 example 会读取本地 wav，重采样到 `16 kHz`，流式发送到
-`/speech/realtime/ws`，并打印收到的 realtime 事件和最终转写结果。
 
 ### ACP Smoke Test
 

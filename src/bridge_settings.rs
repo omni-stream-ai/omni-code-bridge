@@ -1,13 +1,10 @@
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-use crate::models::{
-    AcpServerConfig, ModelProviderConfig, SpeakerFilterSettings, SpeechProfileSelection,
-    SpeechVoiceSelection,
-};
+use crate::models::{AcpServerConfig, ModelProviderConfig};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiApprovalSettings {
@@ -17,40 +14,51 @@ pub struct AiApprovalSettings {
     pub api_key: String,
     pub model: String,
     pub max_risk: String,
+    #[serde(default)]
+    pub prompt: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProjectAiApprovalSettings {
+    #[serde(default)]
+    pub prompt: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProjectAiApprovalInput {
+    #[serde(default)]
+    pub prompt: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiApprovalPromptInput {
+    #[serde(default)]
+    pub prompt: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BridgeSettings {
     pub ai_approval: AiApprovalSettings,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub project_ai_approval: BTreeMap<String, ProjectAiApprovalSettings>,
     /// Global model provider configurations (sorted by priority)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub model_providers: Vec<ModelProviderConfig>,
     /// Experimental ACP agent server configurations (sorted by priority)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub acp_servers: Vec<AcpServerConfig>,
-    #[serde(default)]
-    pub speech_profiles: SpeechProfileSelection,
-    #[serde(default)]
-    pub speech_voices: SpeechVoiceSelection,
-    #[serde(default)]
-    pub speaker_filter: SpeakerFilterSettings,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct BridgeSettingsInput {
-    pub ai_approval: AiApprovalSettings,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai_approval: Option<AiApprovalSettings>,
     /// Global model provider configurations (replaces existing list when set)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_providers: Option<Vec<ModelProviderConfig>>,
     /// ACP agent server configurations (replaces existing list when set)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acp_servers: Option<Vec<AcpServerConfig>>,
-    #[serde(default)]
-    pub speech_profiles: Option<SpeechProfileSelection>,
-    #[serde(default)]
-    pub speech_voices: Option<SpeechVoiceSelection>,
-    #[serde(default)]
-    pub speaker_filter: Option<SpeakerFilterSettings>,
 }
 
 pub struct BridgeSettingsStore {
@@ -61,16 +69,17 @@ pub struct BridgeSettingsStore {
 impl Default for AiApprovalSettings {
     fn default() -> Self {
         Self {
-            enabled: env_bool("ECHO_MATE_AI_APPROVAL"),
-            base_url: std::env::var("ECHO_MATE_AI_APPROVAL_BASE_URL")
+            enabled: env_bool("OMNI_CODE_AI_APPROVAL"),
+            base_url: std::env::var("OMNI_CODE_AI_APPROVAL_BASE_URL")
                 .unwrap_or_else(|_| "https://api.openai.com/v1".to_string()),
-            api_key: std::env::var("ECHO_MATE_AI_APPROVAL_API_KEY")
+            api_key: std::env::var("OMNI_CODE_AI_APPROVAL_API_KEY")
                 .or_else(|_| std::env::var("OPENAI_API_KEY"))
                 .unwrap_or_default(),
-            model: std::env::var("ECHO_MATE_AI_APPROVAL_MODEL")
+            model: std::env::var("OMNI_CODE_AI_APPROVAL_MODEL")
                 .unwrap_or_else(|_| "gpt-4.1-mini".to_string()),
-            max_risk: std::env::var("ECHO_MATE_AI_APPROVAL_MAX_RISK")
+            max_risk: std::env::var("OMNI_CODE_AI_APPROVAL_MAX_RISK")
                 .unwrap_or_else(|_| "low".to_string()),
+            prompt: String::new(),
         }
     }
 }
@@ -79,11 +88,9 @@ impl Default for BridgeSettings {
     fn default() -> Self {
         Self {
             ai_approval: AiApprovalSettings::default(),
+            project_ai_approval: BTreeMap::new(),
             model_providers: Vec::new(),
             acp_servers: Vec::new(),
-            speech_profiles: SpeechProfileSelection::default(),
-            speech_voices: SpeechVoiceSelection::default(),
-            speaker_filter: SpeakerFilterSettings::default(),
         }
     }
 }
@@ -111,8 +118,26 @@ impl BridgeSettingsStore {
     }
 
     pub async fn load_from_path_strict(path: PathBuf) -> Result<Self> {
-        let settings = load_settings_from_path(&path).await?;
-        validate_bridge_settings(&settings).map_err(anyhow::Error::msg)?;
+        let settings = match tokio::fs::read_to_string(&path).await {
+            Ok(body) => {
+                let settings =
+                    serde_json::from_str::<BridgeSettings>(&body).with_context(|| {
+                        format!("failed to parse bridge settings at {}", path.display())
+                    })?;
+                validate_bridge_settings(&settings).map_err(anyhow::Error::msg)?;
+                settings
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let settings = BridgeSettings::default();
+                write_settings(&path, &settings).await?;
+                settings
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to read bridge settings: {}", path.display())
+                });
+            }
+        };
         Ok(Self {
             path,
             settings: RwLock::new(settings),
@@ -162,7 +187,7 @@ pub fn validate_bridge_settings(settings: &BridgeSettings) -> Result<(), String>
 }
 
 pub fn settings_path() -> PathBuf {
-    std::env::var("ECHO_MATE_SETTINGS_PATH")
+    std::env::var("OMNI_CODE_SETTINGS_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
             default_home_dir()
@@ -248,17 +273,19 @@ pub fn validate_acp_servers(servers: &[AcpServerConfig]) -> Result<(), String> {
             .filter(|command| !command.is_empty())
             .is_some();
         match server.profile {
-            crate::models::AcpProfile::Kiro => {
+            crate::models::AcpProfile::Stdio => {
                 if !has_command {
                     return Err(format!(
-                        "ACP server {} with profile `kiro` must configure command",
-                        server.id
+                        "ACP server {} with profile `{}` must configure command",
+                        server.id,
+                        acp_profile_name(server.profile)
                     ));
                 }
                 if has_endpoint {
                     return Err(format!(
-                        "ACP server {} with profile `kiro` must not configure endpoint",
-                        server.id
+                        "ACP server {} with profile `{}` must not configure endpoint",
+                        server.id,
+                        acp_profile_name(server.profile)
                     ));
                 }
             }
@@ -319,6 +346,13 @@ pub fn validate_acp_servers(servers: &[AcpServerConfig]) -> Result<(), String> {
     Ok(())
 }
 
+fn acp_profile_name(profile: crate::models::AcpProfile) -> &'static str {
+    match profile {
+        crate::models::AcpProfile::Stdio => "stdio",
+        crate::models::AcpProfile::GenericHttp => "generic_http",
+    }
+}
+
 fn default_home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
@@ -346,9 +380,8 @@ fn env_bool(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        AiApprovalSettings, BridgeSettings, BridgeSettingsInput, BridgeSettingsStore,
-        ModelProviderConfig, default_home_dir, validate_acp_servers, validate_bridge_settings,
-        validate_model_providers,
+        AiApprovalSettings, BridgeSettings, BridgeSettingsStore, ModelProviderConfig,
+        default_home_dir, validate_acp_servers, validate_bridge_settings, validate_model_providers,
     };
     use std::{
         path::PathBuf,
@@ -371,65 +404,27 @@ mod tests {
         assert_eq!(default_home_dir(), expected);
     }
 
-    #[test]
-    fn settings_input_preserves_missing_speech_settings_as_none() {
-        let input: BridgeSettingsInput = serde_json::from_str(
-            r#"{
-                "ai_approval": {
-                    "enabled": true,
-                    "base_url": "https://example.test/v1",
-                    "model": "review-model",
-                    "max_risk": "medium"
-                }
-            }"#,
-        )
-        .unwrap();
-
-        assert!(input.speech_profiles.is_none());
-        assert!(input.speech_voices.is_none());
-    }
-
     #[tokio::test]
     async fn update_persists_mutated_settings() {
         let store = BridgeSettingsStore {
             path: test_path("bridge-settings-update"),
             settings: tokio::sync::RwLock::new(BridgeSettings {
                 ai_approval: AiApprovalSettings::default(),
+                project_ai_approval: Default::default(),
                 model_providers: Vec::new(),
                 acp_servers: Vec::new(),
-                speech_profiles: Default::default(),
-                speech_voices: Default::default(),
-                speaker_filter: Default::default(),
             }),
         };
 
         let updated = store
-            .update(|settings| {
-                settings.speech_profiles.tts_default = Some("kokoro-int8-multi-lang-v1_1".into());
-                settings
-                    .speech_voices
-                    .tts_by_model
-                    .insert("kokoro-int8-multi-lang-v1_1".into(), "48".into());
-            })
+            .update(|settings| settings.ai_approval.enabled = true)
             .await
             .unwrap();
 
-        assert_eq!(
-            updated.speech_profiles.tts_default.as_deref(),
-            Some("kokoro-int8-multi-lang-v1_1")
-        );
-        assert_eq!(
-            updated
-                .speech_voices
-                .tts_by_model
-                .get("kokoro-int8-multi-lang-v1_1")
-                .map(String::as_str),
-            Some("48")
-        );
+        assert!(updated.ai_approval.enabled);
 
         let body = tokio::fs::read_to_string(&store.path).await.unwrap();
-        assert!(body.contains("kokoro-int8-multi-lang-v1_1"));
-        assert!(body.contains("\"48\""));
+        assert!(body.contains("\"enabled\": true"));
         let _ = tokio::fs::remove_file(&store.path).await;
     }
 
@@ -439,6 +434,42 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("omni-code-bridge-{prefix}-{unique}.json"))
+    }
+
+    #[tokio::test]
+    async fn load_from_path_strict_creates_defaults_when_missing() {
+        let path = test_path("strict-missing-settings");
+        tokio::fs::remove_file(&path).await.ok();
+
+        let store = super::BridgeSettingsStore::load_from_path_strict(path.clone())
+            .await
+            .expect("missing settings should fall back to defaults");
+        let settings = store.get().await;
+        assert!(settings.model_providers.is_empty());
+        assert!(settings.acp_servers.is_empty());
+
+        let body = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(!body.is_empty());
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn load_from_path_strict_rejects_invalid_json() {
+        let path = test_path("strict-invalid-settings-json");
+        tokio::fs::write(&path, "{not-json")
+            .await
+            .expect("invalid settings fixture should be written");
+
+        let error = super::BridgeSettingsStore::load_from_path_strict(path.clone())
+            .await
+            .err()
+            .expect("invalid settings should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to parse bridge settings")
+        );
+        let _ = tokio::fs::remove_file(&path).await;
     }
 
     #[tokio::test]
@@ -565,7 +596,7 @@ mod tests {
         let servers = vec![crate::models::AcpServerConfig {
             id: "kiro-local".to_string(),
             name: "Kiro Local".to_string(),
-            profile: crate::models::AcpProfile::Kiro,
+            profile: crate::models::AcpProfile::Stdio,
             endpoint: None,
             command: Some("kiro-cli".to_string()),
             args: vec!["acp".to_string()],
@@ -581,11 +612,48 @@ mod tests {
     }
 
     #[test]
+    fn acp_profile_deserializes_legacy_kiro_alias_as_stdio() {
+        let server: crate::models::AcpServerConfig = serde_json::from_str(
+            r#"{
+                "id": "kiro-local",
+                "name": "Kiro Local ACP",
+                "profile": "kiro",
+                "command": "kiro-cli",
+                "args": ["acp"]
+            }"#,
+        )
+        .expect("legacy kiro profile should deserialize");
+
+        assert!(matches!(server.profile, crate::models::AcpProfile::Stdio));
+        assert!(validate_acp_servers(&[server]).is_ok());
+    }
+
+    #[test]
+    fn validate_acp_servers_accepts_stdio_command_profile() {
+        let servers = vec![crate::models::AcpServerConfig {
+            id: "opencode-acp".to_string(),
+            name: "OpenCode ACP".to_string(),
+            profile: crate::models::AcpProfile::Stdio,
+            endpoint: None,
+            command: Some("opencode".to_string()),
+            args: vec!["acp".to_string()],
+            auth_token: String::new(),
+            default_model: None,
+            enabled: false,
+            priority: 20,
+            headers: Vec::new(),
+            env: Vec::new(),
+        }];
+
+        assert!(validate_acp_servers(&servers).is_ok());
+    }
+
+    #[test]
     fn validate_acp_servers_rejects_profile_transport_mismatch() {
         let kiro_without_command = crate::models::AcpServerConfig {
             id: "bad-kiro".to_string(),
             name: "Bad Kiro".to_string(),
-            profile: crate::models::AcpProfile::Kiro,
+            profile: crate::models::AcpProfile::Stdio,
             endpoint: Some("https://acp.example.test".to_string()),
             command: None,
             args: Vec::new(),
@@ -620,7 +688,7 @@ mod tests {
         let kiro_with_endpoint = crate::models::AcpServerConfig {
             id: "kiro-mixed".to_string(),
             name: "Kiro Mixed".to_string(),
-            profile: crate::models::AcpProfile::Kiro,
+            profile: crate::models::AcpProfile::Stdio,
             endpoint: Some("https://acp.example.test".to_string()),
             command: Some("kiro-cli".to_string()),
             args: vec!["acp".to_string()],
@@ -657,12 +725,13 @@ mod tests {
     fn validate_bridge_settings_accepts_acp_example_shape() {
         let settings = BridgeSettings {
             ai_approval: AiApprovalSettings::default(),
+            project_ai_approval: Default::default(),
             model_providers: Vec::new(),
             acp_servers: vec![
                 crate::models::AcpServerConfig {
                     id: "kiro-local".to_string(),
                     name: "Kiro Local ACP".to_string(),
-                    profile: crate::models::AcpProfile::Kiro,
+                    profile: crate::models::AcpProfile::Stdio,
                     endpoint: None,
                     command: Some("kiro-cli".to_string()),
                     args: vec!["acp".to_string()],
@@ -670,6 +739,34 @@ mod tests {
                     default_model: Some("claude-sonnet-4".to_string()),
                     enabled: true,
                     priority: 0,
+                    headers: Vec::new(),
+                    env: Vec::new(),
+                },
+                crate::models::AcpServerConfig {
+                    id: "opencode-acp".to_string(),
+                    name: "OpenCode ACP".to_string(),
+                    profile: crate::models::AcpProfile::Stdio,
+                    endpoint: None,
+                    command: Some("opencode".to_string()),
+                    args: vec!["acp".to_string()],
+                    auth_token: String::new(),
+                    default_model: Some(String::new()),
+                    enabled: false,
+                    priority: 20,
+                    headers: Vec::new(),
+                    env: Vec::new(),
+                },
+                crate::models::AcpServerConfig {
+                    id: "codex-acp".to_string(),
+                    name: "Codex ACP".to_string(),
+                    profile: crate::models::AcpProfile::Stdio,
+                    endpoint: None,
+                    command: Some("codex".to_string()),
+                    args: vec!["acp".to_string()],
+                    auth_token: String::new(),
+                    default_model: Some(String::new()),
+                    enabled: false,
+                    priority: 30,
                     headers: Vec::new(),
                     env: Vec::new(),
                 },
@@ -691,9 +788,6 @@ mod tests {
                     env: Vec::new(),
                 },
             ],
-            speech_profiles: Default::default(),
-            speech_voices: Default::default(),
-            speaker_filter: Default::default(),
         };
 
         assert!(validate_bridge_settings(&settings).is_ok());
@@ -708,6 +802,20 @@ mod tests {
             .await
             .expect("checked-in ACP example should load");
         validate_bridge_settings(&settings).expect("checked-in ACP example should validate");
-        assert_eq!(settings.acp_servers.len(), 2);
+        assert_eq!(settings.acp_servers.len(), 4);
+        assert!(
+            settings
+                .acp_servers
+                .iter()
+                .any(|server| server.id == "opencode-acp"
+                    && matches!(server.profile, crate::models::AcpProfile::Stdio))
+        );
+        assert!(
+            settings
+                .acp_servers
+                .iter()
+                .any(|server| server.id == "codex-acp"
+                    && matches!(server.profile, crate::models::AcpProfile::Stdio))
+        );
     }
 }

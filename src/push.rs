@@ -61,7 +61,13 @@ impl PushService {
             }
 
             if let Err(error) = self
-                .send_fcm_notification(&session, &session.title, &trimmed, &device)
+                .send_fcm_notification(
+                    &session,
+                    &session.title,
+                    &trimmed,
+                    "assistant_reply",
+                    &device,
+                )
                 .await
             {
                 eprintln!("FCM push failed for client {}: {error:?}", device.client_id);
@@ -90,7 +96,7 @@ impl PushService {
 
         for device in devices {
             if let Err(error) = self
-                .send_fcm_notification(&session, "需要审批", &body, &device)
+                .send_fcm_notification(&session, "需要审批", &body, "approval_request", &device)
                 .await
             {
                 eprintln!(
@@ -106,6 +112,7 @@ impl PushService {
         session: &SessionSummary,
         title: &str,
         body: &str,
+        notification_type: &str,
         device: &PushDeviceRegistration,
     ) -> Result<()> {
         let token = device.fcm_token.as_deref().context("missing fcm token")?;
@@ -133,14 +140,22 @@ impl PushService {
                     "data": {
                         "payload_json": payload_json,
                         "session_id": session.id,
+                        "notification_type": notification_type,
                     },
                     "android": {
+                        "collapse_key": session.id,
                         "priority": "high",
                         "notification": {
                             "channel_id": "omni_code_replies",
+                            "tag": session.id,
                             "click_action": "FLUTTER_NOTIFICATION_CLICK",
                             "default_sound": true,
                             "default_vibrate_timings": true,
+                        }
+                    },
+                    "apns": {
+                        "headers": {
+                            "apns-collapse-id": session.id,
                         }
                     }
                 }
@@ -256,12 +271,12 @@ struct FcmConfig {
 
 impl FcmConfig {
     fn from_env() -> Option<Self> {
-        if let Ok(json) = std::env::var("ECHO_MATE_FCM_SERVICE_ACCOUNT_JSON") {
+        if let Ok(json) = std::env::var("OMNI_CODE_FCM_SERVICE_ACCOUNT_JSON") {
             let parsed: FcmServiceAccountJson = serde_json::from_str(&json).ok()?;
             return Some(Self::from_service_account(parsed));
         }
 
-        if let Ok(path) = std::env::var("ECHO_MATE_FCM_SERVICE_ACCOUNT_PATH") {
+        if let Ok(path) = std::env::var("OMNI_CODE_FCM_SERVICE_ACCOUNT_PATH") {
             let body = std::fs::read_to_string(path).ok()?;
             let parsed: FcmServiceAccountJson = serde_json::from_str(&body).ok()?;
             return Some(Self::from_service_account(parsed));
@@ -288,8 +303,8 @@ struct XiaomiConfig {
 impl XiaomiConfig {
     fn from_env() -> Option<Self> {
         Some(Self {
-            app_secret: std::env::var("ECHO_MATE_XIAOMI_APP_SECRET").ok()?,
-            package_name: std::env::var("ECHO_MATE_XIAOMI_PACKAGE_NAME").ok()?,
+            app_secret: std::env::var("OMNI_CODE_XIAOMI_APP_SECRET").ok()?,
+            package_name: std::env::var("OMNI_CODE_XIAOMI_PACKAGE_NAME").ok()?,
         })
     }
 }

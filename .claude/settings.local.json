@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//home/junjie/.claude/**)",
+      "Read(//home/junjie/**)",
+      "Bash(cargo check *)",
+      "Bash(cargo test *)",
+      "Bash(cargo clippy *)",
+      "Bash(codex *)",
+      "Bash(cargo build *)"
+    ]
+  }
+}

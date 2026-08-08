@@ -1,25 +1,21 @@
+mod acp_client;
 mod adapter;
 mod ai_approval;
 mod api;
 mod app_state;
 mod approval_policy;
-mod asr;
 mod bridge_settings;
 mod claude_hook;
 mod claude_store;
 mod client_auth_store;
 mod device_store;
+mod logging;
 mod message_projection;
 mod models;
 mod push;
-mod realtime;
 mod secret_store;
 mod session_store;
 mod session_trace;
-mod speaker;
-mod speech;
-mod tts;
-mod vad;
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
@@ -42,6 +38,9 @@ enum Command {
     Serve {
         #[arg(long, default_value = "8787")]
         port: u16,
+        /// Enable verbose diagnostic logging
+        #[arg(long)]
+        debug: bool,
     },
     /// Validate a bridge settings file without starting the server
     SettingsValidate {
@@ -115,12 +114,13 @@ async fn run() -> Result<()> {
         Some(Command::SessionTrace { session, limit }) => {
             session_trace::print_session_trace(&session, limit)
         }
-        Some(Command::Serve { port }) => serve(port).await,
-        None => serve(8787).await,
+        Some(Command::Serve { port, debug }) => serve(port, debug).await,
+        None => serve(8787, false).await,
     }
 }
 
-async fn serve(port: u16) -> Result<()> {
+async fn serve(port: u16, debug: bool) -> Result<()> {
+    logging::init(debug);
     let state = Arc::new(AppState::new_strict().await?);
     let app = router(state);
 

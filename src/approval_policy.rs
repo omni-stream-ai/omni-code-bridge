@@ -14,7 +14,7 @@ pub fn should_auto_approve(command: &str, project_root: &Path) -> Option<AutoApp
     let tokens = shell_split(command)?;
     let (program, args) = split_command(&tokens)?;
 
-    if is_safe_read_only_command(program, args) {
+    if is_safe_read_only_command(program, args, project_root) {
         return Some(AutoApprovalDecision::Accept);
     }
 
@@ -49,37 +49,49 @@ fn is_env_assignment(token: &str) -> bool {
             .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
-fn is_safe_read_only_command(program: &str, args: &[String]) -> bool {
-    matches!(
+fn is_safe_read_only_command(program: &str, args: &[String], project_root: &Path) -> bool {
+    if matches!(
         program,
-        "pwd"
-            | "ls"
-            | "cat"
+        "pwd" | "date" | "uname" | "whoami" | "printenv" | "ps"
+    ) {
+        return true;
+    }
+    if matches!(
+        program,
+        "ls" | "cat"
             | "head"
             | "tail"
             | "wc"
             | "sort"
             | "uniq"
             | "cut"
-            | "sed"
-            | "awk"
             | "rg"
             | "fd"
-            | "find"
             | "grep"
-            | "which"
-            | "whereis"
-            | "env"
-            | "printenv"
-            | "date"
-            | "uname"
-            | "whoami"
-            | "ps"
             | "stat"
             | "du"
             | "tree"
             | "realpath"
-    ) || is_read_only_git_command(program, args)
+    ) {
+        return command_paths_stay_in_project(args, project_root);
+    }
+    is_read_only_git_command(program, args)
+}
+
+fn command_paths_stay_in_project(args: &[String], project_root: &Path) -> bool {
+    args.iter()
+        .filter(|arg| !arg.starts_with('-'))
+        .filter(|arg| looks_like_path(arg))
+        .all(|arg| path_is_within_project(arg, project_root))
+}
+
+fn looks_like_path(arg: &str) -> bool {
+    arg.starts_with('/')
+        || arg.starts_with('~')
+        || arg == "."
+        || arg == ".."
+        || arg.starts_with("./")
+        || arg.starts_with("../")
 }
 
 fn is_read_only_git_command(program: &str, args: &[String]) -> bool {
@@ -90,10 +102,35 @@ fn is_read_only_git_command(program: &str, args: &[String]) -> bool {
         .iter()
         .find(|arg| !arg.starts_with('-'))
         .map(String::as_str);
-    matches!(
+    let safe_subcommand = matches!(
         subcommand,
         Some("status" | "diff" | "show" | "log" | "branch" | "rev-parse" | "ls-files" | "grep")
-    )
+    );
+    if !safe_subcommand {
+        return false;
+    }
+    if subcommand == Some("branch") {
+        let mut branch_args = args
+            .iter()
+            .skip_while(|arg| arg.as_str() != "branch")
+            .skip(1);
+        if !branch_args.all(|arg| {
+            matches!(
+                arg.as_str(),
+                "-a" | "--all" | "-r" | "--remotes" | "--show-current" | "--list"
+            )
+        }) {
+            return false;
+        }
+    }
+    !args.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "-d" | "-D" | "-m" | "-M" | "-c" | "-C" | "--delete" | "--move" | "--copy"
+        ) || arg.starts_with("--output")
+            || arg.starts_with("--exec")
+            || arg.starts_with("--format=%x")
+    })
 }
 
 fn is_safe_project_command(program: &str, args: &[String]) -> bool {
@@ -224,4 +261,48 @@ fn shell_split(command: &str) -> Option<Vec<String>> {
         tokens.push(current);
     }
     (!tokens.is_empty()).then_some(tokens)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_explicitly_safe_read_commands_are_auto_approved() {
+        let root = Path::new("/workspace/project");
+
+        assert_eq!(
+            should_auto_approve("cat ./README.md", root),
+            Some(AutoApprovalDecision::Accept)
+        );
+        assert_eq!(should_auto_approve("sed -i 's/a/b/' file", root), None);
+        assert_eq!(
+            should_auto_approve("awk 'BEGIN { system(\"id\") }'", root),
+            None
+        );
+        assert_eq!(should_auto_approve("find / -delete", root), None);
+    }
+
+    #[test]
+    fn read_commands_with_project_escape_are_not_auto_approved() {
+        let root = Path::new("/workspace/project");
+
+        assert_eq!(should_auto_approve("cat /etc/passwd", root), None);
+        assert_eq!(should_auto_approve("cat ../secret.txt", root), None);
+    }
+
+    #[test]
+    fn mutating_git_branch_variants_are_not_auto_approved() {
+        let root = Path::new("/workspace/project");
+
+        assert_eq!(
+            should_auto_approve("git branch --show-current", root),
+            Some(AutoApprovalDecision::Accept)
+        );
+        assert_eq!(should_auto_approve("git branch -D main", root), None);
+        assert_eq!(
+            should_auto_approve("git branch --set-upstream-to=origin/main", root),
+            None
+        );
+    }
 }
