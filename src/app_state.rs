@@ -91,6 +91,8 @@ struct PersistedSessionMetadataEntry {
     title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     session: Option<SessionSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_unread_message_id: Option<String>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -187,6 +189,7 @@ pub struct AppState {
     projects: RwLock<HashMap<String, ProjectSummary>>,
     sessions: RwLock<HashMap<String, SessionSummary>>,
     session_title_overrides: RwLock<HashMap<String, String>>,
+    unread_message_ids: RwLock<HashMap<String, String>>,
     messages: RwLock<HashMap<String, Vec<ChatMessage>>>,
     client_message_results: RwLock<HashMap<(String, String), (ChatMessage, ChatMessage)>>,
     devices: RwLock<HashMap<String, PushDeviceRegistration>>,
@@ -223,6 +226,12 @@ pub struct EventSubscription {
     pub receiver: broadcast::Receiver<SequencedSessionEvent>,
     pub replay: EventReplay,
     pub high_watermark: u64,
+}
+
+#[derive(Debug)]
+pub enum MarkSessionReadError {
+    NotFound(String),
+    Persistence(String),
 }
 
 impl AppState {
@@ -277,6 +286,7 @@ impl AppState {
             session_title_overrides: RwLock::new(
                 persisted_metadata
                     .sessions
+                    .clone()
                     .into_iter()
                     .filter_map(|(session_id, entry)| {
                         entry
@@ -284,6 +294,18 @@ impl AppState {
                             .map(|title| title.trim().to_string())
                             .filter(|title| !title.is_empty())
                             .map(|title| (session_id, title))
+                    })
+                    .collect(),
+            ),
+            unread_message_ids: RwLock::new(
+                persisted_metadata
+                    .sessions
+                    .iter()
+                    .filter_map(|(session_id, entry)| {
+                        entry
+                            .last_unread_message_id
+                            .as_ref()
+                            .map(|message_id| (session_id.clone(), message_id.clone()))
                     })
                     .collect(),
             ),
@@ -340,6 +362,7 @@ impl AppState {
             session_title_overrides: RwLock::new(
                 persisted_metadata
                     .sessions
+                    .clone()
                     .into_iter()
                     .filter_map(|(session_id, entry)| {
                         entry
@@ -347,6 +370,18 @@ impl AppState {
                             .map(|title| title.trim().to_string())
                             .filter(|title| !title.is_empty())
                             .map(|title| (session_id, title))
+                    })
+                    .collect(),
+            ),
+            unread_message_ids: RwLock::new(
+                persisted_metadata
+                    .sessions
+                    .iter()
+                    .filter_map(|(session_id, entry)| {
+                        entry
+                            .last_unread_message_id
+                            .as_ref()
+                            .map(|message_id| (session_id.clone(), message_id.clone()))
                     })
                     .collect(),
             ),
@@ -401,6 +436,7 @@ impl AppState {
             session_title_overrides: RwLock::new(
                 persisted_metadata
                     .sessions
+                    .clone()
                     .into_iter()
                     .filter_map(|(session_id, entry)| {
                         entry
@@ -408,6 +444,18 @@ impl AppState {
                             .map(|title| title.trim().to_string())
                             .filter(|title| !title.is_empty())
                             .map(|title| (session_id, title))
+                    })
+                    .collect(),
+            ),
+            unread_message_ids: RwLock::new(
+                persisted_metadata
+                    .sessions
+                    .iter()
+                    .filter_map(|(session_id, entry)| {
+                        entry
+                            .last_unread_message_id
+                            .as_ref()
+                            .map(|message_id| (session_id.clone(), message_id.clone()))
                     })
                     .collect(),
             ),
@@ -1046,6 +1094,10 @@ impl AppState {
             created_at: now,
         };
 
+        self.unread_message_ids
+            .write()
+            .await
+            .insert(session.id.clone(), message.id.clone());
         self.sessions
             .write()
             .await
@@ -1058,6 +1110,7 @@ impl AppState {
             .lock()
             .await
             .insert(session.id.clone(), SessionRuntimeState::default());
+        self.persist_canonical_session(&session).await?;
         self.invalidate_list_cache().await;
         self.refresh_project_summary(&session.project_id).await;
 
@@ -1489,6 +1542,10 @@ impl AppState {
         {
             session_snapshot.model = Some(model.to_string());
         }
+        if let Err(error) = self.clear_session_unread(session_id).await {
+            self.finish_turn(session_id).await;
+            return Err(error);
+        }
 
         if matches!(session_snapshot.agent, AgentKind::Custom) {
             let user_message = ChatMessage {
@@ -1904,6 +1961,7 @@ impl AppState {
             assistant_message = provider_message;
         }
         let content = assistant_message.content.clone();
+        let assistant_message_id = assistant_message.id.clone();
 
         self.patch_session(session_id, SessionStatus::Idle, Some(content.clone()))
             .await;
@@ -1915,6 +1973,8 @@ impl AppState {
             status: SessionStatus::Idle,
             error_message: None,
         }));
+        self.mark_session_unread(session_id, &assistant_message_id)
+            .await?;
         if let Some(session) = self.find_session(session_id).await {
             let devices = self
                 .devices
@@ -2408,6 +2468,119 @@ impl AppState {
         }
     }
 
+    /// Only replies completed by this bridge reach this method. Provider-only
+    /// archive updates therefore never create unread state.
+    async fn mark_session_unread(&self, session_id: &str, message_id: &str) -> Result<(), String> {
+        let mut unread_message_ids = self.unread_message_ids.write().await;
+        let mut sessions = self.sessions.write().await;
+        let Some(session) = sessions.get_mut(session_id) else {
+            return Ok(());
+        };
+        session.unread_count = 1;
+        let summary = session.clone();
+        unread_message_ids.insert(session_id.to_string(), message_id.to_string());
+        drop(sessions);
+        drop(unread_message_ids);
+        self.persist_canonical_session(&summary).await?;
+        self.invalidate_list_cache().await;
+        self.publish_event(SessionEvent::SessionSnapshot(summary));
+        Ok(())
+    }
+
+    pub async fn mark_session_read(
+        &self,
+        session_id: &str,
+        last_message_id: &str,
+    ) -> Result<SessionSummary, MarkSessionReadError> {
+        let expected_message_id_before = self
+            .unread_message_ids
+            .read()
+            .await
+            .get(session_id)
+            .cloned();
+        let acknowledges_visible_reply = self
+            .message_is_at_or_after(
+                session_id,
+                expected_message_id_before.as_deref(),
+                last_message_id,
+            )
+            .await;
+        let mut unread_message_ids = self.unread_message_ids.write().await;
+        let mut sessions = self.sessions.write().await;
+        let session = sessions.get_mut(session_id).ok_or_else(|| {
+            MarkSessionReadError::NotFound(format!("unknown bridge session: {session_id}"))
+        })?;
+        let expected_message_id = unread_message_ids.get(session_id).cloned();
+        let changed = (expected_message_id.is_none()
+            || expected_message_id.as_deref() == Some(last_message_id)
+            || (expected_message_id == expected_message_id_before && acknowledges_visible_reply))
+            && (session.unread_count != 0 || expected_message_id.is_some());
+        if changed {
+            session.unread_count = 0;
+            unread_message_ids.remove(session_id);
+        }
+        let summary = session.clone();
+        drop(sessions);
+        drop(unread_message_ids);
+        if changed {
+            self.persist_canonical_session(&summary)
+                .await
+                .map_err(MarkSessionReadError::Persistence)?;
+            self.invalidate_list_cache().await;
+            self.publish_event(SessionEvent::SessionSnapshot(summary.clone()));
+        }
+        Ok(summary)
+    }
+
+    async fn clear_session_unread(&self, session_id: &str) -> Result<(), String> {
+        let mut unread_message_ids = self.unread_message_ids.write().await;
+        let mut sessions = self.sessions.write().await;
+        let Some(session) = sessions.get_mut(session_id) else {
+            return Ok(());
+        };
+        let changed = session.unread_count != 0 || unread_message_ids.contains_key(session_id);
+        if !changed {
+            return Ok(());
+        }
+        session.unread_count = 0;
+        unread_message_ids.remove(session_id);
+        let summary = session.clone();
+        drop(sessions);
+        drop(unread_message_ids);
+        self.persist_canonical_session(&summary).await?;
+        self.invalidate_list_cache().await;
+        self.publish_event(SessionEvent::SessionSnapshot(summary));
+        Ok(())
+    }
+
+    async fn message_is_at_or_after(
+        &self,
+        session_id: &str,
+        expected_message_id: Option<&str>,
+        last_message_id: &str,
+    ) -> bool {
+        let Some(expected_message_id) = expected_message_id else {
+            return false;
+        };
+        let messages = self.messages.read().await;
+        let Some(messages) = messages.get(session_id) else {
+            return false;
+        };
+        let Some(expected_message) = messages
+            .iter()
+            .find(|message| message.id == expected_message_id)
+        else {
+            return false;
+        };
+        let Some(last_message) = messages
+            .iter()
+            .find(|message| message.id == last_message_id)
+        else {
+            return false;
+        };
+        last_message.created_at >= expected_message.created_at
+    }
+
     pub async fn update_session_settings(
         &self,
         session_id: &str,
@@ -2496,6 +2669,7 @@ impl AppState {
 
     async fn write_session_metadata(&self) -> Result<(), String> {
         let entries = self.session_title_overrides.read().await.clone();
+        let unread_message_ids = self.unread_message_ids.read().await.clone();
         let canonical_sessions = self.sessions.read().await.clone();
         let mut metadata = PersistedSessionMetadata {
             sessions: HashMap::new(),
@@ -2507,6 +2681,7 @@ impl AppState {
                 PersistedSessionMetadataEntry {
                     title: entries.get(&session_id).cloned(),
                     session: Some(session),
+                    last_unread_message_id: unread_message_ids.get(&session_id).cloned(),
                 },
             );
         }

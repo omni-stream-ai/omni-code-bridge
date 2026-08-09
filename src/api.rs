@@ -16,7 +16,7 @@ use axum::{
         IntoResponse,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use futures_util::stream::{self, Stream, StreamExt};
 use serde::Deserialize;
@@ -24,15 +24,15 @@ use tokio_stream::wrappers::BroadcastStream;
 
 use crate::{
     adapter,
-    app_state::{AppState, EventReplay, SequencedSessionEvent},
+    app_state::{AppState, EventReplay, MarkSessionReadError, SequencedSessionEvent},
     bridge_settings::{AiApprovalPromptInput, BridgeSettingsInput, ProjectAiApprovalInput},
     models::{
         AcpAgentDiagnosticResponse, AcpHandshakeProbe, AgentCommandForwarding, AgentCommandSummary,
         AgentCommandsSummary, AgentInstallInput, AgentKind, AgentReadiness, AgentSummary, ApiError,
         ApiResponse, AppUpdateManifest, ApprovalDecisionInput, CancelSessionReplyResult,
         ClientAuthRequestInput, CreateProjectInput, CreateSessionInput, FileCompletionItem,
-        FileCompletionQuery, MessageListPage, MessageListQuery, RegisterPushDeviceInput,
-        ReplySummary, SendMessageInput, SessionEvent, SummarizeReplyInput,
+        FileCompletionQuery, MarkSessionReadInput, MessageListPage, MessageListQuery,
+        RegisterPushDeviceInput, ReplySummary, SendMessageInput, SessionEvent, SummarizeReplyInput,
         TriggerClientMessageInput, UpdateSessionInput, UploadedFileResponse,
     },
 };
@@ -71,6 +71,7 @@ pub fn router() -> Router<Arc<AppState>> {
             get(list_messages).post(send_message),
         )
         .route("/sessions/{id}", get(get_session).patch(update_session))
+        .route("/sessions/{id}/read-state", put(mark_session_read))
         .route("/sessions/{id}/summary", post(summarize_reply))
         .route("/agents", get(list_agents))
         .route("/agents/acp/diagnostic", get(get_acp_agent_diagnostic))
@@ -764,6 +765,29 @@ async fn update_session(
         .map_err(|err| ApiError {
             status: StatusCode::NOT_FOUND,
             message: err,
+        })?;
+    Ok(Json(ApiResponse { data: session }))
+}
+
+async fn mark_session_read(
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Json(input): Json<MarkSessionReadInput>,
+) -> Result<impl IntoResponse, ApiError> {
+    authorize_request(&headers, &state).await?;
+    let session = state
+        .mark_session_read(&id, &input.last_message_id)
+        .await
+        .map_err(|error| match error {
+            MarkSessionReadError::NotFound(message) => ApiError {
+                status: StatusCode::NOT_FOUND,
+                message,
+            },
+            MarkSessionReadError::Persistence(message) => ApiError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                message,
+            },
         })?;
     Ok(Json(ApiResponse { data: session }))
 }

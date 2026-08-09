@@ -330,6 +330,11 @@ pub struct UpdateSessionInput {
     pub model: Option<Option<String>>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct MarkSessionReadInput {
+    pub last_message_id: String,
+}
+
 fn deserialize_patch_value<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
 where
     D: Deserializer<'de>,
