@@ -331,6 +331,9 @@ jobs:
       # ── AUR ──────────────────────────────────────────────────────────
       - name: Publish to AUR
         if: needs.prepare-release.outputs.stable == 'true'
+        # AUR is an optional downstream mirror. A transient AUR/SSH failure
+        # must not invalidate the GitHub release, crates.io publish, or tap.
+        continue-on-error: true
         env:
           VERSION: ${{ needs.prepare-release.outputs.cargo_version }}
           TAG: ${{ needs.prepare-release.outputs.tag }}
@@ -353,7 +356,20 @@ jobs:
 
           export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur -o IdentitiesOnly=yes -o StrictHostKeyChecking=no"
 
-          git clone ssh://aur@aur.archlinux.org/${AUR_REPO}.git aur-pkg
+          clone_succeeded=false
+          for attempt in 1 2 3; do
+            if git clone ssh://aur@aur.archlinux.org/${AUR_REPO}.git aur-pkg; then
+              clone_succeeded=true
+              break
+            fi
+            echo "AUR clone attempt ${attempt}/3 failed; retrying..." >&2
+            rm -rf aur-pkg
+            sleep 5
+          done
+          if [[ "${clone_succeeded}" != "true" ]]; then
+            echo "::warning::Unable to clone ${AUR_REPO} from AUR; skipping AUR update."
+            exit 0
+          fi
           cd aur-pkg
 
           linux_x86_sha=$(sha256sum ../dist/omni-code-bridge-linux-x64.tar.gz | awk '{print $1}')
@@ -371,4 +387,15 @@ jobs:
           git config user.email "junjie@omni-stream.ai"
           git config user.name "Junjie"
           git commit -m "Update omni-code-bridge-bin to ${VERSION}"
-          git push origin master
+          push_succeeded=false
+          for attempt in 1 2 3; do
+            if git push origin master; then
+              push_succeeded=true
+              break
+            fi
+            echo "AUR push attempt ${attempt}/3 failed; retrying..." >&2
+            sleep 5
+          done
+          if [[ "${push_succeeded}" != "true" ]]; then
+            echo "::warning::Unable to push ${AUR_REPO} update to AUR; the GitHub release remains available."
+          fi
