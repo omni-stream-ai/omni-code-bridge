@@ -2221,6 +2221,9 @@ impl AppState {
                 self.runtime_store_path.display()
             );
         }
+        // Runtime provider links affect session aggregation. Do not serve a
+        // stale list while a model/provider migration is being established.
+        self.invalidate_list_cache().await;
     }
 
     pub async fn project_root_path_for_session(&self, session_id: &str) -> Result<String, String> {
@@ -3820,6 +3823,10 @@ mod tests {
         goal_thread.updated_at += chrono::TimeDelta::seconds(2);
         provider.set_session(old_thread).await;
         provider.set_session(goal_thread).await;
+
+        // Prime the aggregated list before the runtime fork links are known.
+        // Updating those links must invalidate this cached three-session view.
+        assert_eq!(state.list_sessions().await.len(), 3);
         state
             .set_provider_session_ref(&local.id, Some("old-thread".to_string()))
             .await;
