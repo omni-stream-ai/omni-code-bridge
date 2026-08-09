@@ -38,7 +38,7 @@ use crate::{
     models::{
         AcpAgentDiagnostic, AcpHandshakeProbe, AcpProfile, AgentKind, ApprovalChoice, ApprovalKind,
         ApprovalRequest, ChatMessage, ProjectSummary, ReasoningEffort, ResolvedProviderConfig,
-        SessionSummary,
+        SessionDiffEvent, SessionSummary,
     },
     session_store::{load_session_archive_summary, load_session_messages},
 };
@@ -551,6 +551,69 @@ mod tests {
         }
 
         assert_eq!(state.finish_text().as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn codex_streaming_state_exposes_reasoning_and_unknown_event_context() {
+        let mut state = CodexAppServerStreamingState::default();
+
+        assert!(matches!(
+            state.ingest_value(&serde_json::json!({
+                "method": "item/started",
+                "params": {"item": {
+                    "type": "reasoning",
+                    "summary": [{"text": "Inspect the streaming protocol"}]
+                }}
+            })),
+            CodexAppServerEvent::None
+        ));
+        assert_eq!(
+            state.current_status(),
+            Some("[reasoning:thinking] Inspect the streaming protocol")
+        );
+
+        match state.ingest_value(&serde_json::json!({
+            "method": "provider/customEvent",
+            "params": {"summary": "refreshing the local index", "status": "running"}
+        })) {
+            CodexAppServerEvent::Status(status) => assert_eq!(
+                status,
+                "[debug:codex:method] unhandled method=provider/customEvent (summary=refreshing the local index, status=running)"
+            ),
+            _ => panic!("expected diagnostic status"),
+        }
+    }
+
+    #[test]
+    fn codex_turn_diff_status_describes_unified_diff_changes() {
+        let status = render_codex_turn_diff(&serde_json::json!({
+            "diff": "diff --git a/src/adapter.rs b/src/adapter.rs\n--- a/src/adapter.rs\n+++ b/src/adapter.rs\n@@ -1 +1 @@\n-old\n+new\n+added"
+        }));
+        assert_eq!(status.as_deref(), Some("[diff] src/adapter.rs | +2 -1"));
+        assert_eq!(
+            render_codex_turn_diff(&serde_json::json!({})).as_deref(),
+            Some("[diff] updated")
+        );
+    }
+
+    #[test]
+    fn codex_thread_status_handles_nested_status_payloads() {
+        assert_eq!(
+            render_codex_status_notification(
+                "thread/status/changed",
+                &serde_json::json!({"status": {"type": "running"}}),
+            )
+            .as_deref(),
+            Some("[thread] running")
+        );
+        assert_eq!(
+            render_codex_status_notification(
+                "thread/status/changed",
+                &serde_json::json!({"status": "idle"}),
+            )
+            .as_deref(),
+            None
+        );
     }
 
     #[test]
@@ -5287,6 +5350,17 @@ async fn run_codex(
                     CodexAppServerEvent::Status(status) => {
                         parsed.latest_status = Some(status);
                     }
+                    CodexAppServerEvent::Diff(diff) => {
+                        state.emit_session_diff(SessionDiffEvent {
+                            session_id: session.id.clone(),
+                            conversation_turn_id: Some(input.id.clone()),
+                            files: diff.files,
+                            added: diff.added,
+                            removed: diff.removed,
+                            patch: diff.patch,
+                            summary: diff.summary,
+                        }).await;
+                    }
                     CodexAppServerEvent::ApprovalRequested(mut pending) => {
                         if let Some(choice) = auto_approve_codex_request(&mut pending.request, &project_root).await? {
                             send_json_rpc_response(
@@ -7304,10 +7378,20 @@ enum CodexAppServerEvent {
     None,
     Content(String),
     Status(String),
+    Diff(CodexDiff),
     ApprovalRequested(PendingApproval),
     ApprovalResolved { request_id: String },
     TurnCompleted,
     TurnFailed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexDiff {
+    files: Vec<String>,
+    added: Option<i64>,
+    removed: Option<i64>,
+    patch: Option<String>,
+    summary: Option<String>,
 }
 
 #[derive(Clone)]
@@ -7417,6 +7501,9 @@ impl CodexAppServerStreamingState {
                         .map(CodexAppServerEvent::Status)
                         .unwrap_or(CodexAppServerEvent::None)
                 }
+                "thread/status/changed" => render_codex_thread_status(params)
+                    .map(CodexAppServerEvent::Status)
+                    .unwrap_or(CodexAppServerEvent::None),
                 "item/commandExecution/outputDelta" => {
                     self.mark_command_activity(params.get("itemId").and_then(Value::as_str));
                     render_codex_status_notification(method, params)
@@ -7435,6 +7522,7 @@ impl CodexAppServerStreamingState {
                         .map(CodexAppServerEvent::Status)
                         .unwrap_or(CodexAppServerEvent::None)
                 }
+                "turn/diff/updated" => CodexAppServerEvent::Diff(parse_codex_turn_diff(params)),
                 "item/agentMessage/delta" => {
                     let item_id = params
                         .get("itemId")
@@ -7517,7 +7605,8 @@ impl CodexAppServerStreamingState {
                     .map(CodexAppServerEvent::Status)
                     .unwrap_or_else(|| {
                         CodexAppServerEvent::Status(format!(
-                            "[debug:codex:method] unhandled method={method}"
+                            "[debug:codex:method] unhandled method={method}{}",
+                            summarize_event_fields(params)
                         ))
                     }),
             };
@@ -7727,10 +7816,22 @@ impl CodexAppServerStreamingState {
             "agentMessage" => CodexAppServerEvent::None,
             "userMessage" => CodexAppServerEvent::None,
             "reasoning" => {
-                self.latest_status = Some(if method == "item/started" {
-                    "[reasoning] thinking".to_string()
+                let phase = if method == "item/started" {
+                    "thinking"
                 } else {
-                    "[reasoning] complete".to_string()
+                    "complete"
+                };
+                let detail = item
+                    .get("summary")
+                    .or_else(|| item.get("text"))
+                    .or_else(|| item.get("description"))
+                    .or_else(|| item.get("title"))
+                    .and_then(extract_display_text)
+                    .map(|text| truncate_tool_text(&text, 240))
+                    .filter(|text| !text.trim().is_empty());
+                self.latest_status = Some(match detail {
+                    Some(detail) => format!("[reasoning:{phase}] {detail}"),
+                    None => format!("[reasoning] {phase}"),
                 });
                 CodexAppServerEvent::None
             }
@@ -7787,17 +7888,30 @@ impl CodexAppServerStreamingState {
                 CodexAppServerEvent::None
             }
             _ => {
-                self.latest_status =
-                    render_generic_item_summary(item_type, item, method).or_else(|| {
-                        Some(format!(
-                            "[debug:codex:item] unhandled item_type={} phase={}",
-                            item_type,
-                            if method == "item/started" {
-                                "started"
-                            } else {
-                                "completed"
+                self.latest_status = render_generic_item_summary(item_type, item, method)
+                    .or_else(|| {
+                        let phase = if method == "item/started" {
+                            "started"
+                        } else {
+                            "completed"
+                        };
+                        let detail = item
+                            .get("summary")
+                            .or_else(|| item.get("title"))
+                            .or_else(|| item.get("description"))
+                            .or_else(|| item.get("name"))
+                            .and_then(extract_display_text)
+                            .map(|text| truncate_tool_text(&text, 160))
+                            .filter(|text| !text.trim().is_empty());
+                        Some(match detail {
+                            Some(detail) => {
+                                format!("[debug:codex:item] {item_type} {phase}: {detail}")
                             }
-                        ))
+                            None => format!(
+                                "[debug:codex:item] unhandled item_type={item_type} phase={phase}{}",
+                                summarize_event_fields(item)
+                            ),
+                        })
                     });
                 CodexAppServerEvent::None
             }
@@ -8492,7 +8606,7 @@ fn render_codex_thread_status(params: &Value) -> Option<String> {
     let status = params
         .get("status")
         .or_else(|| params.pointer("/thread/status"))
-        .and_then(Value::as_str)?;
+        .and_then(extract_status_text)?;
     let summary = match status {
         "running" => "[thread] running",
         "waiting" => "[thread] waiting",
@@ -8500,6 +8614,18 @@ fn render_codex_thread_status(params: &Value) -> Option<String> {
         other => return Some(format!("[thread] {other}")),
     };
     Some(summary.to_string())
+}
+
+fn extract_status_text(value: &Value) -> Option<&str> {
+    match value {
+        Value::String(status) if !status.trim().is_empty() => Some(status.trim()),
+        Value::Object(map) => map
+            .get("status")
+            .or_else(|| map.get("type"))
+            .or_else(|| map.get("state"))
+            .and_then(extract_status_text),
+        _ => None,
+    }
 }
 
 fn render_codex_plan_update(params: &Value) -> Option<String> {
@@ -8548,12 +8674,38 @@ fn render_codex_file_change_delta(params: &Value) -> Option<String> {
 }
 
 fn render_codex_turn_diff(params: &Value) -> Option<String> {
-    let files = collect_file_paths(params);
+    let diff = parse_codex_turn_diff(params);
     let mut segments = Vec::new();
-    if !files.is_empty() {
-        segments.push(format_file_preview(&files));
+    if !diff.files.is_empty() {
+        segments.push(format_file_preview(&diff.files));
+    }
+    match (diff.added, diff.removed) {
+        (Some(added), Some(removed)) => segments.push(format!("+{added} -{removed}")),
+        (Some(added), None) => segments.push(format!("+{added}")),
+        (None, Some(removed)) => segments.push(format!("-{removed}")),
+        (None, None) => {}
     }
 
+    if let Some(summary) = diff.summary {
+        segments.push(summary);
+    }
+
+    Some(if segments.is_empty() {
+        "[diff] updated".to_string()
+    } else {
+        format!("[diff] {}", segments.join(" | "))
+    })
+}
+
+fn parse_codex_turn_diff(params: &Value) -> CodexDiff {
+    let patch = find_first_text(params, &["diff", "patch", "unifiedDiff", "unified_diff"]);
+    let mut files = collect_file_paths(params);
+    if let Some(patch) = patch.as_deref() {
+        files.extend(collect_unified_diff_paths(patch));
+    }
+    files.sort();
+    files.dedup();
+    let patch_counts = patch.as_deref().map(count_unified_diff_changes);
     let added = find_first_i64(
         params,
         &[
@@ -8563,7 +8715,8 @@ fn render_codex_turn_diff(params: &Value) -> Option<String> {
             "additions",
             "totalAdded",
         ],
-    );
+    )
+    .or(patch_counts.map(|counts| counts.0));
     let removed = find_first_i64(
         params,
         &[
@@ -8573,30 +8726,21 @@ fn render_codex_turn_diff(params: &Value) -> Option<String> {
             "totalRemoved",
             "deletionsCount",
         ],
-    );
-
-    match (added, removed) {
-        (Some(added), Some(removed)) => segments.push(format!("+{added} -{removed}")),
-        (Some(added), None) => segments.push(format!("+{added}")),
-        (None, Some(removed)) => segments.push(format!("-{removed}")),
-        (None, None) => {}
-    }
-
+    )
+    .or(patch_counts.map(|counts| counts.1));
     let summary = params
         .get("summary")
         .or_else(|| params.get("title"))
         .or_else(|| params.get("description"))
-        .and_then(Value::as_str)
-        .map(|text| truncate_tool_text(text, 80))
+        .and_then(extract_display_text)
+        .map(|text| truncate_tool_text(&text, 80))
         .filter(|text| !text.is_empty());
-    if let Some(summary) = summary {
-        segments.push(summary);
-    }
-
-    if segments.is_empty() {
-        None
-    } else {
-        Some(format!("[diff] {}", segments.join(" | ")))
+    CodexDiff {
+        files,
+        added,
+        removed,
+        patch,
+        summary,
     }
 }
 
@@ -9097,6 +9241,60 @@ fn find_first_i64(value: &Value, keys: &[&str]) -> Option<i64> {
     }
 }
 
+fn find_first_text(value: &Value, keys: &[&str]) -> Option<String> {
+    match value {
+        Value::Object(map) => {
+            for key in keys {
+                if let Some(text) = map.get(*key).and_then(Value::as_str) {
+                    if !text.trim().is_empty() {
+                        return Some(text.to_string());
+                    }
+                }
+            }
+            map.values()
+                .find_map(|nested| find_first_text(nested, keys))
+        }
+        Value::Array(items) => items.iter().find_map(|item| find_first_text(item, keys)),
+        _ => None,
+    }
+}
+
+fn collect_unified_diff_paths(patch: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    for line in patch.lines() {
+        let path = line
+            .strip_prefix("diff --git a/")
+            .and_then(|value| value.split_once(" b/").map(|(_, path)| path))
+            .or_else(|| line.strip_prefix("+++ b/"))
+            .or_else(|| line.strip_prefix("--- a/"));
+        if let Some(path) = path
+            .map(str::trim)
+            .filter(|path| !path.is_empty() && *path != "/dev/null")
+        {
+            paths.push(path.to_string());
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn count_unified_diff_changes(patch: &str) -> (i64, i64) {
+    patch.lines().fold((0, 0), |(added, removed), line| {
+        if line.starts_with("+++") {
+            (added, removed)
+        } else if line.starts_with("---") {
+            (added, removed)
+        } else if line.starts_with('+') {
+            (added + 1, removed)
+        } else if line.starts_with('-') {
+            (added, removed + 1)
+        } else {
+            (added, removed)
+        }
+    })
+}
+
 fn collect_file_paths_inner(value: &Value, results: &mut Vec<String>) {
     match value {
         Value::Object(map) => {
@@ -9123,6 +9321,57 @@ fn collect_file_paths_inner(value: &Value, results: &mut Vec<String>) {
 
 fn looks_like_file_path(path: &str) -> bool {
     path.contains('/') || path.contains('.') || path.contains('\\')
+}
+
+/// Returns the first human-readable text carried by a provider event.
+/// Providers use both flat strings and nested summary/content-part structures.
+fn extract_display_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => (!text.trim().is_empty()).then(|| text.trim().to_string()),
+        Value::Array(items) => items.iter().find_map(extract_display_text),
+        Value::Object(map) => [
+            "text",
+            "summary",
+            "content",
+            "description",
+            "title",
+            "message",
+            "reasoning",
+        ]
+        .iter()
+        .find_map(|key| map.get(*key).and_then(extract_display_text)),
+        _ => None,
+    }
+}
+
+/// Adds a compact explanation to unknown protocol events without dumping payloads.
+fn summarize_event_fields(value: &Value) -> String {
+    let Some(map) = value.as_object() else {
+        return String::new();
+    };
+    let details = [
+        "message",
+        "summary",
+        "description",
+        "title",
+        "name",
+        "status",
+        "reason",
+        "error",
+    ]
+    .iter()
+    .filter_map(|key| {
+        map.get(*key)
+            .and_then(extract_display_text)
+            .map(|text| format!("{key}={}", truncate_tool_text(&text, 120)))
+    })
+    .take(2)
+    .collect::<Vec<_>>();
+    if details.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", details.join(", "))
+    }
 }
 
 fn truncate_tool_text(text: &str, max_chars: usize) -> String {
@@ -9212,7 +9461,10 @@ impl ClaudeStreamingState {
                 }
             }
             other => {
-                self.latest_status = Some(format!("[debug:claude:type] unhandled type={other}"));
+                self.latest_status = Some(format!(
+                    "[debug:claude:type] unhandled type={other}{}",
+                    summarize_event_fields(&value)
+                ));
                 Ok(None)
             }
         }
@@ -9277,7 +9529,12 @@ impl ClaudeStreamingState {
             }
             _ => {
                 self.latest_status = render_claude_stream_event_status(event_type, event_value)
-                    .or_else(|| Some(format!("[debug:claude:event] unhandled type={event_type}")));
+                    .or_else(|| {
+                        Some(format!(
+                            "[debug:claude:event] unhandled type={event_type}{}",
+                            summarize_event_fields(event_value)
+                        ))
+                    });
                 None
             }
         }
@@ -9383,7 +9640,17 @@ fn render_claude_content_block_status(block: &Value, phase: &str) -> Option<Stri
                 None => format!("[claude:{tool}] {phase}"),
             })
         }
-        "thinking" | "redacted_thinking" => Some(format!("[claude] thinking {phase}")),
+        "thinking" | "redacted_thinking" => {
+            let detail = block
+                .get("thinking")
+                .or_else(|| block.get("text"))
+                .and_then(extract_display_text)
+                .map(|text| truncate_tool_text(&text, 240));
+            Some(match detail {
+                Some(detail) => format!("[claude:thinking] {phase}: {detail}"),
+                None => format!("[claude] thinking {phase}"),
+            })
+        }
         "text" => None,
         other => Some(format!("[claude:{other}] {phase}")),
     }
@@ -9495,7 +9762,8 @@ impl OpenCodeStreamingState {
                 .unwrap_or(Ok(OpenCodeStreamEvent::None)),
             other if other.is_empty() => Ok(OpenCodeStreamEvent::None),
             other => Ok(OpenCodeStreamEvent::Status(format!(
-                "[debug:opencode:type] unhandled type={other}"
+                "[debug:opencode:type] unhandled type={other}{}",
+                summarize_event_fields(&value)
             ))),
         }
     }
@@ -10364,7 +10632,10 @@ fn render_opencode_event_status(event_type: &str, properties: &Value) -> Option<
             render_opencode_file_event_status(event_type, properties)
         }
         other if other.is_empty() => None,
-        other => Some(format!("[debug:opencode:event] unhandled type={other}")),
+        other => Some(format!(
+            "[debug:opencode:event] unhandled type={other}{}",
+            summarize_event_fields(properties)
+        )),
     }
 }
 

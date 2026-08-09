@@ -29,8 +29,9 @@ use crate::{
         ClientAuthRequestInput, ClientAuthStatus, CreateProjectInput, CreateSessionInput,
         GitStatusDetail, InputMode, MessageRole, MessageSnapshotEvent, ModelProviderConfig,
         ProjectGitStatus, ProjectSummary, PushDeviceRegistration, RegisterPushDeviceInput,
-        ResolvedProviderConfig, SendMessageInput, SessionDetail, SessionEvent, SessionStatus,
-        SessionStatusEvent, SessionSummary, TriggerClientMessageInput, TriggerClientMessageResult,
+        ResolvedProviderConfig, SendMessageInput, SessionDetail, SessionDiffEvent, SessionEvent,
+        SessionStatus, SessionStatusEvent, SessionSummary, TriggerClientMessageInput,
+        TriggerClientMessageResult,
     },
     push::PushService,
     secret_store::SecretStore,
@@ -93,6 +94,12 @@ struct PersistedSessionMetadataEntry {
     session: Option<SessionSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_unread_message_id: Option<String>,
+    #[serde(default)]
+    diffs: Vec<SessionDiffEvent>,
+    #[serde(default)]
+    system_messages: Vec<ChatMessage>,
+    #[serde(default)]
+    user_messages: Vec<ChatMessage>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -191,6 +198,8 @@ pub struct AppState {
     session_title_overrides: RwLock<HashMap<String, String>>,
     unread_message_ids: RwLock<HashMap<String, String>>,
     messages: RwLock<HashMap<String, Vec<ChatMessage>>>,
+    session_diffs: RwLock<HashMap<String, Vec<SessionDiffEvent>>>,
+    metadata_write_lock: Mutex<()>,
     client_message_results: RwLock<HashMap<(String, String), (ChatMessage, ChatMessage)>>,
     devices: RwLock<HashMap<String, PushDeviceRegistration>>,
     list_cache: Mutex<Option<AggregatedListCache>>,
@@ -236,6 +245,7 @@ pub enum MarkSessionReadError {
 
 impl AppState {
     const LIST_CACHE_TTL: Duration = Duration::from_secs(5);
+    const MAX_PERSISTED_DIFF_CHARS: usize = 200_000;
     const STALE_RUNNING_SESSION_DAYS: i64 = 7;
 
     #[allow(dead_code)]
@@ -309,7 +319,25 @@ impl AppState {
                     })
                     .collect(),
             ),
-            messages: RwLock::new(HashMap::new()),
+            messages: RwLock::new(
+                persisted_metadata
+                    .sessions
+                    .iter()
+                    .filter_map(|(id, entry)| {
+                        let mut messages = entry.user_messages.clone();
+                        messages.extend(entry.system_messages.clone());
+                        (!messages.is_empty()).then(|| (id.clone(), messages))
+                    })
+                    .collect(),
+            ),
+            session_diffs: RwLock::new(
+                persisted_metadata
+                    .sessions
+                    .iter()
+                    .map(|(id, entry)| (id.clone(), entry.diffs.clone()))
+                    .collect(),
+            ),
+            metadata_write_lock: Mutex::new(()),
             client_message_results: RwLock::new(HashMap::new()),
             devices: RwLock::new(load_device_registrations()),
             list_cache: Mutex::new(None),
@@ -385,7 +413,25 @@ impl AppState {
                     })
                     .collect(),
             ),
-            messages: RwLock::new(HashMap::new()),
+            messages: RwLock::new(
+                persisted_metadata
+                    .sessions
+                    .iter()
+                    .filter_map(|(id, entry)| {
+                        let mut messages = entry.user_messages.clone();
+                        messages.extend(entry.system_messages.clone());
+                        (!messages.is_empty()).then(|| (id.clone(), messages))
+                    })
+                    .collect(),
+            ),
+            session_diffs: RwLock::new(
+                persisted_metadata
+                    .sessions
+                    .iter()
+                    .map(|(id, entry)| (id.clone(), entry.diffs.clone()))
+                    .collect(),
+            ),
+            metadata_write_lock: Mutex::new(()),
             client_message_results: RwLock::new(HashMap::new()),
             devices: RwLock::new(load_device_registrations()),
             list_cache: Mutex::new(None),
@@ -459,7 +505,25 @@ impl AppState {
                     })
                     .collect(),
             ),
-            messages: RwLock::new(HashMap::new()),
+            messages: RwLock::new(
+                persisted_metadata
+                    .sessions
+                    .iter()
+                    .filter_map(|(id, entry)| {
+                        let mut messages = entry.user_messages.clone();
+                        messages.extend(entry.system_messages.clone());
+                        (!messages.is_empty()).then(|| (id.clone(), messages))
+                    })
+                    .collect(),
+            ),
+            session_diffs: RwLock::new(
+                persisted_metadata
+                    .sessions
+                    .iter()
+                    .map(|(id, entry)| (id.clone(), entry.diffs.clone()))
+                    .collect(),
+            ),
+            metadata_write_lock: Mutex::new(()),
             client_message_results: RwLock::new(HashMap::new()),
             devices: RwLock::new(load_device_registrations()),
             list_cache: Mutex::new(None),
@@ -910,6 +974,14 @@ impl AppState {
         Some(SessionDetail {
             session,
             git_status,
+            diffs: dedupe_session_diffs(
+                self.session_diffs
+                    .read()
+                    .await
+                    .get(session_id)
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
         })
     }
 
@@ -1930,7 +2002,34 @@ impl AppState {
             created_at: Utc::now(),
         };
         self.push_message(message.clone()).await;
+        if let Err(error) = self.write_session_metadata().await {
+            eprintln!("failed to persist session activity: {error}");
+        }
         self.publish_event(SessionEvent::MessageCreated(message));
+    }
+
+    pub async fn emit_session_diff(&self, mut event: SessionDiffEvent) {
+        if let Some(patch) = event.patch.as_mut() {
+            if patch.chars().count() > Self::MAX_PERSISTED_DIFF_CHARS {
+                *patch = format!(
+                    "{}\n\n[diff truncated by omni-code-bridge]",
+                    patch
+                        .chars()
+                        .take(Self::MAX_PERSISTED_DIFF_CHARS)
+                        .collect::<String>()
+                );
+            }
+        }
+        let mut diffs = self.session_diffs.write().await;
+        let entries = diffs.entry(event.session_id.clone()).or_default();
+        let key = session_diff_key(&event);
+        entries.retain(|item| session_diff_key(item) != key);
+        entries.push(event.clone());
+        drop(diffs);
+        if let Err(error) = self.write_session_metadata().await {
+            eprintln!("failed to persist session diff: {error}");
+        }
+        self.publish_event(SessionEvent::SessionDiff(event));
     }
 
     pub async fn finish_assistant_message(
@@ -2671,8 +2770,11 @@ impl AppState {
     }
 
     async fn write_session_metadata(&self) -> Result<(), String> {
+        let _write_guard = self.metadata_write_lock.lock().await;
         let entries = self.session_title_overrides.read().await.clone();
         let unread_message_ids = self.unread_message_ids.read().await.clone();
+        let session_diffs = self.session_diffs.read().await.clone();
+        let system_messages = self.messages.read().await.clone();
         let canonical_sessions = self.sessions.read().await.clone();
         let mut metadata = PersistedSessionMetadata {
             sessions: HashMap::new(),
@@ -2685,6 +2787,21 @@ impl AppState {
                     title: entries.get(&session_id).cloned(),
                     session: Some(session),
                     last_unread_message_id: unread_message_ids.get(&session_id).cloned(),
+                    diffs: session_diffs.get(&session_id).cloned().unwrap_or_default(),
+                    system_messages: system_messages
+                        .get(&session_id)
+                        .into_iter()
+                        .flatten()
+                        .filter(|message| matches!(message.role, MessageRole::System))
+                        .cloned()
+                        .collect(),
+                    user_messages: system_messages
+                        .get(&session_id)
+                        .into_iter()
+                        .flatten()
+                        .filter(|message| matches!(message.role, MessageRole::User))
+                        .cloned()
+                        .collect(),
                 },
             );
         }
@@ -2964,6 +3081,24 @@ impl AppState {
     ) -> Option<Arc<dyn crate::adapter::AgentProvider>> {
         self.providers.get(agent)
     }
+}
+
+fn session_diff_key(event: &SessionDiffEvent) -> String {
+    format!(
+        "{}:{}",
+        event.conversation_turn_id.as_deref().unwrap_or_default(),
+        event.files.first().cloned().unwrap_or_default()
+    )
+}
+
+fn dedupe_session_diffs(diffs: Vec<SessionDiffEvent>) -> Vec<SessionDiffEvent> {
+    let mut deduped = Vec::new();
+    for diff in diffs {
+        let key = session_diff_key(&diff);
+        deduped.retain(|item| session_diff_key(item) != key);
+        deduped.push(diff);
+    }
+    deduped
 }
 
 #[derive(Debug, Clone, Default)]

@@ -223,6 +223,8 @@ pub struct SessionDetail {
     pub session: SessionSummary,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_status: Option<GitStatusDetail>,
+    #[serde(default)]
+    pub diffs: Vec<SessionDiffEvent>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -503,6 +505,23 @@ pub struct MessageSnapshotEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionDiffEvent {
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_turn_id: Option<String>,
+    #[serde(default)]
+    pub files: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub added: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub removed: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub patch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentErrorEvent {
     pub session_id: String,
     pub message: String,
@@ -569,6 +588,7 @@ pub enum SessionEvent {
     MessageCreated(ChatMessage),
     MessageDelta(MessageDeltaEvent),
     MessageSnapshot(MessageSnapshotEvent),
+    SessionDiff(SessionDiffEvent),
     AgentError(AgentErrorEvent),
     ApprovalRequested(ApprovalRequestEvent),
     ApprovalResolved(ApprovalResolvedEvent),
