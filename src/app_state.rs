@@ -10,11 +10,16 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::{
     sync::{Mutex, RwLock, broadcast, mpsc},
     task::AbortHandle,
 };
 use uuid::Uuid;
+
+tokio::task_local! {
+    static DOMAIN_TURN_ID: String;
+}
 
 use crate::{
     adapter::ProviderRegistry,
@@ -35,11 +40,17 @@ use crate::{
     },
     push::PushService,
     secret_store::SecretStore,
+    session_domain::{
+        ActivityKind, AgentProjection, ArtifactKind, CreateTurnCommand, CreateTurnResult,
+        EntityState, MessagePurpose, SessionDomainEvent, SessionState, TurnStatus,
+    },
+    session_domain_store::{DomainStoreError, SessionDomainStore},
     session_store::project_id_for_path,
 };
 
 #[derive(Default)]
 struct SessionRuntimeState {
+    current_turn_id: Option<String>,
     provider_session_ref: Option<String>,
     /// The codex model_provider name used when creating the current thread.
     /// Stored so we can resume with the same provider (codex binds threads to providers).
@@ -120,6 +131,7 @@ impl SessionRuntimeState {
             request
         });
         Self {
+            current_turn_id: None,
             provider_session_ref: value.provider_session_ref,
             codex_provider_name: value.codex_provider_name,
             codex_model: value.codex_model,
@@ -211,6 +223,7 @@ pub struct AppState {
     client_auth: ClientAuthStore,
     secret_store: SecretStore,
     push: PushService,
+    session_domain: Arc<SessionDomainStore>,
     runtime_store_path: PathBuf,
     session_metadata_store_path: PathBuf,
 }
@@ -283,6 +296,10 @@ impl AppState {
         let persisted_runtime = load_persisted_runtime(&runtime_store_path).await;
         let persisted_metadata =
             load_persisted_session_metadata(&session_metadata_store_path).await;
+        let session_domain = Arc::new(
+            SessionDomainStore::open(&domain_store_path(&session_metadata_store_path))
+                .expect("session domain store should open"),
+        );
         let state = Self {
             projects: RwLock::new(persisted_metadata.projects.clone()),
             sessions: RwLock::new(
@@ -359,9 +376,14 @@ impl AppState {
             client_auth: ClientAuthStore::load().await,
             secret_store: SecretStore::load().await,
             push: PushService::new(),
+            session_domain,
             runtime_store_path,
             session_metadata_store_path,
         };
+        state.ensure_domain_sessions().await;
+        if let Err(error) = state.recover_domain_active_turns().await {
+            debug_log!("[domain] failed to recover active turns: {error}");
+        }
         state.interrupt_stale_running_sessions(Utc::now()).await;
         state
     }
@@ -377,6 +399,10 @@ impl AppState {
         let persisted_runtime = load_persisted_runtime(&runtime_store_path).await;
         let persisted_metadata =
             load_persisted_session_metadata(&session_metadata_store_path).await;
+        let session_domain = Arc::new(
+            SessionDomainStore::open(&domain_store_path(&session_metadata_store_path))
+                .expect("session domain store should open"),
+        );
         let state = Self {
             projects: RwLock::new(persisted_metadata.projects.clone()),
             sessions: RwLock::new(
@@ -453,9 +479,14 @@ impl AppState {
             client_auth: ClientAuthStore::load().await,
             secret_store: SecretStore::load().await,
             push: PushService::new(),
+            session_domain,
             runtime_store_path,
             session_metadata_store_path,
         };
+        state.ensure_domain_sessions().await;
+        if let Err(error) = state.recover_domain_active_turns().await {
+            debug_log!("[domain] failed to recover active turns: {error}");
+        }
         state.interrupt_stale_running_sessions(Utc::now()).await;
         state
     }
@@ -469,6 +500,10 @@ impl AppState {
         let persisted_runtime = load_persisted_runtime(&runtime_store_path).await;
         let persisted_metadata =
             load_persisted_session_metadata(&session_metadata_store_path).await;
+        let session_domain = Arc::new(
+            SessionDomainStore::open(&domain_store_path(&session_metadata_store_path))
+                .map_err(anyhow::Error::msg)?,
+        );
         let state = Self {
             projects: RwLock::new(persisted_metadata.projects.clone()),
             sessions: RwLock::new(
@@ -545,15 +580,67 @@ impl AppState {
             client_auth: ClientAuthStore::load().await,
             secret_store: SecretStore::load().await,
             push: PushService::new(),
+            session_domain,
             runtime_store_path,
             session_metadata_store_path,
         };
+        state.ensure_domain_sessions().await;
+        state
+            .recover_domain_active_turns()
+            .await
+            .map_err(anyhow::Error::msg)?;
         state.interrupt_stale_running_sessions(Utc::now()).await;
         Ok(state)
     }
 
     pub async fn is_runtime_client_id_allowed(&self, client_id: &str) -> bool {
         self.client_auth.has_approved_client_id(client_id).await
+    }
+
+    async fn ensure_domain_sessions(&self) {
+        let sessions = self
+            .sessions
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for session in sessions {
+            if let Err(error) = self.session_domain.ensure_session(&session) {
+                debug_log!("[domain] failed to import session={}: {error}", session.id);
+            } else if let Err(error) = self.session_domain.sync_session_metadata(&session) {
+                debug_log!("[domain] failed to sync session={}: {error}", session.id);
+            }
+        }
+    }
+
+    async fn recover_domain_active_turns(&self) -> Result<(), String> {
+        let interrupted = self.session_domain.interrupt_active_turns()?;
+        for session_id in interrupted {
+            let summary = {
+                let mut sessions = self.sessions.write().await;
+                let Some(session) = sessions.get_mut(&session_id) else {
+                    continue;
+                };
+                session.status = SessionStatus::Interrupted;
+                session.pending_approval = None;
+                session.updated_at = Utc::now();
+                session.clone()
+            };
+            self.update_runtime_state(&session_id, |runtime| {
+                runtime.interrupted = true;
+                runtime.turn_in_flight = false;
+                runtime.turn_abort = None;
+                runtime.cancel_tx = None;
+                runtime.approval_tx = None;
+                runtime.pending_approval = None;
+            })
+            .await;
+            self.persist_canonical_session(&summary).await?;
+            self.publish_event(SessionEvent::SessionSnapshot(summary));
+        }
+        self.invalidate_list_cache().await;
+        Ok(())
     }
 
     pub async fn client_token_matches(&self, client_id: &str, token: &str) -> bool {
@@ -1064,6 +1151,7 @@ impl AppState {
         self.runtime.lock().await.insert(
             session.id.clone(),
             SessionRuntimeState {
+                current_turn_id: None,
                 provider_session_ref: None,
                 codex_provider_name: None,
                 codex_model: None,
@@ -1081,6 +1169,7 @@ impl AppState {
         self.invalidate_list_cache().await;
         self.refresh_project_summary(&session.project_id).await;
         self.persist_canonical_session(&session).await?;
+        self.session_domain.ensure_session(&session)?;
 
         self.publish_event(SessionEvent::SessionSnapshot(session.clone()));
 
@@ -1233,6 +1322,150 @@ impl AppState {
             receiver,
             replay,
             high_watermark,
+        }
+    }
+
+    pub async fn domain_session_state(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionState>, String> {
+        if let Some(state) = self.session_domain.session_state(session_id)?
+            && !state.turns.is_empty()
+        {
+            let diffs = self
+                .session_diffs
+                .read()
+                .await
+                .get(session_id)
+                .cloned()
+                .unwrap_or_default();
+            self.session_domain
+                .import_diff_history(session_id, &diffs)?;
+            return self.session_domain.session_state(session_id);
+        }
+        let session = if let Some(session) = self.find_session(session_id).await {
+            session
+        } else {
+            self.invalidate_list_cache().await;
+            let Some(session) = self.find_session(session_id).await else {
+                return Ok(None);
+            };
+            session
+        };
+        self.session_domain.ensure_session(&session)?;
+        self.session_domain.sync_session_metadata(&session)?;
+        if let Some(messages) = self.list_messages(session_id).await {
+            self.session_domain
+                .import_message_history(session_id, &messages)?;
+        }
+        let diffs = self
+            .session_diffs
+            .read()
+            .await
+            .get(session_id)
+            .cloned()
+            .unwrap_or_default();
+        self.session_domain
+            .import_diff_history(session_id, &diffs)?;
+        self.session_domain.session_state(session_id)
+    }
+
+    pub async fn create_domain_turn(
+        &self,
+        session_id: &str,
+        command: &CreateTurnCommand,
+    ) -> Result<CreateTurnResult, DomainStoreError> {
+        self.domain_session_state(session_id)
+            .await
+            .map_err(DomainStoreError::Storage)?
+            .ok_or_else(|| DomainStoreError::NotFound("session not found".to_string()))?;
+        self.session_domain.create_turn(session_id, command)
+    }
+
+    pub async fn mark_domain_session_read(&self, session_id: &str) -> Result<(), String> {
+        self.domain_session_state(session_id)
+            .await?
+            .ok_or_else(|| "session not found".to_string())?;
+        self.clear_session_unread(session_id).await
+    }
+
+    pub fn domain_events_after(
+        &self,
+        session_id: &str,
+        after: i64,
+        limit: usize,
+    ) -> Result<Vec<SessionDomainEvent>, String> {
+        self.session_domain.events_after(session_id, after, limit)
+    }
+
+    pub fn subscribe_domain_events(&self) -> broadcast::Receiver<SessionDomainEvent> {
+        self.session_domain.subscribe()
+    }
+
+    pub fn domain_event_snapshot(
+        &self,
+        session_id: &str,
+        turn_id: Option<&str>,
+    ) -> Result<
+        Option<(
+            crate::session_domain::DomainSession,
+            Option<crate::session_domain::Turn>,
+        )>,
+        String,
+    > {
+        self.session_domain.event_snapshot(session_id, turn_id)
+    }
+
+    fn project_agent_event(&self, session_id: &str, event: AgentProjection) {
+        let turn_id = DOMAIN_TURN_ID.try_with(Clone::clone);
+        let Ok(turn_id) = turn_id else {
+            debug_log!("[domain] ignored unbound projection for session={session_id}");
+            return;
+        };
+        if let Err(error) = self
+            .session_domain
+            .project_agent_event(session_id, &turn_id, event)
+        {
+            debug_log!("[domain] failed to project event for session={session_id}: {error}");
+        }
+    }
+
+    fn bound_domain_turn_is_active(&self, session_id: &str) -> bool {
+        let Ok(expected_turn_id) = DOMAIN_TURN_ID.try_with(Clone::clone) else {
+            return true;
+        };
+        let active_turn_id = self
+            .session_domain
+            .session_state(session_id)
+            .ok()
+            .flatten()
+            .and_then(|state| state.session.active_turn_id);
+        let is_active = active_turn_id.as_deref() == Some(expected_turn_id.as_str());
+        if !is_active {
+            debug_log!(
+                "[domain] ignored stale provider callback for session={session_id}, turn={expected_turn_id}"
+            );
+        }
+        is_active
+    }
+
+    fn project_active_turn_event(&self, session_id: &str, event: AgentProjection) {
+        let turn_id = self
+            .session_domain
+            .session_state(session_id)
+            .ok()
+            .flatten()
+            .and_then(|state| state.session.active_turn_id);
+        let Some(turn_id) = turn_id else {
+            return;
+        };
+        if let Err(error) = self
+            .session_domain
+            .project_agent_event(session_id, &turn_id, event)
+        {
+            debug_log!(
+                "[domain] failed to project control event for session={session_id}: {error}"
+            );
         }
     }
 
@@ -1564,6 +1797,7 @@ impl AppState {
         session_id: &str,
         input: SendMessageInput,
     ) -> Result<(ChatMessage, ChatMessage), String> {
+        let domain_turn_id = DOMAIN_TURN_ID.try_with(Clone::clone).ok();
         let client_message_id = input
             .client_message_id
             .as_deref()
@@ -1589,6 +1823,7 @@ impl AppState {
             }
             entry.turn_in_flight = true;
             entry.interrupted = false;
+            entry.current_turn_id = domain_turn_id.clone();
         })
         .await;
         if already_processing {
@@ -1649,6 +1884,13 @@ impl AppState {
                 status: SessionStatus::Idle,
                 error_message: None,
             }));
+            self.project_agent_event(
+                session_id,
+                AgentProjection::TurnStatus {
+                    status: TurnStatus::Completed,
+                    error: None,
+                },
+            );
             return Ok((user_message.clone(), user_message));
         }
 
@@ -1704,7 +1946,13 @@ impl AppState {
             status: SessionStatus::Running,
             error_message: None,
         }));
-
+        self.project_agent_event(
+            session_id,
+            AgentProjection::TurnStatus {
+                status: TurnStatus::Running,
+                error: None,
+            },
+        );
         // Resolve provider configuration
         let provider_config = self
             .resolve_provider_config(&session_snapshot, &input.provider_id)
@@ -1732,18 +1980,26 @@ impl AppState {
         let session_id_for_task = session_id.clone();
         let user_message_for_task = user_message.clone();
         let pending_reply_for_task = pending_reply.clone();
+        let domain_turn_id_for_runtime = domain_turn_id.clone();
         let handle = tokio::spawn(async move {
-            let result = provider
-                .run_session(
-                    state.clone(),
-                    session_snapshot,
-                    user_message_for_task,
-                    system_prompt,
-                    pending_reply_for_task,
-                    provider_config,
-                    reasoning_effort,
-                )
-                .await;
+            let run = async {
+                provider
+                    .run_session(
+                        state.clone(),
+                        session_snapshot,
+                        user_message_for_task,
+                        system_prompt,
+                        pending_reply_for_task,
+                        provider_config,
+                        reasoning_effort,
+                    )
+                    .await
+            };
+            let result = if let Some(turn_id) = domain_turn_id {
+                DOMAIN_TURN_ID.scope(turn_id, run).await
+            } else {
+                run.await
+            };
             if let Err(error) = result {
                 eprintln!(
                     "[session] session={} failed: {:#}",
@@ -1757,9 +2013,25 @@ impl AppState {
             state.finish_turn(&session_id_for_task).await;
         });
         let abort_handle = handle.abort_handle();
-        self.set_turn_abort(&session_id, Some(abort_handle)).await;
+        if let Some(turn_id) = domain_turn_id_for_runtime {
+            self.set_turn_abort_for_turn(&session_id, &turn_id, Some(abort_handle))
+                .await;
+        } else {
+            self.set_turn_abort(&session_id, Some(abort_handle)).await;
+        }
 
         Ok((user_message, pending_reply))
+    }
+
+    pub async fn send_domain_message(
+        self: &Arc<Self>,
+        session_id: &str,
+        turn_id: &str,
+        input: SendMessageInput,
+    ) -> Result<(ChatMessage, ChatMessage), String> {
+        DOMAIN_TURN_ID
+            .scope(turn_id.to_string(), self.send_message(session_id, input))
+            .await
     }
 
     pub async fn cancel_turn(&self, session_id: &str) -> Result<bool, String> {
@@ -1843,6 +2115,13 @@ impl AppState {
                 status: SessionStatus::Interrupted,
                 error_message: None,
             }));
+            self.project_active_turn_event(
+                &canonical_session_id,
+                AgentProjection::TurnStatus {
+                    status: TurnStatus::Cancelled,
+                    error: None,
+                },
+            );
         }
         Ok(should_interrupt || provider_cancelled)
     }
@@ -1970,6 +2249,9 @@ impl AppState {
         message_id: &str,
         content: &str,
     ) {
+        if !self.bound_domain_turn_is_active(session_id) {
+            return;
+        }
         let content = content.to_string();
         {
             let mut messages = self.messages.write().await;
@@ -1984,16 +2266,84 @@ impl AppState {
         self.publish_event(SessionEvent::MessageSnapshot(MessageSnapshotEvent {
             session_id: session_id.to_string(),
             message_id: message_id.to_string(),
-            content,
+            content: content.clone(),
         }));
+        self.project_agent_event(
+            session_id,
+            AgentProjection::AssistantMessage {
+                message_id: message_id.to_string(),
+                purpose: MessagePurpose::Final,
+                state: EntityState::Running,
+                content: content.to_string(),
+            },
+        );
     }
 
     pub async fn emit_system_message(&self, session_id: &str, content: impl Into<String>) {
+        if !self.bound_domain_turn_is_active(session_id) {
+            return;
+        }
         let content = content.into().trim().to_string();
         if content.is_empty() {
             return;
         }
 
+        self.emit_activity(
+            session_id,
+            classify_activity_kind(&content),
+            content.clone(),
+            None,
+            Vec::new(),
+            serde_json::json!({ "raw": content }),
+        )
+        .await;
+
+        let message = ChatMessage {
+            id: Uuid::new_v4().to_string(),
+            session_id: session_id.to_string(),
+            role: MessageRole::System,
+            content: content.clone(),
+            created_at: Utc::now(),
+        };
+        self.push_message(message.clone()).await;
+        if let Err(error) = self.write_session_metadata().await {
+            eprintln!("failed to persist session activity: {error}");
+        }
+        self.publish_event(SessionEvent::MessageCreated(message));
+    }
+
+    pub async fn emit_progress(&self, session_id: &str, content: impl Into<String>) {
+        let activity = crate::adapter::provider_activity_from_status(content);
+        self.emit_provider_activity(session_id, activity).await;
+    }
+
+    pub async fn emit_provider_activity(
+        &self,
+        session_id: &str,
+        activity: crate::adapter::ProviderActivity,
+    ) {
+        if !self.bound_domain_turn_is_active(session_id) {
+            return;
+        }
+        let content = activity.title.trim().to_string();
+        if content.is_empty() {
+            return;
+        }
+        self.emit_activity_with_state(
+            session_id,
+            activity.correlation_key.as_deref().map(|key| {
+                let turn_id = DOMAIN_TURN_ID.try_with(Clone::clone).unwrap_or_default();
+                let digest = Sha256::digest(format!("{session_id}\0{turn_id}\0{key}").as_bytes());
+                format!("provider:{digest:x}")
+            }),
+            activity.kind,
+            activity.state,
+            content.clone(),
+            None,
+            Vec::new(),
+            activity.payload,
+        )
+        .await;
         let message = ChatMessage {
             id: Uuid::new_v4().to_string(),
             session_id: session_id.to_string(),
@@ -2008,7 +2358,64 @@ impl AppState {
         self.publish_event(SessionEvent::MessageCreated(message));
     }
 
+    pub async fn emit_activity(
+        &self,
+        session_id: &str,
+        kind: ActivityKind,
+        title: impl Into<String>,
+        primary: Option<String>,
+        secondary: Vec<String>,
+        payload: serde_json::Value,
+    ) {
+        self.emit_activity_with_state(
+            session_id,
+            None,
+            kind,
+            EntityState::Running,
+            title,
+            primary,
+            secondary,
+            payload,
+        )
+        .await;
+    }
+
+    async fn emit_activity_with_state(
+        &self,
+        session_id: &str,
+        activity_id: Option<String>,
+        kind: ActivityKind,
+        state: EntityState,
+        title: impl Into<String>,
+        primary: Option<String>,
+        secondary: Vec<String>,
+        payload: serde_json::Value,
+    ) {
+        if !self.bound_domain_turn_is_active(session_id) {
+            return;
+        }
+        let title = title.into().trim().to_string();
+        if title.is_empty() {
+            return;
+        }
+        self.project_agent_event(
+            session_id,
+            AgentProjection::Activity {
+                activity_id: activity_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+                kind,
+                state,
+                title,
+                primary,
+                secondary,
+                payload,
+            },
+        );
+    }
+
     pub async fn emit_session_diff(&self, mut event: SessionDiffEvent) {
+        if !self.bound_domain_turn_is_active(&event.session_id) {
+            return;
+        }
         if let Some(patch) = event.patch.as_mut() {
             if patch.chars().count() > Self::MAX_PERSISTED_DIFF_CHARS {
                 *patch = format!(
@@ -2029,7 +2436,24 @@ impl AppState {
         if let Err(error) = self.write_session_metadata().await {
             eprintln!("failed to persist session diff: {error}");
         }
-        self.publish_event(SessionEvent::SessionDiff(event));
+        self.publish_event(SessionEvent::SessionDiff(event.clone()));
+        let artifact_owner = DOMAIN_TURN_ID.try_with(Clone::clone).unwrap_or_else(|_| {
+            event
+                .conversation_turn_id
+                .clone()
+                .unwrap_or_else(|| event.session_id.clone())
+        });
+        let artifact_id = format!("{artifact_owner}:turn-diff");
+        self.project_agent_event(
+            &event.session_id,
+            AgentProjection::Artifact {
+                artifact_id,
+                kind: ArtifactKind::TurnCumulativeDiff,
+                state: EntityState::Running,
+                source_activity_id: None,
+                payload: serde_json::to_value(&event).unwrap_or_default(),
+            },
+        );
     }
 
     pub async fn finish_assistant_message(
@@ -2037,6 +2461,9 @@ impl AppState {
         session_id: &str,
         message_id: &str,
     ) -> Result<(), String> {
+        if !self.bound_domain_turn_is_active(session_id) {
+            return Ok(());
+        }
         let mut assistant_message = {
             let mut messages = self.messages.write().await;
             let message = messages
@@ -2072,6 +2499,22 @@ impl AppState {
             status: SessionStatus::Idle,
             error_message: None,
         }));
+        self.project_agent_event(
+            session_id,
+            AgentProjection::AssistantMessage {
+                message_id: assistant_message_id.clone(),
+                purpose: MessagePurpose::Final,
+                state: EntityState::Completed,
+                content: content.clone(),
+            },
+        );
+        self.project_agent_event(
+            session_id,
+            AgentProjection::TurnStatus {
+                status: TurnStatus::Completed,
+                error: None,
+            },
+        );
         self.mark_session_unread(session_id, &assistant_message_id)
             .await?;
         if let Some(session) = self.find_session(session_id).await {
@@ -2178,6 +2621,9 @@ impl AppState {
     }
 
     pub async fn fail_session(&self, session_id: &str, message: String) {
+        if !self.bound_domain_turn_is_active(session_id) {
+            return;
+        }
         self.patch_session(session_id, SessionStatus::Failed, Some(message.clone()))
             .await;
         self.clear_interrupted(session_id).await;
@@ -2191,6 +2637,19 @@ impl AppState {
             status: SessionStatus::Failed,
             error_message: Some(message.clone()),
         }));
+        self.project_agent_event(
+            session_id,
+            AgentProjection::TurnStatus {
+                status: TurnStatus::Failed,
+                error: Some(message),
+            },
+        );
+    }
+
+    pub async fn fail_domain_turn(&self, session_id: &str, turn_id: &str, message: String) {
+        DOMAIN_TURN_ID
+            .scope(turn_id.to_string(), self.fail_session(session_id, message))
+            .await;
     }
 
     pub async fn set_provider_session_ref(&self, session_id: &str, session_ref: Option<String>) {
@@ -2346,21 +2805,40 @@ impl AppState {
         let entry = runtime
             .entry(session_id.to_string())
             .or_insert_with(SessionRuntimeState::default);
-        entry.approval_tx = Some(sender);
+        let allowed = DOMAIN_TURN_ID
+            .try_with(Clone::clone)
+            .map(|turn| entry.current_turn_id.as_deref() == Some(turn.as_str()))
+            .unwrap_or(true);
+        if allowed {
+            entry.approval_tx = Some(sender);
+        }
     }
 
     pub async fn clear_approval_sender(&self, session_id: &str) {
         let mut runtime = self.runtime.lock().await;
         if let Some(entry) = runtime.get_mut(session_id) {
-            entry.approval_tx = None;
+            let allowed = DOMAIN_TURN_ID
+                .try_with(Clone::clone)
+                .map(|turn| entry.current_turn_id.as_deref() == Some(turn.as_str()))
+                .unwrap_or(true);
+            if allowed {
+                entry.approval_tx = None;
+            }
         }
     }
 
     pub async fn finish_turn(&self, session_id: &str) {
         self.update_runtime_state(session_id, |entry| {
-            entry.turn_in_flight = false;
-            entry.turn_abort = None;
-            entry.cancel_tx = None;
+            let allowed = DOMAIN_TURN_ID
+                .try_with(Clone::clone)
+                .map(|turn| entry.current_turn_id.as_deref() == Some(turn.as_str()))
+                .unwrap_or(true);
+            if allowed {
+                entry.turn_in_flight = false;
+                entry.turn_abort = None;
+                entry.cancel_tx = None;
+                entry.current_turn_id = None;
+            }
         })
         .await;
     }
@@ -2370,7 +2848,13 @@ impl AppState {
         let entry = runtime
             .entry(session_id.to_string())
             .or_insert_with(SessionRuntimeState::default);
-        entry.cancel_tx = Some(sender);
+        let allowed = DOMAIN_TURN_ID
+            .try_with(Clone::clone)
+            .map(|turn| entry.current_turn_id.as_deref() == Some(turn.as_str()))
+            .unwrap_or(true);
+        if allowed {
+            entry.cancel_tx = Some(sender);
+        }
     }
 
     #[cfg(test)]
@@ -2399,6 +2883,20 @@ impl AppState {
             .entry(session_id.to_string())
             .or_insert_with(SessionRuntimeState::default);
         entry.turn_abort = abort_handle;
+    }
+
+    async fn set_turn_abort_for_turn(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        abort_handle: Option<AbortHandle>,
+    ) {
+        let mut runtime = self.runtime.lock().await;
+        if let Some(entry) = runtime.get_mut(session_id)
+            && entry.current_turn_id.as_deref() == Some(turn_id)
+        {
+            entry.turn_abort = abort_handle;
+        }
     }
 
     pub async fn raise_approval(&self, session_id: &str, request: ApprovalRequest) {
@@ -2434,13 +2932,32 @@ impl AppState {
         }
         self.publish_event(SessionEvent::ApprovalRequested(ApprovalRequestEvent {
             session_id: session_id.to_string(),
-            request,
+            request: request.clone(),
         }));
         self.publish_event(SessionEvent::SessionStatus(SessionStatusEvent {
             session_id: session_id.to_string(),
             status: SessionStatus::AwaitingApproval,
             error_message: None,
         }));
+        self.project_agent_event(
+            session_id,
+            AgentProjection::Activity {
+                activity_id: request.request_id.clone(),
+                kind: ActivityKind::Approval,
+                state: EntityState::AwaitingApproval,
+                title: "等待审批".to_string(),
+                primary: request.command.clone().or_else(|| request.reason.clone()),
+                secondary: Vec::new(),
+                payload: serde_json::to_value(&request).unwrap_or_default(),
+            },
+        );
+        self.project_agent_event(
+            session_id,
+            AgentProjection::TurnStatus {
+                status: TurnStatus::AwaitingApproval,
+                error: None,
+            },
+        );
     }
 
     pub async fn resolve_approval(
@@ -2465,13 +2982,32 @@ impl AppState {
         self.publish_event(SessionEvent::ApprovalResolved(ApprovalResolvedEvent {
             session_id: session_id.to_string(),
             request_id: request_id.to_string(),
-            choice,
+            choice: choice.clone(),
         }));
         self.publish_event(SessionEvent::SessionStatus(SessionStatusEvent {
             session_id: session_id.to_string(),
             status: SessionStatus::Running,
             error_message: None,
         }));
+        self.project_active_turn_event(
+            session_id,
+            AgentProjection::Activity {
+                activity_id: request_id.to_string(),
+                kind: ActivityKind::Approval,
+                state: EntityState::Completed,
+                title: preview,
+                primary: None,
+                secondary: Vec::new(),
+                payload: serde_json::json!({ "choice": choice }),
+            },
+        );
+        self.project_active_turn_event(
+            session_id,
+            AgentProjection::TurnStatus {
+                status: TurnStatus::Running,
+                error: None,
+            },
+        );
     }
 
     async fn clear_pending_approval(&self, session_id: &str) {
@@ -2630,6 +3166,9 @@ impl AppState {
                 .map_err(MarkSessionReadError::Persistence)?;
             self.invalidate_list_cache().await;
             self.publish_event(SessionEvent::SessionSnapshot(summary.clone()));
+            self.session_domain
+                .mark_read(session_id)
+                .map_err(MarkSessionReadError::Persistence)?;
         }
         Ok(summary)
     }
@@ -2652,6 +3191,7 @@ impl AppState {
         self.persist_canonical_session(&summary).await?;
         self.invalidate_list_cache().await;
         self.publish_event(SessionEvent::SessionSnapshot(summary));
+        self.session_domain.mark_read(session_id)?;
         Ok(())
     }
 
@@ -2716,6 +3256,7 @@ impl AppState {
         self.invalidate_list_cache().await;
         self.refresh_project_summary(&project_id).await;
         let _ = self.persist_canonical_session(&summary).await;
+        self.session_domain.sync_session_metadata(&summary)?;
         Ok(summary)
     }
 
@@ -2749,6 +3290,7 @@ impl AppState {
         self.invalidate_list_cache().await;
         self.refresh_project_summary(&project_id).await;
         self.publish_event(SessionEvent::SessionSnapshot(summary.clone()));
+        self.session_domain.sync_session_metadata(&summary)?;
         Ok(summary)
     }
 
@@ -3083,6 +3625,28 @@ impl AppState {
     }
 }
 
+fn classify_activity_kind(content: &str) -> ActivityKind {
+    let normalized = content.to_ascii_lowercase();
+    if normalized.starts_with("[reasoning]") {
+        ActivityKind::Reasoning
+    } else if normalized.contains("completed")
+        || normalized.contains("finished")
+        || normalized.contains(" exited")
+        || normalized.contains(":output]")
+    {
+        ActivityKind::ToolResult
+    } else if normalized.starts_with("[exec]")
+        || normalized.starts_with("[process]")
+        || normalized.starts_with("[command")
+        || normalized.starts_with("[acp:")
+        || normalized.contains("tool_call")
+    {
+        ActivityKind::ToolCall
+    } else {
+        ActivityKind::Progress
+    }
+}
+
 fn session_diff_key(event: &SessionDiffEvent) -> String {
     format!(
         "{}:{}",
@@ -3307,6 +3871,14 @@ async fn load_persisted_runtime(path: &PathBuf) -> HashMap<String, PersistedSess
             .unwrap_or_default(),
         Err(_) => HashMap::new(),
     }
+}
+
+fn domain_store_path(metadata_path: &Path) -> PathBuf {
+    let file_name = metadata_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("sessions-metadata.json");
+    metadata_path.with_file_name(format!("{file_name}.v2.sqlite3"))
 }
 
 async fn write_persisted_runtime(
@@ -3699,7 +4271,6 @@ mod tests {
                 ],
             )
             .await;
-
         state.messages.write().await.insert(
             session.id.clone(),
             vec![test_message(
@@ -3802,7 +4373,6 @@ mod tests {
                 ],
             )
             .await;
-
         let messages = state
             .list_messages(&session.id)
             .await
@@ -3920,6 +4490,104 @@ mod tests {
             provider_session_ref_chain_from_refs(&refs, "local"),
             vec!["old-thread".to_string(), "goal-thread".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn domain_state_imports_provider_only_session_on_demand() {
+        let provider = Arc::new(TestMessageProvider::new(HashMap::new()));
+        let registry = ProviderRegistry::from_map(HashMap::from([(
+            AgentKind::Codex,
+            provider.clone() as Arc<dyn AgentProvider>,
+        )]));
+        let state = test_state_with_providers("domain-provider-import", registry).await;
+        let provider_session = SessionSummary {
+            id: "provider-only-session".to_string(),
+            project_id: "provider-project".to_string(),
+            title: "Provider history".to_string(),
+            agent: AgentKind::Codex,
+            brief_reply_mode: false,
+            status: SessionStatus::Idle,
+            updated_at: Utc::now(),
+            unread_count: 0,
+            last_message_preview: Some("history".to_string()),
+            pending_approval: None,
+            runtime_session_ref: None,
+            provider_id: None,
+            reasoning_effort: None,
+            model: None,
+        };
+        provider.set_session(provider_session.clone()).await;
+        let now = Utc::now();
+        provider
+            .set_messages(
+                provider_session.id.clone(),
+                vec![
+                    test_message(
+                        "provider-user",
+                        &provider_session.id,
+                        MessageRole::User,
+                        "old question",
+                        now,
+                    ),
+                    test_message(
+                        "provider-assistant",
+                        &provider_session.id,
+                        MessageRole::Assistant,
+                        "old answer",
+                        now + chrono::TimeDelta::seconds(1),
+                    ),
+                ],
+            )
+            .await;
+        state.session_diffs.write().await.insert(
+            "provider-only-session".to_string(),
+            vec![SessionDiffEvent {
+                session_id: "provider-only-session".to_string(),
+                conversation_turn_id: Some("provider-user".to_string()),
+                files: vec!["src/main.rs".to_string()],
+                added: Some(2),
+                removed: Some(1),
+                patch: Some("@@ -1 +1 @@".to_string()),
+                summary: Some("updated main".to_string()),
+            }],
+        );
+        state
+            .session_domain
+            .ensure_session(&provider_session)
+            .expect("simulate an already imported empty domain session");
+        assert!(
+            state
+                .session_domain
+                .session_state(&provider_session.id)
+                .unwrap()
+                .is_some_and(|snapshot| snapshot.turns.is_empty())
+        );
+        let snapshot = state
+            .domain_session_state(&provider_session.id)
+            .await
+            .unwrap()
+            .expect("provider-only session should be imported on demand");
+
+        assert_eq!(snapshot.session.id, provider_session.id);
+        assert_eq!(snapshot.session.title, provider_session.title);
+        assert_eq!(snapshot.turns.len(), 1);
+        assert_eq!(snapshot.turns[0].user_message.content, "old question");
+        assert_eq!(
+            snapshot.turns[0].segments[0]
+                .message
+                .as_ref()
+                .map(|message| message.content.as_str()),
+            Some("old answer")
+        );
+        assert_eq!(snapshot.turns[0].artifacts.len(), 1);
+        assert_eq!(
+            snapshot.turns[0].artifacts[0]
+                .payload
+                .get("conversation_turn_id")
+                .and_then(serde_json::Value::as_str),
+            Some("provider-user")
+        );
+        assert_eq!(snapshot.cursor, 3);
     }
 
     #[tokio::test]
@@ -5570,5 +6238,43 @@ mod tests {
         let resolved = resolved.expect("explicit provider should resolve");
         assert_eq!(resolved.base_url, "https://explicit.test/v1");
         assert_eq!(resolved.provider_id.as_deref(), Some("codex-explicit"));
+    }
+
+    #[tokio::test]
+    async fn stale_turn_cannot_replace_or_clear_current_runtime_channels() {
+        let state = test_state("stale-runtime-channels").await;
+        let session_id = "session-runtime";
+        state.runtime.lock().await.insert(
+            session_id.to_string(),
+            SessionRuntimeState {
+                current_turn_id: Some("turn-new".to_string()),
+                turn_in_flight: true,
+                ..SessionRuntimeState::default()
+            },
+        );
+        let (new_approval_tx, _new_approval_rx) = mpsc::unbounded_channel();
+        let (new_cancel_tx, _new_cancel_rx) = mpsc::unbounded_channel();
+        DOMAIN_TURN_ID
+            .scope("turn-new".to_string(), async {
+                state.set_approval_sender(session_id, new_approval_tx).await;
+                state.set_cancel_sender(session_id, new_cancel_tx).await;
+            })
+            .await;
+        DOMAIN_TURN_ID
+            .scope("turn-old".to_string(), async {
+                let (old_approval_tx, _old_approval_rx) = mpsc::unbounded_channel();
+                let (old_cancel_tx, _old_cancel_rx) = mpsc::unbounded_channel();
+                state.set_approval_sender(session_id, old_approval_tx).await;
+                state.set_cancel_sender(session_id, old_cancel_tx).await;
+                state.clear_approval_sender(session_id).await;
+                state.finish_turn(session_id).await;
+            })
+            .await;
+        let runtime = state.runtime.lock().await;
+        let runtime = runtime.get(session_id).expect("runtime should remain");
+        assert_eq!(runtime.current_turn_id.as_deref(), Some("turn-new"));
+        assert!(runtime.turn_in_flight);
+        assert!(runtime.approval_tx.is_some());
+        assert!(runtime.cancel_tx.is_some());
     }
 }

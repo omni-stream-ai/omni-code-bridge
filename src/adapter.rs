@@ -40,8 +40,160 @@ use crate::{
         ApprovalRequest, ChatMessage, ProjectSummary, ReasoningEffort, ResolvedProviderConfig,
         SessionDiffEvent, SessionSummary,
     },
+    session_domain::{ActivityKind, EntityState},
     session_store::{load_session_archive_summary, load_session_messages},
 };
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ProviderActivity {
+    pub correlation_key: Option<String>,
+    pub kind: ActivityKind,
+    pub state: EntityState,
+    pub title: String,
+    pub payload: Value,
+}
+
+pub(crate) fn provider_activity_from_status(status: impl Into<String>) -> ProviderActivity {
+    let title = status.into();
+    let status = title.trim_start().to_ascii_lowercase();
+    let label = status
+        .strip_prefix('[')
+        .and_then(|value| value.split_once(']'))
+        .map(|(label, _)| label);
+    let kind = if status.starts_with("[reasoning")
+        || status.starts_with("[thinking")
+        || status.starts_with("[claude:thinking")
+    {
+        ActivityKind::Reasoning
+    } else if status.starts_with("[command:output]")
+        || status.starts_with("[exec:output]")
+        || status.starts_with("[process:output]")
+        || status.starts_with("[exec]:")
+        || status.starts_with("[process]:")
+        || (status.starts_with("[command:")
+            && (status.contains("completed]")
+                || status.contains("failed]")
+                || status.contains("finished]")))
+        || status.contains(" tool result")
+    {
+        ActivityKind::ToolResult
+    } else if status.starts_with("[exec]")
+        || status.starts_with("[process]")
+        || status.starts_with("[command")
+        || status.starts_with("[tool]")
+        || label.is_some_and(|label| {
+            label.starts_with("claude:") && !label.contains("thinking")
+                || label.starts_with("opencode:")
+                    && !label.contains("error")
+                    && !label.contains("permission")
+                    && !matches!(label, "opencode:session" | "opencode:storage")
+        })
+    {
+        ActivityKind::ToolCall
+    } else {
+        ActivityKind::Progress
+    };
+    let state = if status.contains("failed") || status.contains("error") {
+        EntityState::Failed
+    } else if kind == ActivityKind::ToolResult
+        || status.contains("completed")
+        || status.contains("finished")
+        || status.contains(" exit ")
+    {
+        EntityState::Completed
+    } else {
+        EntityState::Running
+    };
+    let correlation_key = match kind {
+        ActivityKind::ToolCall | ActivityKind::ToolResult | ActivityKind::Reasoning => {
+            label.map(|label| {
+                let normalized_label = label
+                    .replace(":output", "")
+                    .replace(":running", "")
+                    .replace(":completed", "")
+                    .replace(":finished", "")
+                    .replace(":failed", "");
+                let detail = title
+                    .split_once(']')
+                    .map(|(_, detail)| detail.trim())
+                    .unwrap_or_default()
+                    .split(" (exit ")
+                    .next()
+                    .unwrap_or_default();
+                if !detail.is_empty() {
+                    format!("{normalized_label}:{detail}")
+                } else {
+                    normalized_label
+                }
+            })
+        }
+        _ => None,
+    };
+    ProviderActivity {
+        correlation_key,
+        kind,
+        state,
+        title,
+        payload: serde_json::json!({ "source": "provider", "raw_status": status }),
+    }
+}
+
+#[cfg(test)]
+mod provider_activity_kind_tests {
+    use super::*;
+
+    #[test]
+    fn maps_structured_provider_status_labels() {
+        assert_eq!(
+            provider_activity_from_status("[reasoning:thinking] checking state").kind,
+            ActivityKind::Reasoning
+        );
+        assert_eq!(
+            provider_activity_from_status("[exec] cargo test").kind,
+            ActivityKind::ToolCall
+        );
+        assert_eq!(
+            provider_activity_from_status("[command:output] passed").kind,
+            ActivityKind::ToolResult
+        );
+        assert_eq!(
+            provider_activity_from_status("waiting for background tasks").kind,
+            ActivityKind::Progress
+        );
+        assert_eq!(
+            provider_activity_from_status("[exec]:stdout ok").kind,
+            ActivityKind::ToolResult
+        );
+        assert_eq!(
+            provider_activity_from_status("[opencode:bash:running] cargo test").kind,
+            ActivityKind::ToolCall
+        );
+        assert_eq!(
+            provider_activity_from_status("[claude:thinking] started").kind,
+            ActivityKind::Reasoning
+        );
+        assert_eq!(
+            provider_activity_from_status("[claude:bash] started").kind,
+            ActivityKind::ToolCall
+        );
+        assert_eq!(
+            provider_activity_from_status("[opencode:error] failed").kind,
+            ActivityKind::Progress
+        );
+        assert_eq!(
+            provider_activity_from_status("[opencode:permission:asked] exec").kind,
+            ActivityKind::Progress
+        );
+        assert_eq!(
+            provider_activity_from_status("[acp] turn completed").kind,
+            ActivityKind::Progress
+        );
+        assert_eq!(
+            provider_activity_from_status("[command:running] cargo test").correlation_key,
+            provider_activity_from_status("[command:completed] cargo test").correlation_key
+        );
+    }
+}
 
 const CODEX_IDLE_TICK_SECONDS: u64 = 15;
 const CODEX_COMMAND_SOFT_RECOVERY_IDLE_TICKS: u32 = 8;
@@ -594,6 +746,28 @@ mod tests {
             render_codex_turn_diff(&serde_json::json!({})).as_deref(),
             Some("[diff] updated")
         );
+
+        let mut state = CodexAppServerStreamingState::default();
+        match state.ingest_value(&serde_json::json!({
+            "method": "item/fileChange/patchUpdated",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "file-change-1",
+                "changes": [{
+                    "path": "src/main.rs",
+                    "kind": "update",
+                    "diff": "@@ -1 +1 @@\n-old\n+new"
+                }]
+            }
+        })) {
+            CodexAppServerEvent::Diff(diff) => {
+                assert_eq!(diff.files, ["src/main.rs"]);
+                assert_eq!(diff.added, Some(1));
+                assert_eq!(diff.removed, Some(1));
+            }
+            _ => panic!("fileChange patch updates must produce a diff event"),
+        }
     }
 
     #[test]
@@ -645,6 +819,33 @@ mod tests {
             CodexAppServerEvent::None
         ));
         assert_eq!(state.finish_text().as_deref(), Some("final answer"));
+    }
+
+    #[test]
+    fn codex_final_answer_replaces_completed_commentary_items() {
+        let mut state = CodexAppServerStreamingState::default();
+        for (id, phase, text) in [
+            ("commentary-1", "commentary", "I will inspect it."),
+            ("final-1", "final_answer", "Inspection is complete."),
+        ] {
+            assert!(matches!(
+                state.ingest_value(&serde_json::json!({
+                    "method": "item/completed",
+                    "params": {"item": {
+                        "id": id,
+                        "type": "agentMessage",
+                        "phase": phase,
+                        "text": text
+                    }}
+                })),
+                CodexAppServerEvent::Content(_)
+            ));
+        }
+
+        assert_eq!(
+            state.finish_text().as_deref(),
+            Some("Inspection is complete.")
+        );
     }
 
     #[test]
@@ -1219,6 +1420,13 @@ mod tests {
         assert_eq!(
             state.current_status(),
             Some("[claude:Bash] started: cargo test")
+        );
+        assert_eq!(
+            state
+                .current_activity()
+                .and_then(|activity| activity.correlation_key),
+            None,
+            "tool blocks without a provider id must not reuse another block id"
         );
 
         let rendered = state
@@ -2777,6 +2985,49 @@ for line in sys.stdin:
             .as_deref(),
             Some("[opencode:bash:running] cargo check")
         );
+        let patch_diff = opencode_patch_diff(
+            &serde_json::json!({
+                "part": {
+                    "id": "part-patch",
+                    "type": "patch",
+                    "hash": "snapshot-hash",
+                    "files": ["src/main.rs", "Cargo.toml"]
+                }
+            }),
+            "session-1",
+            "user-1",
+        )
+        .expect("OpenCode patch part should produce a diff event");
+        assert_eq!(patch_diff.session_id, "session-1");
+        assert_eq!(patch_diff.conversation_turn_id.as_deref(), Some("user-1"));
+        assert_eq!(patch_diff.files, ["src/main.rs", "Cargo.toml"]);
+        assert!(
+            opencode_patch_diff(
+                &serde_json::json!({ "part": { "type": "tool", "files": ["src/main.rs"] } }),
+                "session-1",
+                "user-1",
+            )
+            .is_none()
+        );
+        assert!(
+            opencode_delta_activity(&serde_json::json!({
+                "partID": "part-1",
+                "field": "state",
+                "delta": ""
+            }))
+            .is_none(),
+            "an empty delta must not replace the title from the full part snapshot"
+        );
+        let delta_activity = opencode_delta_activity(&serde_json::json!({
+            "partID": "part-1",
+            "field": "state",
+            "delta": "running tests"
+        }))
+        .expect("non-empty tool delta should produce an activity update");
+        assert_eq!(
+            delta_activity.correlation_key.as_deref(),
+            Some("opencode:part:part-1")
+        );
 
         assert_eq!(
             render_opencode_event_status(
@@ -2989,6 +3240,14 @@ for line in sys.stdin:
 
     #[test]
     fn acp_notification_renders_tool_status_and_turn_end() {
+        assert_eq!(
+            acp_activity_correlation_key(&serde_json::json!({
+                "type": "ToolCall",
+                "toolCall": { "id": "call-1", "toolName": "execute_command" }
+            }))
+            .as_deref(),
+            Some("acp:update:call-1")
+        );
         assert_eq!(
             render_acp_notification_status(&serde_json::json!({
                 "type": "ToolCall",
@@ -5217,7 +5476,7 @@ async fn run_codex(
         ),
     };
     if let Some(status_message) = slash_status_message {
-        state.emit_system_message(&session.id, status_message).await;
+        state.emit_progress(&session.id, status_message).await;
     }
 
     let idle_deadline = Duration::from_secs(CODEX_IDLE_TICK_SECONDS);
@@ -5412,14 +5671,14 @@ async fn run_codex(
                         if parsed.has_background_processes() && !background_waiting {
                             background_waiting = true;
                             state
-                                .emit_system_message(
+                                .emit_progress(
                                     &session.id,
                                     "[codex] turn completed; waiting for background tasks",
                                 )
                                 .await;
                         } else if goal_mode && !parsed.goal_is_terminal() {
                             state
-                                .emit_system_message(
+                                .emit_progress(
                                     &session.id,
                                     "[codex] goal active; waiting for automatic continuation",
                                 )
@@ -5432,9 +5691,9 @@ async fn run_codex(
                 }
                 let next_status = parsed.current_status().map(ToString::to_string);
                 if next_status.is_some() && next_status != previous_status {
-                    state
-                        .emit_system_message(&session.id, next_status.unwrap_or_default())
-                        .await;
+                    if let Some(activity) = parsed.current_activity() {
+                        state.emit_provider_activity(&session.id, activity).await;
+                    }
                 }
                 if turn_finished
                     && !parsed.has_background_processes()
@@ -5490,9 +5749,9 @@ async fn run_codex(
                 }
                 let next_status = parsed.current_status().map(ToString::to_string);
                 if next_status.is_some() && next_status != previous_status {
-                    state
-                        .emit_system_message(&session.id, next_status.unwrap_or_default())
-                        .await;
+                    if let Some(activity) = parsed.current_activity() {
+                        state.emit_provider_activity(&session.id, activity).await;
+                    }
                 }
                 idle_sleep.as_mut().reset(tokio::time::Instant::now() + idle_deadline);
             }
@@ -5506,7 +5765,11 @@ async fn run_codex(
         .finish_text()
         .or_else(|| fallback_text(&raw_stdout))
         .context("codex response did not include assistant text")?;
-    push_incremental_text(&state, &session.id, &reply.id, &mut last_rendered, &text).await;
+    // The final item is authoritative and may not share a prefix with the last
+    // commentary snapshot, so it must bypass streaming-prefix throttling.
+    state
+        .emit_assistant_message_snapshot(&session.id, &reply.id, &text)
+        .await;
 
     if turn_finished {
         stderr_task.abort();
@@ -5824,9 +6087,10 @@ async fn run_claude_code(
                 }
                 let next_status = parsed.current_status().map(ToString::to_string);
                 if next_status.is_some() && next_status != previous_status {
-                    state
-                        .emit_system_message(&session.id, next_status.unwrap_or_default())
-                        .await;
+                    if let Some(activity) = parsed.current_activity() {
+                        state.emit_provider_activity(&session.id, activity).await;
+                        parsed.clear_completed_activity();
+                    }
                 }
             }
             _ = permission_poll.tick() => {
@@ -5838,7 +6102,7 @@ async fn run_claude_code(
                     let next_status = parsed.current_status().map(ToString::to_string);
                     if next_status.is_some() && next_status != previous_status {
                         state
-                            .emit_system_message(&session.id, next_status.unwrap_or_default())
+                            .emit_progress(&session.id, next_status.unwrap_or_default())
                             .await;
                     }
                 }
@@ -5947,7 +6211,7 @@ async fn run_opencode(
                 .await
                 .ok();
             state
-                .emit_system_message(&session.id, format!("Session renamed to: {new_title}"))
+                .emit_progress(&session.id, format!("Session renamed to: {new_title}"))
                 .await;
             state
                 .finish_assistant_message(&session.id, &reply.id)
@@ -6027,6 +6291,8 @@ async fn run_opencode(
                         {
                             full_text.push_str(delta);
                             push_incremental_text(&state, &session.id, &reply.id, &mut last_rendered, &full_text).await;
+                        } else if let Some(activity) = opencode_delta_activity(properties) {
+                            state.emit_provider_activity(&session.id, activity).await;
                         }
                     }
                     "permission.asked" => {
@@ -6057,6 +6323,11 @@ async fn run_opencode(
                     }
                     "session.idle" => break,
                     _ => {
+                        if event_type == "message.part.updated"
+                            && let Some(diff) = opencode_patch_diff(properties, &session.id, &input.id)
+                        {
+                            state.emit_session_diff(diff).await;
+                        }
                         if let Some(status) = render_opencode_event_status(event_type, properties) {
                             debug_log!(
                                 "[opencode] system event session={} type={} status={}",
@@ -6064,7 +6335,19 @@ async fn run_opencode(
                                 event_type,
                                 status
                             );
-                            state.emit_system_message(&session.id, status).await;
+                            let mut activity = provider_activity_from_status(status);
+                            activity.correlation_key = properties
+                                .get("part")
+                                .unwrap_or(properties)
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .map(|id| format!("opencode:part:{id}"));
+                            activity.payload = serde_json::json!({
+                                "source": "opencode",
+                                "event_type": event_type,
+                                "properties": properties,
+                            });
+                            state.emit_provider_activity(&session.id, activity).await;
                         }
                     }
                 }
@@ -6240,7 +6523,7 @@ async fn run_acp_http(
             full_text = text;
         }
         if let Some(status) = acp_extract_status(&value) {
-            state.emit_system_message(&session.id, status).await;
+            state.emit_progress(&session.id, status).await;
         }
     } else {
         let mut buffer = Vec::<u8>::new();
@@ -6302,7 +6585,7 @@ async fn run_acp_http(
                             .await;
                         }
                         if let Some(status) = acp_extract_status(&event) {
-                            state.emit_system_message(&session.id, status).await;
+                            state.emit_progress(&session.id, status).await;
                         }
                         if acp_event_is_error(&event) {
                             bail!("{}", acp_extract_error(&event));
@@ -6500,7 +6783,7 @@ async fn run_stdio_acp(
                 let message = format!(
                     "[acp] failed to load ACP session {runtime_ref}; starting a new session: {error}"
                 );
-                state.emit_system_message(&session.id, message).await;
+                state.emit_progress(&session.id, message).await;
                 state.set_provider_session_ref(&session.id, None).await;
                 let new_request = crate::acp_client::build_new_session_request(
                     &project_root.display().to_string(),
@@ -6662,7 +6945,7 @@ async fn run_stdio_acp(
                     if let Some(result) = value.get("result") {
                         if let Ok(prompt_resp) = crate::acp_client::AcpMessageParser::parse_prompt_response(result) {
                             let stop_desc = crate::acp_client::acp_stop_reason_description(&prompt_resp.stop_reason);
-                            state.emit_system_message(&session.id, format!("[acp] {stop_desc}")).await;
+                            state.emit_progress(&session.id, format!("[acp] {stop_desc}")).await;
                         }
                     }
                     turn_finished = true;
@@ -6672,7 +6955,10 @@ async fn run_stdio_acp(
                 if value.get("method").and_then(Value::as_str) == Some("session/notification") {
                     let params = value.get("params").unwrap_or(&Value::Null);
                     if let Some(status) = render_acp_notification_status(params) {
-                        state.emit_system_message(&session.id, status).await;
+                        let mut activity = provider_activity_from_status(status);
+                        activity.correlation_key = acp_activity_correlation_key(params);
+                        activity.payload = serde_json::json!({ "source": "acp", "update": params });
+                        state.emit_provider_activity(&session.id, activity).await;
                     }
                     if let Some(delta) = extract_acp_message_chunk(params) {
                         full_text.push_str(&delta);
@@ -6692,9 +6978,18 @@ async fn run_stdio_acp(
                             full_text.push_str(&delta);
                             push_incremental_text(&state, &session.id, &reply.id, &mut last_rendered, &full_text).await;
                         }
+                        if let Some(status) = render_acp_notification_status(params) {
+                            let mut activity = provider_activity_from_status(status);
+                            activity.correlation_key = acp_activity_correlation_key(params);
+                            activity.payload = serde_json::json!({ "source": "acp", "update": params });
+                            state.emit_provider_activity(&session.id, activity).await;
+                        }
                     } else {
                         if let Some(status) = render_acp_notification_status(params) {
-                            state.emit_system_message(&session.id, status).await;
+                            let mut activity = provider_activity_from_status(status);
+                            activity.correlation_key = acp_activity_correlation_key(params);
+                            activity.payload = serde_json::json!({ "source": "acp", "update": params });
+                            state.emit_provider_activity(&session.id, activity).await;
                         }
                         if let Some(delta) = extract_acp_message_chunk(params) {
                             full_text.push_str(&delta);
@@ -7122,7 +7417,9 @@ async fn push_incremental_text(
     next_text: &str,
 ) {
     if let Some(delta) = next_text.strip_prefix(last_rendered.as_str()) {
-        if !delta.is_empty() {
+        if !delta.is_empty()
+            && (delta.chars().count() >= 64 || delta.contains('\n') || last_rendered.is_empty())
+        {
             state
                 .emit_assistant_message_snapshot(session_id, message_id, next_text)
                 .await;
@@ -7368,6 +7665,7 @@ struct CodexAppServerStreamingState {
     last_agent_message_delta: BTreeMap<String, String>,
     completed_agent_message_ids: HashSet<String>,
     latest_status: Option<String>,
+    latest_activity_key: Option<String>,
     session_id: Option<String>,
     running_command: Option<RunningCommand>,
     background_processes: HashSet<String>,
@@ -7462,6 +7760,27 @@ impl CodexAppServerStreamingState {
         self.latest_status.as_deref()
     }
 
+    fn current_activity(&self) -> Option<ProviderActivity> {
+        let mut activity = provider_activity_from_status(self.latest_status.clone()?);
+        if matches!(
+            activity.kind,
+            ActivityKind::ToolCall | ActivityKind::ToolResult
+        ) {
+            if let Some(key) = &self.latest_activity_key {
+                activity.correlation_key = Some(key.clone());
+            }
+            if let Some(command) = &self.running_command {
+                activity.payload = serde_json::json!({
+                    "source": "codex",
+                    "item_id": command.item_id,
+                    "process_id": command.process_id,
+                    "command": command.command,
+                });
+            }
+        }
+        Some(activity)
+    }
+
     fn ingest_value(&mut self, value: &Value) -> CodexAppServerEvent {
         let Some(map) = value.as_object() else {
             return CodexAppServerEvent::None;
@@ -7505,24 +7824,38 @@ impl CodexAppServerStreamingState {
                     .map(CodexAppServerEvent::Status)
                     .unwrap_or(CodexAppServerEvent::None),
                 "item/commandExecution/outputDelta" => {
-                    self.mark_command_activity(params.get("itemId").and_then(Value::as_str));
+                    let item_id = params.get("itemId").and_then(Value::as_str);
+                    self.mark_command_activity(item_id);
+                    self.latest_activity_key = item_id.map(|id| format!("codex:item:{id}"));
                     render_codex_status_notification(method, params)
                         .map(CodexAppServerEvent::Status)
                         .unwrap_or(CodexAppServerEvent::None)
                 }
                 "process/outputDelta" => {
                     self.track_background_process(params);
+                    self.latest_activity_key = params
+                        .get("processId")
+                        .or_else(|| params.get("id"))
+                        .and_then(Value::as_str)
+                        .map(|id| format!("codex:process:{id}"));
                     render_codex_status_notification(method, params)
                         .map(CodexAppServerEvent::Status)
                         .unwrap_or(CodexAppServerEvent::None)
                 }
                 "process/exited" => {
+                    self.latest_activity_key = params
+                        .get("processId")
+                        .or_else(|| params.get("id"))
+                        .and_then(Value::as_str)
+                        .map(|id| format!("codex:process:{id}"));
                     self.complete_background_process(params);
                     render_codex_status_notification(method, params)
                         .map(CodexAppServerEvent::Status)
                         .unwrap_or(CodexAppServerEvent::None)
                 }
-                "turn/diff/updated" => CodexAppServerEvent::Diff(parse_codex_turn_diff(params)),
+                "turn/diff/updated" | "item/fileChange/patchUpdated" => {
+                    CodexAppServerEvent::Diff(parse_codex_turn_diff(params))
+                }
                 "item/agentMessage/delta" => {
                     let item_id = params
                         .get("itemId")
@@ -7805,8 +8138,16 @@ impl CodexAppServerStreamingState {
                 if text.is_empty() {
                     return CodexAppServerEvent::None;
                 }
+                let is_final = item
+                    .get("phase")
+                    .and_then(Value::as_str)
+                    .is_some_and(|phase| phase == "final_answer");
                 self.partial_agent_messages.remove(item_id);
                 self.last_agent_message_delta.remove(item_id);
+                if is_final {
+                    self.display_blocks.clear();
+                    self.assistant_blocks.clear();
+                }
                 self.display_blocks.push(text.clone());
                 self.assistant_blocks.push(text);
                 self.render_assistant_text()
@@ -7845,6 +8186,9 @@ impl CodexAppServerStreamingState {
                     .get("status")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
+                if !item_id.is_empty() {
+                    self.latest_activity_key = Some(format!("codex:item:{item_id}"));
+                }
                 if method == "item/started" || status == "inProgress" {
                     if !item_id.is_empty() {
                         self.running_command = Some(RunningCommand {
@@ -9390,6 +9734,8 @@ struct ClaudeStreamingState {
     display_blocks: Vec<String>,
     assistant_blocks: Vec<String>,
     latest_status: Option<String>,
+    latest_activity_key: Option<String>,
+    current_block_is_tool: bool,
     partial_text: Option<String>,
     stream_text: String,
     session_id: Option<String>,
@@ -9398,6 +9744,27 @@ struct ClaudeStreamingState {
 impl ClaudeStreamingState {
     fn current_status(&self) -> Option<&str> {
         self.latest_status.as_deref()
+    }
+
+    fn current_activity(&self) -> Option<ProviderActivity> {
+        let mut activity = provider_activity_from_status(self.latest_status.clone()?);
+        if matches!(
+            activity.kind,
+            ActivityKind::ToolCall | ActivityKind::ToolResult
+        ) {
+            activity.correlation_key = self.latest_activity_key.clone();
+            if let Some(key) = &self.latest_activity_key {
+                activity.payload = serde_json::json!({ "source": "claude", "tool_use_id": key });
+            }
+        }
+        Some(activity)
+    }
+
+    fn clear_completed_activity(&mut self) {
+        if self.latest_status.as_deref() == Some("[claude:tool] completed") {
+            self.latest_activity_key = None;
+            self.latest_status = None;
+        }
     }
 
     fn ingest_line(&mut self, line: &str) -> Result<Option<String>> {
@@ -9484,6 +9851,16 @@ impl ClaudeStreamingState {
             .unwrap_or_default();
         match event_type {
             "content_block_start" => {
+                let block = event.get("content_block").or_else(|| event.get("block"));
+                self.current_block_is_tool = block
+                    .and_then(|block| block.get("type"))
+                    .and_then(Value::as_str)
+                    == Some("tool_use");
+                self.latest_activity_key = block
+                    .and_then(|block| block.get("id"))
+                    .and_then(Value::as_str)
+                    .filter(|_| self.current_block_is_tool)
+                    .map(|id| format!("claude:tool:{id}"));
                 if let Some(text) = event
                     .get("content_block")
                     .and_then(extract_text_from_json)
@@ -9520,7 +9897,15 @@ impl ClaudeStreamingState {
                 }
                 self.partial_text = None;
                 self.stream_text.clear();
-                self.latest_status = None;
+                self.latest_status = if event_type == "content_block_stop"
+                    && self.current_block_is_tool
+                    && self.latest_activity_key.is_some()
+                {
+                    Some("[claude:tool] completed".to_string())
+                } else {
+                    None
+                };
+                self.current_block_is_tool = false;
                 self.render_assistant_text()
             }
             "message_start" | "message_delta" => {
@@ -10029,6 +10414,19 @@ fn render_acp_notification_status(params: &Value) -> Option<String> {
         }
         _ => None,
     }
+}
+
+fn acp_activity_correlation_key(params: &Value) -> Option<String> {
+    params
+        .get("id")
+        .or_else(|| params.get("toolCallId"))
+        .or_else(|| params.get("tool_call_id"))
+        .or_else(|| params.pointer("/toolCall/id"))
+        .or_else(|| params.pointer("/toolCall/toolCallId"))
+        .or_else(|| params.pointer("/toolCall/tool_call_id"))
+        .or_else(|| params.pointer("/tool/id"))
+        .and_then(Value::as_str)
+        .map(|id| format!("acp:update:{id}"))
 }
 
 fn acp_permission_request_to_approval(request_id: &str, params: &Value) -> ApprovalRequest {
@@ -10639,6 +11037,29 @@ fn render_opencode_event_status(event_type: &str, properties: &Value) -> Option<
     }
 }
 
+fn opencode_delta_activity(properties: &Value) -> Option<ProviderActivity> {
+    let delta = properties.get("delta").and_then(Value::as_str)?;
+    if delta.is_empty() {
+        return None;
+    }
+    let part_id = properties
+        .get("partID")
+        .or_else(|| properties.get("partId"))
+        .or_else(|| properties.pointer("/part/id"))
+        .and_then(Value::as_str)?;
+    let mut activity = provider_activity_from_status(format!(
+        "[opencode:tool:running] {}",
+        truncate_tool_text(delta, 120)
+    ));
+    activity.correlation_key = Some(format!("opencode:part:{part_id}"));
+    activity.payload = serde_json::json!({
+        "source": "opencode",
+        "event_type": "message.part.delta",
+        "properties": properties,
+    });
+    Some(activity)
+}
+
 fn render_opencode_message_status(properties: &Value) -> Option<String> {
     let role = properties
         .pointer("/info/role")
@@ -10704,6 +11125,36 @@ fn render_opencode_patch_status(part: &Value) -> Option<String> {
     } else {
         Some(format!("[opencode:patch] {}", paths.join(", ")))
     }
+}
+
+fn opencode_patch_diff(
+    properties: &Value,
+    session_id: &str,
+    conversation_turn_id: &str,
+) -> Option<SessionDiffEvent> {
+    let part = properties.get("part")?;
+    if part.get("type").and_then(Value::as_str) != Some("patch") {
+        return None;
+    }
+    let files = part
+        .get("files")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if files.is_empty() {
+        return None;
+    }
+    Some(SessionDiffEvent {
+        session_id: session_id.to_string(),
+        conversation_turn_id: Some(conversation_turn_id.to_string()),
+        summary: Some(format!("Changed {} file(s)", files.len())),
+        files,
+        added: None,
+        removed: None,
+        patch: None,
+    })
 }
 
 async fn wait_for_opencode_session_idle(

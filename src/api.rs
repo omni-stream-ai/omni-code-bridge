@@ -35,6 +35,8 @@ use crate::{
         RegisterPushDeviceInput, ReplySummary, SendMessageInput, SessionEvent, SummarizeReplyInput,
         TriggerClientMessageInput, UpdateSessionInput, UploadedFileResponse,
     },
+    session_domain::CreateTurnCommand,
+    session_domain_store::DomainStoreError,
 };
 
 pub fn router() -> Router<Arc<AppState>> {
@@ -82,6 +84,19 @@ pub fn router() -> Router<Arc<AppState>> {
             post(resolve_approval),
         )
         .route("/sessions/{id}/events", get(session_events))
+        .route("/v2/sessions/{id}/state", get(domain_session_state))
+        .route(
+            "/v2/sessions/{id}/read-state",
+            put(mark_domain_session_read),
+        )
+        .route("/v2/sessions/{id}/turns", post(create_domain_turn))
+        .route("/v2/sessions/{id}/events", get(domain_session_events))
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct DomainEventQuery {
+    #[serde(default)]
+    after: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1311,6 +1326,265 @@ async fn session_events(
             .interval(Duration::from_secs(15))
             .text("keep-alive"),
     ))
+}
+
+async fn domain_session_state(
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, ApiError> {
+    authorize_request_status(&headers, &state).await?;
+    let snapshot = state
+        .domain_session_state(&id)
+        .await
+        .map_err(|message| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message,
+        })?
+        .ok_or(ApiError {
+            status: StatusCode::NOT_FOUND,
+            message: "session not found".to_string(),
+        })?;
+    Ok(Json(ApiResponse { data: snapshot }))
+}
+
+async fn mark_domain_session_read(
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, ApiError> {
+    authorize_request(&headers, &state).await?;
+    state
+        .mark_domain_session_read(&id)
+        .await
+        .map_err(|message| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message,
+        })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn create_domain_turn(
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Json(command): Json<CreateTurnCommand>,
+) -> Result<impl IntoResponse, ApiError> {
+    authorize_request(&headers, &state).await?;
+    let result = state
+        .create_domain_turn(&id, &command)
+        .await
+        .map_err(domain_store_api_error)?;
+
+    if !result.created {
+        return Ok((StatusCode::OK, Json(ApiResponse { data: result })));
+    }
+
+    let execution_state = Arc::clone(&state);
+    let execution_session_id = id.clone();
+    let execution_turn_id = result.turn.id.clone();
+    tokio::spawn(async move {
+        let mut provider_content = command.content;
+        for attachment in &command.attachments {
+            let label = if attachment.file_name.trim().is_empty() {
+                "attachment"
+            } else {
+                attachment.file_name.trim()
+            };
+            let reference =
+                if attachment.kind == "image" || attachment.content_type.starts_with("image/") {
+                    format!("![{label}]({})", attachment.url)
+                } else {
+                    format!("[{label}]({})", attachment.url)
+                };
+            if !provider_content.is_empty() {
+                provider_content.push_str("\n\n");
+            }
+            provider_content.push_str(&reference);
+        }
+        let input = SendMessageInput {
+            content: provider_content,
+            input_mode: command.input_mode,
+            system_prompt: command.system_prompt,
+            client_message_id: Some(command.user_message_id),
+            provider_id: command.provider_id,
+            reasoning_effort: command.reasoning_effort,
+            model: command.model,
+        };
+        if let Err(error) = execution_state
+            .send_domain_message(&execution_session_id, &execution_turn_id, input)
+            .await
+        {
+            execution_state
+                .fail_domain_turn(&execution_session_id, &execution_turn_id, error)
+                .await;
+        }
+    });
+
+    Ok((StatusCode::ACCEPTED, Json(ApiResponse { data: result })))
+}
+
+async fn domain_session_events(
+    Path(id): Path<String>,
+    Query(query): Query<DomainEventQuery>,
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    authorize_request_status(&headers, &state).await?;
+    let receiver = state.subscribe_domain_events();
+    let snapshot = state
+        .domain_session_state(&id)
+        .await
+        .map_err(|message| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message,
+        })?;
+    let Some(snapshot) = snapshot else {
+        return Err(ApiError {
+            status: StatusCode::NOT_FOUND,
+            message: "session not found".to_string(),
+        });
+    };
+
+    // Subscribe before reading the durable backlog. Events emitted in between are
+    // present in both streams and are removed by the high-watermark filter.
+    let high_watermark = snapshot.cursor;
+    if query.after > high_watermark {
+        return Err(ApiError {
+            status: StatusCode::CONFLICT,
+            message: "event cursor is ahead of the session; reload session state".to_string(),
+        });
+    }
+    let mut latest_backlog_event = None;
+    let mut cursor = query.after.max(0);
+    while cursor < high_watermark {
+        let page = state
+            .domain_events_after(&id, cursor, 10_000)
+            .map_err(|message| ApiError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                message,
+            })?;
+        if page.is_empty() {
+            return Err(ApiError {
+                status: StatusCode::CONFLICT,
+                message: "event history is incomplete; reload session state".to_string(),
+            });
+        }
+        cursor = page.last().map(|event| event.event_id).unwrap_or(cursor);
+        latest_backlog_event = page
+            .into_iter()
+            .filter(|event| event.event_id <= high_watermark)
+            .last()
+            .or(latest_backlog_event);
+    }
+    let initial_state = Arc::clone(&state);
+    let initial = stream::iter(latest_backlog_event).filter_map(move |event| {
+        let state = Arc::clone(&initial_state);
+        async move { hydrate_domain_sse_event(&state, event, true) }
+    });
+    let live_session_id = id.clone();
+    let live = BroadcastStream::new(receiver).filter_map(move |item| {
+        let session_id = live_session_id.clone();
+        async move {
+            match item {
+                Ok(event) if event.session_id == session_id && event.event_id > high_watermark => {
+                    Some(event)
+                }
+                Err(_) => Some(crate::session_domain::SessionDomainEvent {
+                    event_id: high_watermark + 1,
+                    session_id: session_id.clone(),
+                    session_version: 0,
+                    turn_id: None,
+                    event_type: "stream.reset_required".to_string(),
+                    entity_id: None,
+                    entity_revision: None,
+                    payload: serde_json::json!({}),
+                    created_at: chrono::Utc::now(),
+                }),
+                _ => None,
+            }
+        }
+    });
+    let live_state = Arc::clone(&state);
+    let live = tokio_stream::StreamExt::chunks_timeout(live, 512, Duration::from_millis(250))
+        .filter_map(move |chunk| {
+            let state = Arc::clone(&live_state);
+            async move {
+                let fallback_turn_id = chunk.iter().rev().find_map(|event| event.turn_id.clone());
+                let mut event = chunk.into_iter().last()?;
+                if event.turn_id.is_none() {
+                    event.turn_id = fallback_turn_id;
+                }
+                if event.event_type == "stream.reset_required" {
+                    domain_sse_event(event)
+                } else {
+                    hydrate_domain_sse_event(&state, event, true)
+                }
+            }
+        });
+
+    Ok(Sse::new(initial.chain(live)).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keep-alive"),
+    ))
+}
+
+fn hydrate_domain_sse_event(
+    state: &AppState,
+    mut event: crate::session_domain::SessionDomainEvent,
+    coalesced: bool,
+) -> Option<Result<Event, Infallible>> {
+    let (session, explicit_turn) = state
+        .domain_event_snapshot(&event.session_id, event.turn_id.as_deref())
+        .ok()??;
+    let turn = if explicit_turn.is_some() || session.active_turn_id.is_none() {
+        explicit_turn
+    } else {
+        state
+            .domain_event_snapshot(&event.session_id, session.active_turn_id.as_deref())
+            .ok()??
+            .1
+    };
+    event.payload = serde_json::json!({
+        "session": session,
+        "turn": turn,
+        "coalesced": coalesced,
+    });
+    domain_sse_event(event)
+}
+
+fn domain_sse_event(
+    event: crate::session_domain::SessionDomainEvent,
+) -> Option<Result<Event, Infallible>> {
+    let event_id = event.event_id;
+    let event_name = event.event_type.clone();
+    let body = serde_json::to_string(&event).ok()?;
+    Some(Ok(Event::default()
+        .id(event_id.to_string())
+        .event(event_name)
+        .data(body)))
+}
+
+fn domain_store_api_error(error: DomainStoreError) -> ApiError {
+    match error {
+        DomainStoreError::NotFound(message) => ApiError {
+            status: StatusCode::NOT_FOUND,
+            message,
+        },
+        DomainStoreError::Invalid(message) => ApiError {
+            status: StatusCode::BAD_REQUEST,
+            message,
+        },
+        DomainStoreError::Conflict(message) => ApiError {
+            status: StatusCode::CONFLICT,
+            message,
+        },
+        DomainStoreError::Storage(message) => ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message,
+        },
+    }
 }
 
 fn sse_event_for_initial_snapshot(

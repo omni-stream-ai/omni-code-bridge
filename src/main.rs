@@ -14,6 +14,8 @@ mod message_projection;
 mod models;
 mod push;
 mod secret_store;
+mod session_domain;
+mod session_domain_store;
 mod session_store;
 mod session_trace;
 
