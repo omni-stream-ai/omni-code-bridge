@@ -12,6 +12,7 @@ mod device_store;
 mod logging;
 mod message_projection;
 mod models;
+mod pi_plugin_store;
 mod push;
 mod secret_store;
 mod session_domain;
@@ -43,6 +44,13 @@ enum Command {
         /// Enable verbose diagnostic logging
         #[arg(long)]
         debug: bool,
+        /// Pi provider HTTP request timeout in seconds; 0 disables the timeout
+        #[arg(
+            long = "pi-request-timeout",
+            env = "PI_HTTP_REQUEST_TIMEOUT_SECS",
+            default_value_t = 300
+        )]
+        pi_request_timeout: u64,
     },
     /// Validate a bridge settings file without starting the server
     SettingsValidate {
@@ -116,12 +124,24 @@ async fn run() -> Result<()> {
         Some(Command::SessionTrace { session, limit }) => {
             session_trace::print_session_trace(&session, limit)
         }
-        Some(Command::Serve { port, debug }) => serve(port, debug).await,
-        None => serve(8787, false).await,
+        Some(Command::Serve {
+            port,
+            debug,
+            pi_request_timeout,
+        }) => serve(port, debug, pi_request_timeout).await,
+        None => serve(8787, false, pi_request_timeout_from_env()).await,
     }
 }
 
-async fn serve(port: u16, debug: bool) -> Result<()> {
+fn pi_request_timeout_from_env() -> u64 {
+    std::env::var("PI_HTTP_REQUEST_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(300)
+}
+
+async fn serve(port: u16, debug: bool, pi_request_timeout: u64) -> Result<()> {
+    pi::http::client::set_request_timeout_override(pi_request_timeout);
     logging::init(debug);
     let state = Arc::new(AppState::new_strict().await?);
     let app = router(state);

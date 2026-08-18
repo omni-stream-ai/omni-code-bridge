@@ -63,11 +63,15 @@ Agent 二进制路径可以通过 `OMNI_CODE_CODEX_BIN` 和 `OMNI_CODE_OPENCODE_
 | `POST /client/messages` | 向项目/会话流程推送消息 |
 | `POST /devices/register` | 注册客户端设备以接收推送 |
 | `GET /files?path=...` | 返回已登记本地项目目录中的文件 |
-| `GET /sessions/{id}/messages` | 列出会话消息；支持 `limit`、`before_id`、`after_id` |
+| `GET /v2/sessions` | 列出 domain 会话摘要；支持可选的 `project_id` |
+| `GET /v2/sessions/{id}/state` | 读取原子会话及 turn 快照 |
+| `POST /v2/sessions/{id}/turns` | 提交幂等 turn 命令 |
+| `GET /v2/sessions/{id}/events` | 从 cursor 开始订阅持久化 domain 事件 |
+| `GET /v2/sessions/{id}/messages` | 兼容消息投影；支持 cursor 分页 |
 | `GET /app-update/manifest` | APK 更新 manifest |
 | `GET /app-update/apk` | 下载最新 APK |
 
-`GET /sessions/{id}/messages` 按存储顺序返回消息。未传 cursor 时返回最新一页：
+`GET /v2/sessions/{id}/messages` 按存储顺序返回消息。未传 cursor 时返回最新一页：
 `limit` 默认 `50`，并限制在 `1..=200`，因此正在生成中的 assistant 回复会保留在默认页。
 `before_id` 返回某条消息之前的消息；`after_id` 返回某条消息之后的消息。
 `before_id` 和 `after_id` 不能同时使用。`limit` 按展示消息计数：每条 `user`
@@ -78,8 +82,8 @@ Agent 二进制路径可以通过 `OMNI_CODE_CODEX_BIN` 和 `OMNI_CODE_OPENCODE_
 
 ### Provider 选择
 
-创建会话（`POST /sessions`）、更新会话（`PATCH /sessions/{id}`）和发送消息
-（`POST /sessions/{id}/messages`）都支持 `provider_id`。
+创建会话（`POST /v2/sessions`）、更新会话（`PATCH /v2/sessions/{id}`）和提交 turn
+（`POST /v2/sessions/{id}/turns`）都支持 `provider_id`。
 创建会话必须提供客户端生成的 `client_session_id`。Bridge 会将其作为 canonical 会话 ID，
 重复创建请求也使用它进行幂等处理。
 
@@ -110,7 +114,7 @@ Agent 二进制路径可以通过 `OMNI_CODE_CODEX_BIN` 和 `OMNI_CODE_OPENCODE_
 }
 ```
 
-对于 `PATCH /sessions/{id}`，请求体里省略 `provider_id` 表示不修改当前会话设置，
+对于 `PATCH /v2/sessions/{id}`，请求体里省略 `provider_id` 表示不修改当前会话设置，
 而 `"provider_id": null` 表示清空已保存的会话级选择。
 
 ### ACP Profiles
@@ -125,6 +129,27 @@ Agent 二进制路径可以通过 `OMNI_CODE_CODEX_BIN` 和 `OMNI_CODE_OPENCODE_
 - `stdio`：本地 ACP `stdio + JSON-RPC` runtime，例如 `kiro-cli acp` 或其他 ACP 兼容 CLI 命令
 - `kiro`：旧版 Kiro 专用 stdio profile 的兼容别名
 - `generic_http`：实验性的 HTTP/SSE ACP endpoint 兼容模式
+
+### Pi Agent Rust SDK
+
+将会话的 `agent` 设置为 `pi`，即可在同一进程中直接使用 `pi_agent_rust` SDK。
+插件路径通过环境变量传入，多个路径用逗号分隔：
+
+```bash
+export PI_EXTENSION_PATHS=/path/to/plugin-a.js,/path/to/plugin-b.js
+```
+
+这些路径会传给 Pi SDK 的 `SessionOptions.extension_paths`，插件权限和能力确认
+仍由 Pi SDK 的安全策略处理；不需要额外安装 `pi` CLI。
+
+Pi Agent 会把 bridge 供应商配置同步到 Pi 的 `models.json`，包括 `base_url` 和模型。
+格式映射如下：`codex` 使用 OpenAI Responses API，`openai-compatible` 使用 OpenAI
+Chat Completions API，`anthropic-messages` 使用 Anthropic Messages API。同步条目使用
+`omni-bridge-<provider-id>` 命名，不会覆盖其他 Pi provider 配置。
+
+Pi provider 请求默认超时为 300 秒。可通过启动参数
+`--pi-request-timeout <秒数>` 或环境变量 `PI_HTTP_REQUEST_TIMEOUT_SECS` 调整；设为
+`0` 表示不限制请求时长。
 
 通过 `stdio` 或 `kiro` 使用 Kiro 前，请先确认已经安装并登录 `kiro-cli`：
 
@@ -278,11 +303,11 @@ settings 里没有对应 ACP server，接口会直接返回 `400 Bad Request`。
 
 ### 思考等级
 
-创建会话（`POST /sessions`）、更新会话（`PATCH /sessions/{id}`）和发送消息
-（`POST /sessions/{id}/messages`）也支持可选的 `reasoning_effort`。
+创建会话（`POST /v2/sessions`）、更新会话（`PATCH /v2/sessions/{id}`）和提交 turn
+（`POST /v2/sessions/{id}/turns`）也支持可选的 `reasoning_effort`。
 
 允许值为 `"low"`、`"medium"`、`"high"`、`"xhigh"` 和 `"max"`。消息级
-`reasoning_effort` 会覆盖本轮的会话默认值。对于 `PATCH /sessions/{id}`，
+`reasoning_effort` 会覆盖本轮的会话默认值。对于 `PATCH /v2/sessions/{id}`，
 省略 `reasoning_effort` 表示不修改，`"reasoning_effort": null` 表示清空会话默认值。
 
 Codex 会收到 `model_reasoning_effort`，Claude Code 会收到 `--effort`。OpenCode 当前会忽略

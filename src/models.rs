@@ -94,6 +94,7 @@ pub enum AgentKind {
     ClaudeCode,
     OpenCode,
     Acp,
+    Pi,
     Custom,
 }
 
@@ -121,11 +122,12 @@ impl ReasoningEffort {
 
 #[cfg(test)]
 impl AgentKind {
-    pub const ALL: [AgentKind; 5] = [
+    pub const ALL: [AgentKind; 6] = [
         AgentKind::Codex,
         AgentKind::ClaudeCode,
         AgentKind::OpenCode,
         AgentKind::Acp,
+        AgentKind::Pi,
         AgentKind::Custom,
     ];
 }
@@ -301,6 +303,9 @@ pub struct CreateSessionInput {
     /// Default reasoning effort for this session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Model selected for this session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

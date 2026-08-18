@@ -63,11 +63,15 @@ Agent binary paths can be overridden with `OMNI_CODE_CODEX_BIN` and `OMNI_CODE_O
 | `POST /client/messages` | Push a message into a project/session flow |
 | `POST /devices/register` | Register a client device for push notifications |
 | `GET /files?path=...` | Return a file from a registered local project root |
-| `GET /sessions/{id}/messages` | List session messages; supports `limit`, `before_id`, `after_id` |
+| `GET /v2/sessions` | List domain session summaries; accepts optional `project_id` |
+| `GET /v2/sessions/{id}/state` | Load the atomic session and turn snapshot |
+| `POST /v2/sessions/{id}/turns` | Submit an idempotent turn command |
+| `GET /v2/sessions/{id}/events` | Stream durable domain events after a cursor |
+| `GET /v2/sessions/{id}/messages` | Compatibility history projection with cursor pagination |
 | `GET /app-update/manifest` | APK update manifest |
 | `GET /app-update/apk` | Download latest APK |
 
-`GET /sessions/{id}/messages` returns messages in stored order. Without a cursor it returns the
+`GET /v2/sessions/{id}/messages` returns messages in stored order. Without a cursor it returns the
 latest page (`limit` defaults to `50` and is clamped to `1..=200`), so an in-progress assistant
 reply remains visible on the default page. `before_id` returns messages before a message id;
 `after_id` returns messages after a message id. `before_id` and `after_id` cannot be combined.
@@ -78,8 +82,8 @@ segment counts as one even when it contains multiple `assistant`/`system` messag
 
 ### Provider Selection
 
-Session creation (`POST /sessions`), session update (`PATCH /sessions/{id}`), and message send
-(`POST /sessions/{id}/messages`) all accept `provider_id`.
+Session creation (`POST /v2/sessions`), session update (`PATCH /v2/sessions/{id}`), and turn submit
+(`POST /v2/sessions/{id}/turns`) all accept `provider_id`.
 Session creation requires a client-generated `client_session_id`. The bridge uses it as the
 canonical session ID and as the idempotency key for repeated create requests.
 
@@ -110,7 +114,7 @@ Examples:
 }
 ```
 
-For `PATCH /sessions/{id}`, omitting `provider_id` leaves the session unchanged, while
+For `PATCH /v2/sessions/{id}`, omitting `provider_id` leaves the session unchanged, while
 `"provider_id": null` clears the stored session-level selection.
 
 ### ACP Profiles
@@ -282,11 +286,11 @@ mutually exclusive and also return `400 Bad Request` when used together.
 
 ### Reasoning Effort
 
-Session creation (`POST /sessions`), session update (`PATCH /sessions/{id}`), and message send
-(`POST /sessions/{id}/messages`) also accept optional `reasoning_effort`.
+Session creation (`POST /v2/sessions`), session update (`PATCH /v2/sessions/{id}`), and turn submit
+(`POST /v2/sessions/{id}/turns`) also accept optional `reasoning_effort`.
 
 Allowed values are `"low"`, `"medium"`, `"high"`, `"xhigh"`, and `"max"`. Message-level
-`reasoning_effort` overrides the session default for that turn. For `PATCH /sessions/{id}`,
+`reasoning_effort` overrides the session default for that turn. For `PATCH /v2/sessions/{id}`,
 omitting `reasoning_effort` leaves it unchanged, while `"reasoning_effort": null` clears the
 session default.
 

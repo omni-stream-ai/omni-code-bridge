@@ -1,4 +1,4 @@
-use std::{path::Path, sync::Mutex};
+use std::{collections::HashSet, path::Path, sync::Mutex};
 
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -111,7 +111,6 @@ impl SessionDomainStore {
         if let Some(session) = read_session(&transaction, &legacy.id)? {
             return Ok(session);
         }
-        let now = Utc::now();
         let session = DomainSession {
             id: legacy.id.clone(),
             project_id: legacy.project_id.clone(),
@@ -131,7 +130,7 @@ impl SessionDomainStore {
             unread_count: legacy.unread_count,
             last_message_preview: legacy.last_message_preview.clone(),
             created_at: legacy.updated_at,
-            updated_at: now,
+            updated_at: legacy.updated_at,
         };
         write_session(&transaction, &session)?;
         let event = insert_event(
@@ -169,6 +168,37 @@ impl SessionDomainStore {
         }))
     }
 
+    pub fn list_sessions(&self, project_id: Option<&str>) -> Result<Vec<DomainSession>, String> {
+        let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        let (sql, parameter) = match project_id {
+            Some(project_id) => (
+                "SELECT state_json FROM domain_sessions WHERE project_id = ?1 ORDER BY updated_at DESC",
+                Some(project_id),
+            ),
+            None => (
+                "SELECT state_json FROM domain_sessions ORDER BY updated_at DESC",
+                None,
+            ),
+        };
+        let mut statement = connection.prepare(sql).map_err(|error| error.to_string())?;
+        fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<String> {
+            row.get(0)
+        }
+        if let Some(project_id) = parameter {
+            statement
+                .query_map([project_id], read_row)
+                .map_err(|error| error.to_string())?
+                .map(|row| decode(&row.map_err(|error| error.to_string())?))
+                .collect()
+        } else {
+            statement
+                .query_map([], read_row)
+                .map_err(|error| error.to_string())?
+                .map(|row| decode(&row.map_err(|error| error.to_string())?))
+                .collect()
+        }
+    }
+
     pub fn import_message_history(
         &self,
         session_id: &str,
@@ -183,15 +213,34 @@ impl SessionDomainStore {
             .map_err(|error| error.to_string())?;
         let mut session = read_session(&transaction, session_id)?
             .ok_or_else(|| "session not found".to_string())?;
-        let existing: i64 = transaction
-            .query_row(
-                "SELECT COUNT(*) FROM domain_turns WHERE session_id = ?1",
-                [session_id],
-                |row| row.get(0),
-            )
-            .map_err(|error| error.to_string())?;
-        if existing > 0 {
-            return Ok(());
+        let existing_turns = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT state_json FROM domain_turns WHERE session_id = ?1 ORDER BY sequence",
+                )
+                .map_err(|error| error.to_string())?;
+            statement
+                .query_map([session_id], |row| row.get::<_, String>(0))
+                .map_err(|error| error.to_string())?
+                .map(|row| decode(&row.map_err(|error| error.to_string())?))
+                .collect::<Result<Vec<Turn>, String>>()?
+        };
+        if !existing_turns.is_empty() {
+            if !legacy_turns_need_reimport(&existing_turns) {
+                return Ok(());
+            }
+            transaction
+                .execute(
+                    "DELETE FROM domain_events WHERE session_id = ?1",
+                    [session_id],
+                )
+                .map_err(|error| error.to_string())?;
+            transaction
+                .execute(
+                    "DELETE FROM domain_turns WHERE session_id = ?1",
+                    [session_id],
+                )
+                .map_err(|error| error.to_string())?;
         }
 
         let mut turns = Vec::<Turn>::new();
@@ -304,7 +353,11 @@ impl SessionDomainStore {
             write_turn(&transaction, turn)?;
         }
         session.version += 1;
-        session.updated_at = Utc::now();
+        session.updated_at = messages
+            .iter()
+            .map(|message| message.created_at)
+            .max()
+            .unwrap_or(session.updated_at);
         write_session(&transaction, &session)?;
         let event = insert_event(
             &transaction,
@@ -318,6 +371,144 @@ impl SessionDomainStore {
         transaction.commit().map_err(|error| error.to_string())?;
         let _ = self.event_tx.send(event);
         Ok(())
+    }
+
+    pub fn refresh_completed_assistant_history(
+        &self,
+        session_id: &str,
+        messages: &[ChatMessage],
+    ) -> Result<(), String> {
+        let archive_turns = assistant_messages_by_turn(messages);
+        if archive_turns.is_empty() {
+            return Ok(());
+        }
+        let mut connection = self.connection.lock().map_err(|error| error.to_string())?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        let mut session = read_session(&transaction, session_id)?
+            .ok_or_else(|| "session not found".to_string())?;
+        let mut turns = read_turns(&transaction, session_id)?;
+        let mut changed = false;
+
+        let fallback_match_counts = archive_turns
+            .iter()
+            .map(|(archive_user, _)| {
+                turns
+                    .iter()
+                    .filter(|turn| archive_turn_matches(turn, archive_user))
+                    .count()
+            })
+            .collect::<Vec<_>>();
+        let mut matched_archive_turns = HashSet::new();
+        for turn in &mut turns {
+            let exact_id_candidates = archive_turns
+                .iter()
+                .enumerate()
+                .filter(|(index, (archive_user, _))| {
+                    !matched_archive_turns.contains(index)
+                        && turn.user_message.id == archive_user.id
+                })
+                .collect::<Vec<_>>();
+            let candidates = if exact_id_candidates.is_empty() {
+                archive_turns
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, (archive_user, _))| {
+                        !matched_archive_turns.contains(index)
+                            && fallback_match_counts[*index] == 1
+                            && archive_turn_matches(turn, archive_user)
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                exact_id_candidates
+            };
+            if candidates.len() != 1 {
+                continue;
+            }
+            let (archive_index, (_, archive_assistants)) = candidates[0];
+            matched_archive_turns.insert(archive_index);
+            if archive_assistants.is_empty() || assistant_segments_match(turn, archive_assistants) {
+                continue;
+            }
+
+            let insertion_index = turn
+                .segments
+                .iter()
+                .position(|segment| segment.message.is_some())
+                .unwrap_or(turn.segments.len());
+            turn.segments.retain(|segment| segment.message.is_none());
+            let replacements = archive_assistants.iter().map(|message| Segment {
+                id: format!("archive-assistant-{}", message.id),
+                turn_id: turn.id.clone(),
+                sequence: 0,
+                revision: 1,
+                kind: SegmentKind::AssistantMessage,
+                state: EntityState::Completed,
+                message: Some(DomainMessage {
+                    id: message.id.clone(),
+                    turn_id: turn.id.clone(),
+                    sequence: 0,
+                    revision: 1,
+                    purpose: MessagePurpose::Final,
+                    state: EntityState::Completed,
+                    content: message.content.clone(),
+                    attachments: Vec::new(),
+                    created_at: message.created_at,
+                    updated_at: message.created_at,
+                }),
+                activities: Vec::new(),
+                latest_activity_id: None,
+                created_at: message.created_at,
+                updated_at: message.created_at,
+            });
+            turn.segments
+                .splice(insertion_index..insertion_index, replacements);
+            for (index, segment) in turn.segments.iter_mut().enumerate() {
+                segment.sequence = index as i64 + 1;
+                if let Some(message) = segment.message.as_mut() {
+                    message.sequence = segment.sequence + 1;
+                }
+            }
+            turn.final_assistant_message_id =
+                archive_assistants.last().map(|message| message.id.clone());
+            turn.version += 1;
+            changed = true;
+        }
+        if !changed {
+            return Ok(());
+        }
+        for turn in &turns {
+            write_turn(&transaction, turn)?;
+        }
+        session.version += 1;
+        session.updated_at = Utc::now();
+        write_session(&transaction, &session)?;
+        let event = insert_event(
+            &transaction,
+            &session,
+            None,
+            "stream.reset_required",
+            Some(&session.id),
+            Some(session.version),
+            json!({ "session": session }),
+        )?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        let _ = self.event_tx.send(event);
+        Ok(())
+    }
+
+    pub fn needs_legacy_history_reimport(&self, session_id: &str) -> Result<bool, String> {
+        let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        let mut statement = connection
+            .prepare("SELECT state_json FROM domain_turns WHERE session_id = ?1 ORDER BY sequence")
+            .map_err(|error| error.to_string())?;
+        let turns = statement
+            .query_map([session_id], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .map(|row| decode(&row.map_err(|error| error.to_string())?))
+            .collect::<Result<Vec<Turn>, String>>()?;
+        Ok(legacy_turns_need_reimport(&turns))
     }
 
     pub fn import_diff_history(
@@ -581,7 +772,7 @@ impl SessionDomainStore {
         let mut statement = connection
             .prepare(
                 "SELECT event_id, session_id, session_version, turn_id, event_type, entity_id, \
-                 entity_revision, '{}', created_at FROM domain_events \
+                 entity_revision, payload_json, created_at FROM domain_events \
                  WHERE session_id = ?1 AND event_id > ?2 ORDER BY event_id LIMIT ?3",
             )
             .map_err(|error| error.to_string())?;
@@ -1006,6 +1197,65 @@ fn aggregate_segment_state(activities: &[crate::session_domain::Activity]) -> En
     EntityState::Completed
 }
 
+fn legacy_turns_need_reimport(turns: &[Turn]) -> bool {
+    !turns.is_empty()
+        && turns
+            .iter()
+            .all(|turn| turn.id.starts_with("imported-turn-"))
+        && turns.windows(2).any(|pair| {
+            pair[0].user_message.content.trim() == pair[1].user_message.content.trim()
+                && !pair[0].user_message.content.trim().is_empty()
+                && pair[1]
+                    .created_at
+                    .signed_duration_since(pair[0].created_at)
+                    .num_seconds()
+                    .abs()
+                    <= 10
+        })
+}
+
+fn assistant_messages_by_turn(messages: &[ChatMessage]) -> Vec<(&ChatMessage, Vec<&ChatMessage>)> {
+    let mut turns = Vec::new();
+    let mut current_user = None;
+    let mut assistants = Vec::new();
+    for message in messages {
+        if message.role == MessageRole::User {
+            if let Some(user) = current_user.replace(message) {
+                turns.push((user, std::mem::take(&mut assistants)));
+            }
+        } else if message.role == MessageRole::Assistant && current_user.is_some() {
+            assistants.push(message);
+        }
+    }
+    if let Some(user) = current_user {
+        turns.push((user, assistants));
+    }
+    turns
+}
+
+fn assistant_segments_match(turn: &Turn, archive_assistants: &[&ChatMessage]) -> bool {
+    turn.segments
+        .iter()
+        .filter_map(|segment| segment.message.as_ref())
+        .map(|message| (&message.id, &message.content))
+        .eq(archive_assistants
+            .iter()
+            .map(|message| (&message.id, &message.content)))
+}
+
+fn archive_turn_matches(turn: &Turn, archive_user: &ChatMessage) -> bool {
+    if turn.user_message.id == archive_user.id {
+        return true;
+    }
+    if turn.user_message.content.trim() != archive_user.content.trim() {
+        return false;
+    }
+    (turn.user_message.created_at - archive_user.created_at)
+        .num_seconds()
+        .abs()
+        <= 300
+}
+
 #[derive(Debug)]
 pub enum DomainStoreError {
     NotFound(String),
@@ -1118,6 +1368,17 @@ fn read_turn(connection: &Connection, turn_id: &str) -> Result<Option<Turn>, Str
         .transpose()
 }
 
+fn read_turns(connection: &Connection, session_id: &str) -> Result<Vec<Turn>, String> {
+    let mut statement = connection
+        .prepare("SELECT state_json FROM domain_turns WHERE session_id = ?1 ORDER BY sequence")
+        .map_err(|error| error.to_string())?;
+    statement
+        .query_map([session_id], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?
+        .map(|row| decode(&row.map_err(|error| error.to_string())?))
+        .collect()
+}
+
 fn latest_cursor(connection: &Connection, session_id: &str) -> Result<i64, String> {
     connection
         .query_row(
@@ -1138,6 +1399,7 @@ fn insert_event(
     payload: Value,
 ) -> Result<SessionDomainEvent, String> {
     let created_at = Utc::now();
+    let persisted_payload = payload.to_string();
     let event_id: i64 = connection
         .query_row(
             "SELECT COALESCE(MAX(event_id), 0) + 1 FROM domain_events WHERE session_id = ?1",
@@ -1158,7 +1420,7 @@ fn insert_event(
                 event_type,
                 entity_id,
                 entity_revision,
-                payload.to_string(),
+                persisted_payload,
                 created_at.to_rfc3339(),
             ],
         )
@@ -1171,6 +1433,19 @@ fn insert_event(
             )
             .map_err(|error| error.to_string())?;
     }
+    // The durable log intentionally stores only lightweight metadata. The
+    // broadcast event, however, is consumed immediately by SSE clients and
+    // must carry the exact state produced at this cursor.
+    let turn = turn_id
+        .map(|id| read_turn(connection, id))
+        .transpose()?
+        .flatten();
+    let broadcast_payload = json!({
+        "session": session,
+        "turn": turn,
+        "coalesced": false,
+        "detail": payload,
+    });
     Ok(SessionDomainEvent {
         event_id,
         session_id: session.id.clone(),
@@ -1179,7 +1454,7 @@ fn insert_event(
         event_type: event_type.to_string(),
         entity_id: entity_id.map(ToOwned::to_owned),
         entity_revision,
-        payload,
+        payload: broadcast_payload,
         created_at,
     })
 }
@@ -1252,16 +1527,18 @@ fn write_command_result<T: Serialize>(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use chrono::Utc;
     use serde_json::json;
     use uuid::Uuid;
 
     use super::SessionDomainStore;
     use crate::{
-        models::{AgentKind, InputMode, SessionStatus, SessionSummary},
+        models::{AgentKind, ChatMessage, InputMode, MessageRole, SessionStatus, SessionSummary},
         session_domain::{
-            AgentProjection, CreateTurnCommand, EntityState, MessagePurpose, SegmentKind,
-            TurnStatus,
+            AgentProjection, Attachment, CreateTurnCommand, EntityState, MessagePurpose,
+            SegmentKind, TurnStatus,
         },
     };
 
@@ -1322,6 +1599,537 @@ mod tests {
             store.create_turn("session-1", &conflicting),
             Err(super::DomainStoreError::Conflict(_))
         ));
+    }
+
+    #[test]
+    fn concurrent_turn_creation_accepts_exactly_one_active_turn() {
+        let store = Arc::new(test_store());
+        store
+            .ensure_session(&session("session-concurrent"))
+            .unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let handles = (0..2)
+            .map(|index| {
+                let store = Arc::clone(&store);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let command = CreateTurnCommand {
+                        command_id: format!("command-{index}"),
+                        turn_id: format!("turn-{index}"),
+                        user_message_id: format!("user-{index}"),
+                        content: format!("message {index}"),
+                        attachments: Vec::new(),
+                        input_mode: InputMode::Text,
+                        system_prompt: None,
+                        expected_session_version: None,
+                        provider_id: None,
+                        reasoning_effort: None,
+                        model: None,
+                    };
+                    barrier.wait();
+                    store.create_turn("session-concurrent", &command)
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let results = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(super::DomainStoreError::Conflict(_))))
+                .count(),
+            1
+        );
+        let state = store.session_state("session-concurrent").unwrap().unwrap();
+        assert_eq!(state.turns.len(), 1);
+        assert!(state.session.active_turn_id.is_some());
+    }
+
+    #[test]
+    fn attachment_only_turn_is_persisted_and_idempotent() {
+        let store = test_store();
+        store
+            .ensure_session(&session("session-attachment"))
+            .unwrap();
+        let attachment = Attachment {
+            id: "attachment-1".to_string(),
+            kind: "image".to_string(),
+            file_name: "screen.png".to_string(),
+            content_type: "image/png".to_string(),
+            size_bytes: 42,
+            url: "http://127.0.0.1/uploads/screen.png".to_string(),
+            provider_reference: Some("provider-image-1".to_string()),
+        };
+        let command = CreateTurnCommand {
+            command_id: "attachment-command".to_string(),
+            turn_id: "attachment-turn".to_string(),
+            user_message_id: "attachment-user".to_string(),
+            content: String::new(),
+            attachments: vec![attachment.clone()],
+            input_mode: InputMode::Text,
+            system_prompt: None,
+            expected_session_version: None,
+            provider_id: None,
+            reasoning_effort: None,
+            model: None,
+        };
+
+        let first = store.create_turn("session-attachment", &command).unwrap();
+        let duplicate = store.create_turn("session-attachment", &command).unwrap();
+        assert!(first.created);
+        assert!(!duplicate.created);
+        let state = store.session_state("session-attachment").unwrap().unwrap();
+        assert_eq!(state.turns.len(), 1);
+        assert_eq!(state.turns[0].user_message.content, "");
+        assert_eq!(state.turns[0].user_message.attachments.len(), 1);
+        let stored = &state.turns[0].user_message.attachments[0];
+        assert_eq!(stored.id, attachment.id);
+        assert_eq!(stored.url, attachment.url);
+        assert_eq!(stored.provider_reference, attachment.provider_reference);
+    }
+
+    #[test]
+    fn create_turn_rejects_empty_input_and_stale_session_version() {
+        let store = test_store();
+        store
+            .ensure_session(&session("session-validation"))
+            .unwrap();
+        let mut command = CreateTurnCommand {
+            command_id: "validation-command".to_string(),
+            turn_id: "validation-turn".to_string(),
+            user_message_id: "validation-user".to_string(),
+            content: "   ".to_string(),
+            attachments: Vec::new(),
+            input_mode: InputMode::Text,
+            system_prompt: None,
+            expected_session_version: None,
+            provider_id: None,
+            reasoning_effort: None,
+            model: None,
+        };
+        assert!(matches!(
+            store.create_turn("session-validation", &command),
+            Err(super::DomainStoreError::Invalid(message))
+                if message.contains("content or attachments")
+        ));
+
+        command.content = "valid".to_string();
+        command.expected_session_version = Some(999);
+        assert!(matches!(
+            store.create_turn("session-validation", &command),
+            Err(super::DomainStoreError::Conflict(message))
+                if message.contains("version mismatch")
+        ));
+        let state = store.session_state("session-validation").unwrap().unwrap();
+        assert!(state.turns.is_empty());
+        assert!(state.session.active_turn_id.is_none());
+    }
+
+    #[test]
+    fn lists_domain_sessions_by_project_in_updated_order() {
+        let store = test_store();
+        let mut first = session("session-list-1");
+        first.project_id = "project-a".to_string();
+        first.updated_at = Utc::now() - chrono::TimeDelta::seconds(1);
+        let mut second = session("session-list-2");
+        second.project_id = "project-a".to_string();
+        second.updated_at = Utc::now();
+        let mut other = session("session-list-3");
+        other.project_id = "project-b".to_string();
+        store.ensure_session(&first).unwrap();
+        store.ensure_session(&second).unwrap();
+        store.ensure_session(&other).unwrap();
+
+        let project_sessions = store.list_sessions(Some("project-a")).unwrap();
+        assert_eq!(project_sessions.len(), 2);
+        assert_eq!(project_sessions[0].id, "session-list-2");
+        assert_eq!(project_sessions[1].id, "session-list-1");
+        assert_eq!(store.list_sessions(None).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn importing_history_keeps_the_latest_message_timestamp() {
+        let store = test_store();
+        let mut session = session("session-history-time");
+        let first_message_at = Utc::now() - chrono::TimeDelta::days(2);
+        let latest_message_at = first_message_at + chrono::TimeDelta::minutes(5);
+        session.updated_at = first_message_at;
+        store.ensure_session(&session).unwrap();
+        store
+            .import_message_history(
+                &session.id,
+                &[
+                    ChatMessage {
+                        id: "user".to_string(),
+                        session_id: session.id.clone(),
+                        role: MessageRole::User,
+                        content: "question".to_string(),
+                        created_at: first_message_at,
+                    },
+                    ChatMessage {
+                        id: "assistant".to_string(),
+                        session_id: session.id.clone(),
+                        role: MessageRole::Assistant,
+                        content: "answer".to_string(),
+                        created_at: latest_message_at,
+                    },
+                ],
+            )
+            .unwrap();
+
+        let state = store.session_state(&session.id).unwrap().unwrap();
+        assert_eq!(state.session.updated_at, latest_message_at);
+    }
+
+    #[test]
+    fn reimports_legacy_history_when_adjacent_duplicate_user_turns_exist() {
+        let store = test_store();
+        let session = session("session-reimport");
+        let now = Utc::now();
+        store.ensure_session(&session).unwrap();
+        store
+            .import_message_history(
+                &session.id,
+                &[
+                    ChatMessage {
+                        id: "local-user".to_string(),
+                        session_id: session.id.clone(),
+                        role: MessageRole::User,
+                        content: "继续".to_string(),
+                        created_at: now,
+                    },
+                    ChatMessage {
+                        id: "remote-user".to_string(),
+                        session_id: session.id.clone(),
+                        role: MessageRole::User,
+                        content: "继续".to_string(),
+                        created_at: now + chrono::TimeDelta::seconds(2),
+                    },
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .session_state(&session.id)
+                .unwrap()
+                .unwrap()
+                .turns
+                .len(),
+            2
+        );
+
+        store
+            .import_message_history(
+                &session.id,
+                &[
+                    ChatMessage {
+                        id: "local-user".to_string(),
+                        session_id: session.id.clone(),
+                        role: MessageRole::User,
+                        content: "继续".to_string(),
+                        created_at: now,
+                    },
+                    ChatMessage {
+                        id: "assistant".to_string(),
+                        session_id: session.id.clone(),
+                        role: MessageRole::Assistant,
+                        content: "已继续".to_string(),
+                        created_at: now + chrono::TimeDelta::seconds(3),
+                    },
+                ],
+            )
+            .unwrap();
+
+        let state = store.session_state(&session.id).unwrap().unwrap();
+        assert_eq!(state.turns.len(), 1);
+        assert_eq!(state.turns[0].user_message.id, "local-user");
+        assert_eq!(state.turns[0].segments.len(), 1);
+        assert_eq!(
+            state.turns[0].segments[0].message.as_ref().unwrap().content,
+            "已继续"
+        );
+    }
+
+    #[test]
+    fn refreshes_completed_assistant_history_without_replacing_turn_metadata() {
+        let store = test_store();
+        let session = session("session-completed-history");
+        let now = Utc::now();
+        store.ensure_session(&session).unwrap();
+        let user = ChatMessage {
+            id: "user".to_string(),
+            session_id: session.id.clone(),
+            role: MessageRole::User,
+            content: "inspect it".to_string(),
+            created_at: now,
+        };
+        let final_reply = ChatMessage {
+            id: "final".to_string(),
+            session_id: session.id.clone(),
+            role: MessageRole::Assistant,
+            content: "Inspection complete.".to_string(),
+            created_at: now + chrono::TimeDelta::seconds(3),
+        };
+        store
+            .import_message_history(&session.id, &[user.clone(), final_reply.clone()])
+            .unwrap();
+
+        let cursor_before_refresh = store.session_state(&session.id).unwrap().unwrap().cursor;
+        store
+            .refresh_completed_assistant_history(
+                &session.id,
+                &[
+                    user,
+                    ChatMessage {
+                        id: "commentary-1".to_string(),
+                        session_id: session.id.clone(),
+                        role: MessageRole::Assistant,
+                        content: "I will inspect it.".to_string(),
+                        created_at: now + chrono::TimeDelta::seconds(1),
+                    },
+                    ChatMessage {
+                        id: "commentary-2".to_string(),
+                        session_id: session.id.clone(),
+                        role: MessageRole::Assistant,
+                        content: "I found the relevant files.".to_string(),
+                        created_at: now + chrono::TimeDelta::seconds(2),
+                    },
+                    final_reply,
+                ],
+            )
+            .unwrap();
+
+        let state = store.session_state(&session.id).unwrap().unwrap();
+        let assistant_contents = state.turns[0]
+            .segments
+            .iter()
+            .filter_map(|segment| segment.message.as_ref())
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            assistant_contents,
+            [
+                "I will inspect it.",
+                "I found the relevant files.",
+                "Inspection complete."
+            ]
+        );
+        assert!(state.cursor > cursor_before_refresh);
+        let refresh_events = store
+            .events_after(&session.id, cursor_before_refresh, 10)
+            .unwrap();
+        assert_eq!(refresh_events.len(), 1);
+        assert_eq!(refresh_events[0].event_type, "stream.reset_required");
+    }
+
+    #[test]
+    fn refreshing_assistant_history_skips_ambiguous_fallback_turn_matches() {
+        let store = test_store();
+        let session = session("session-history-ambiguous-match");
+        let now = Utc::now();
+        store.ensure_session(&session).unwrap();
+        store
+            .import_message_history(
+                &session.id,
+                &[
+                    ChatMessage {
+                        id: "live-user-1".to_string(),
+                        session_id: session.id.clone(),
+                        role: MessageRole::User,
+                        content: "continue".to_string(),
+                        created_at: now,
+                    },
+                    ChatMessage {
+                        id: "live-assistant-1".to_string(),
+                        session_id: session.id.clone(),
+                        role: MessageRole::Assistant,
+                        content: "first reply".to_string(),
+                        created_at: now + chrono::TimeDelta::seconds(1),
+                    },
+                    ChatMessage {
+                        id: "live-user-2".to_string(),
+                        session_id: session.id.clone(),
+                        role: MessageRole::User,
+                        content: "continue".to_string(),
+                        created_at: now + chrono::TimeDelta::seconds(2),
+                    },
+                    ChatMessage {
+                        id: "live-assistant-2".to_string(),
+                        session_id: session.id.clone(),
+                        role: MessageRole::Assistant,
+                        content: "second reply".to_string(),
+                        created_at: now + chrono::TimeDelta::seconds(3),
+                    },
+                ],
+            )
+            .unwrap();
+
+        store
+            .refresh_completed_assistant_history(
+                &session.id,
+                &[
+                    ChatMessage {
+                        id: "archive-user".to_string(),
+                        session_id: session.id.clone(),
+                        role: MessageRole::User,
+                        content: "continue".to_string(),
+                        created_at: now + chrono::TimeDelta::seconds(1),
+                    },
+                    ChatMessage {
+                        id: "archive-assistant".to_string(),
+                        session_id: session.id.clone(),
+                        role: MessageRole::Assistant,
+                        content: "replacement that must not be applied".to_string(),
+                        created_at: now + chrono::TimeDelta::seconds(4),
+                    },
+                ],
+            )
+            .unwrap();
+
+        let state = store.session_state(&session.id).unwrap().unwrap();
+        let replies = state
+            .turns
+            .iter()
+            .map(|turn| {
+                turn.segments
+                    .iter()
+                    .filter_map(|segment| segment.message.as_ref())
+                    .map(|message| message.content.as_str())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(replies, vec![vec!["first reply"], vec!["second reply"]]);
+    }
+
+    #[test]
+    fn refreshing_assistant_history_preserves_attachments_activities_and_artifacts() {
+        let store = test_store();
+        let session = session("session-history-metadata");
+        let now = Utc::now();
+        store.ensure_session(&session).unwrap();
+        store
+            .create_turn(
+                &session.id,
+                &CreateTurnCommand {
+                    command_id: "command".to_string(),
+                    turn_id: "turn".to_string(),
+                    user_message_id: "user".to_string(),
+                    content: "inspect it".to_string(),
+                    attachments: vec![Attachment {
+                        id: "attachment".to_string(),
+                        kind: "image".to_string(),
+                        file_name: "screen.png".to_string(),
+                        content_type: "image/png".to_string(),
+                        size_bytes: 1,
+                        url: "http://localhost/screen.png".to_string(),
+                        provider_reference: None,
+                    }],
+                    input_mode: InputMode::Text,
+                    system_prompt: None,
+                    expected_session_version: None,
+                    provider_id: None,
+                    reasoning_effort: None,
+                    model: None,
+                },
+            )
+            .unwrap();
+        store
+            .project_agent_event(
+                &session.id,
+                "turn",
+                AgentProjection::Activity {
+                    activity_id: "tool".to_string(),
+                    kind: crate::session_domain::ActivityKind::ToolCall,
+                    state: EntityState::Completed,
+                    title: "Read screen.png".to_string(),
+                    primary: None,
+                    secondary: Vec::new(),
+                    payload: json!({"tool": "read"}),
+                },
+            )
+            .unwrap();
+        store
+            .project_agent_event(
+                &session.id,
+                "turn",
+                AgentProjection::Artifact {
+                    artifact_id: "diff".to_string(),
+                    kind: crate::session_domain::ArtifactKind::TurnCumulativeDiff,
+                    state: EntityState::Completed,
+                    source_activity_id: Some("tool".to_string()),
+                    payload: json!({"files": ["screen.png"]}),
+                },
+            )
+            .unwrap();
+        store
+            .project_agent_event(
+                &session.id,
+                "turn",
+                AgentProjection::AssistantMessage {
+                    message_id: "live-final".to_string(),
+                    purpose: MessagePurpose::Final,
+                    state: EntityState::Completed,
+                    content: "Inspection complete.".to_string(),
+                },
+            )
+            .unwrap();
+        store
+            .project_agent_event(
+                &session.id,
+                "turn",
+                AgentProjection::TurnStatus {
+                    status: TurnStatus::Completed,
+                    error: None,
+                },
+            )
+            .unwrap();
+        let cursor_before_refresh = store.session_state(&session.id).unwrap().unwrap().cursor;
+
+        store
+            .refresh_completed_assistant_history(
+                &session.id,
+                &[
+                    ChatMessage {
+                        id: "user".to_string(),
+                        session_id: session.id.clone(),
+                        role: MessageRole::User,
+                        content: "inspect it".to_string(),
+                        created_at: now,
+                    },
+                    ChatMessage {
+                        id: "commentary".to_string(),
+                        session_id: session.id.clone(),
+                        role: MessageRole::Assistant,
+                        content: "I will inspect it.".to_string(),
+                        created_at: now,
+                    },
+                    ChatMessage {
+                        id: "final".to_string(),
+                        session_id: session.id.clone(),
+                        role: MessageRole::Assistant,
+                        content: "Inspection complete.".to_string(),
+                        created_at: now,
+                    },
+                ],
+            )
+            .unwrap();
+
+        let state = store.session_state(&session.id).unwrap().unwrap();
+        let turn = &state.turns[0];
+        assert_eq!(turn.user_message.attachments.len(), 1);
+        assert!(turn.segments.iter().any(|segment| {
+            segment
+                .activities
+                .iter()
+                .any(|activity| activity.id == "tool")
+        }));
+        assert_eq!(turn.artifacts.len(), 1);
+        assert!(state.cursor > cursor_before_refresh);
     }
 
     #[test]
@@ -1394,6 +2202,15 @@ mod tests {
             store.events_after("session-2", 4, 10).unwrap()[0].event_id,
             5
         );
+        let events = store.events_after("session-2", 0, 10).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.event_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5, 6]
+        );
+        assert!(events.iter().all(|event| event.payload.is_object()));
     }
 
     #[test]
@@ -1618,6 +2435,73 @@ mod tests {
         assert_eq!(events.len(), 3);
         assert_eq!(events.last().unwrap().payload, json!({}));
         assert!(serde_json::to_string(events.last().unwrap()).unwrap().len() < 512);
+    }
+
+    #[test]
+    fn live_events_include_the_state_snapshot_at_their_own_cursor() {
+        let store = test_store();
+        store
+            .ensure_session(&session("session-live-snapshot"))
+            .unwrap();
+        let mut receiver = store.subscribe();
+        store
+            .create_turn(
+                "session-live-snapshot",
+                &CreateTurnCommand {
+                    command_id: "live-command".to_string(),
+                    turn_id: "live-turn".to_string(),
+                    user_message_id: "live-user".to_string(),
+                    content: "first state".to_string(),
+                    attachments: Vec::new(),
+                    input_mode: InputMode::Text,
+                    system_prompt: None,
+                    expected_session_version: None,
+                    provider_id: None,
+                    reasoning_effort: None,
+                    model: None,
+                },
+            )
+            .unwrap();
+        store
+            .project_agent_event(
+                "session-live-snapshot",
+                "live-turn",
+                AgentProjection::AssistantMessage {
+                    message_id: "live-assistant".to_string(),
+                    purpose: MessagePurpose::Commentary,
+                    state: EntityState::Running,
+                    content: "second state".to_string(),
+                },
+            )
+            .unwrap();
+        let accepted = receiver
+            .try_recv()
+            .expect("accepted event should be broadcast");
+        let updated = receiver
+            .try_recv()
+            .expect("update event should be broadcast");
+        assert_eq!(accepted.event_type, "turn.accepted");
+        assert_eq!(accepted.payload["coalesced"], false);
+        assert_eq!(
+            accepted.payload["session"]["version"],
+            accepted.session_version
+        );
+        assert_eq!(accepted.payload["turn"]["id"], "live-turn");
+        assert_eq!(
+            accepted.payload["turn"]["user_message"]["content"],
+            "first state"
+        );
+        assert!(
+            accepted.payload["turn"]["segments"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(updated.event_type, "message.updated");
+        assert_eq!(
+            updated.payload["turn"]["segments"][0]["message"]["content"],
+            "second state"
+        );
     }
 
     #[test]

@@ -35,7 +35,6 @@ pub enum AiApprovalReasonKind {
     #[default]
     AiReview,
     RiskThreshold,
-    HardBlock,
 }
 
 impl AiApprovalReasonKind {
@@ -43,7 +42,6 @@ impl AiApprovalReasonKind {
         match self {
             Self::AiReview => "ai_review",
             Self::RiskThreshold => "risk_threshold",
-            Self::HardBlock => "hard_block",
         }
     }
 }
@@ -112,6 +110,7 @@ pub fn is_enabled() -> bool {
 pub async fn review_request(
     request: &ApprovalRequest,
     project_root: &Path,
+    preferred_language: Option<&str>,
 ) -> Result<Option<AiApprovalDecision>> {
     let Some(command) = request
         .command
@@ -124,20 +123,19 @@ pub async fn review_request(
     if !is_enabled() {
         return Ok(None);
     }
-    if is_hard_blocked(command, project_root) {
-        return Ok(Some(AiApprovalDecision {
-            decision: AiApprovalDecisionKind::AskUser,
-            risk: AiApprovalRisk::High,
-            reason: "Command matched a hard safety block".to_string(),
-            reason_kind: AiApprovalReasonKind::HardBlock,
-        }));
-    }
-
     let config = AiApprovalConfig::from_settings_or_env(project_root)?;
     if !config.enabled {
         return Ok(None);
     }
-    let decision = call_openai_compatible(&config, request, command, project_root).await?;
+    let decision = call_openai_compatible(
+        &config,
+        request,
+        command,
+        project_root,
+        is_hard_blocked(command, project_root),
+        preferred_language,
+    )
+    .await?;
     if decision.decision == AiApprovalDecisionKind::Accept && decision.risk > config.max_auto_risk {
         return Ok(Some(AiApprovalDecision {
             decision: AiApprovalDecisionKind::AskUser,
@@ -245,6 +243,8 @@ async fn call_openai_compatible(
     request: &ApprovalRequest,
     command: &str,
     project_root: &Path,
+    has_static_safety_signal: bool,
+    preferred_language: Option<&str>,
 ) -> Result<AiApprovalDecision> {
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
@@ -256,11 +256,11 @@ async fn call_openai_compatible(
         messages: vec![
             ChatMessageRequest {
                 role: "system",
-                content: system_prompt(config),
+                content: system_prompt(config, preferred_language),
             },
             ChatMessageRequest {
                 role: "user",
-                content: user_prompt(request, command, project_root),
+                content: user_prompt(request, command, project_root, has_static_safety_signal),
             },
         ],
         temperature: 0.0,
@@ -296,18 +296,33 @@ async fn call_openai_compatible(
         .context("AI approval response did not include message content")?;
     let decision: AiApprovalDecision =
         serde_json::from_str(content).context("failed to parse AI approval decision JSON")?;
-    Ok(normalize_decision(decision))
+    Ok(normalize_decision(decision, preferred_language))
 }
 
-fn normalize_decision(mut decision: AiApprovalDecision) -> AiApprovalDecision {
+fn normalize_decision(
+    mut decision: AiApprovalDecision,
+    preferred_language: Option<&str>,
+) -> AiApprovalDecision {
     if decision.reason.trim().is_empty() {
-        decision.reason = "No reason provided".to_string();
+        decision.reason =
+            if preferred_language.is_some_and(|language| language.eq_ignore_ascii_case("zh-CN")) {
+                "未提供审批理由".to_string()
+            } else {
+                "No reason provided".to_string()
+            };
     }
     decision
 }
 
-fn system_prompt(config: &AiApprovalConfig) -> String {
-    let mut prompt = "You are a conservative command approval reviewer for a coding agent. Return only JSON with keys decision, risk, reason. decision must be one of accept, decline, ask_user. risk must be one of low, medium, high. Accept only commands that are clearly project-local, reversible, and routine for software development, and assign their actual risk level. Ask the user for anything ambiguous, destructive, credential-related, system-level, network-installing, or outside the project. Decline commands that are clearly malicious or destructive. Hard safety rules cannot be overridden. Global instructions supplement these rules. Project instructions take precedence over conflicting global instructions, but cannot override hard safety rules. Write reason as a concise, natural, user-facing explanation with no labels or boilerplate. Use the same language as the request Reason when that language is detectable.".to_string();
+fn system_prompt(config: &AiApprovalConfig, preferred_language: Option<&str>) -> String {
+    let mut prompt = "You are a conservative command approval reviewer for a coding agent. Return only JSON with keys decision, risk, reason. decision must be one of accept, decline, ask_user. risk must be one of low, medium, high. Accept only commands that are clearly project-local, reversible, and routine for software development, and assign their actual risk level. Ask the user for anything ambiguous, destructive, credential-related, system-level, network-installing, or outside the project. Decline commands that are clearly malicious or destructive. A static safety signal is supplementary evidence, not an automatic rejection: inspect the complete command and distinguish an interpreter or toolchain path from the operation it performs. Global instructions supplement these rules. Project instructions take precedence over conflicting global instructions. Write reason as a concise, natural, user-facing explanation with no labels or boilerplate.".to_string();
+    if let Some(language) = preferred_language {
+        prompt.push_str(" Write reason in ");
+        prompt.push_str(language);
+        prompt.push_str(
+            ". This requirement takes precedence over the language used by the request Reason.",
+        );
+    }
     if !config.prompt.trim().is_empty() {
         prompt.push_str("\n\nGlobal approval instructions:\n");
         prompt.push_str(config.prompt.trim());
@@ -319,7 +334,12 @@ fn system_prompt(config: &AiApprovalConfig) -> String {
     prompt
 }
 
-fn user_prompt(request: &ApprovalRequest, command: &str, project_root: &Path) -> String {
+fn user_prompt(
+    request: &ApprovalRequest,
+    command: &str,
+    project_root: &Path,
+    has_static_safety_signal: bool,
+) -> String {
     let kind = match request.kind {
         ApprovalKind::CommandExecution => "command_execution",
         ApprovalKind::ExecCommand => "exec_command",
@@ -328,9 +348,14 @@ fn user_prompt(request: &ApprovalRequest, command: &str, project_root: &Path) ->
         ApprovalKind::Permissions => "permissions",
     };
     format!(
-        "Review this approval request.\nProject root: {}\nKind: {}\nReason: {}\nCommand: {}\n\nReturn JSON only, for example: {{\"decision\":\"ask_user\",\"risk\":\"medium\",\"reason\":\"...\"}}",
+        "Review this approval request.\nProject root: {}\nKind: {}\nStatic safety signal: {}\nReason: {}\nCommand: {}\n\nReturn JSON only, for example: {{\"decision\":\"ask_user\",\"risk\":\"medium\",\"reason\":\"...\"}}",
         project_root.display(),
         kind,
+        if has_static_safety_signal {
+            "detected"
+        } else {
+            "none"
+        },
         request.reason.as_deref().unwrap_or(""),
         command
     )
@@ -462,12 +487,13 @@ mod tests {
                 .to_string(),
         };
 
-        let prompt = system_prompt(&config);
+        let prompt = system_prompt(&config, Some("zh-CN"));
         assert!(prompt.contains("Follow company policy"));
         assert!(prompt.contains("Allow repository checks"));
         assert!(prompt.contains("unless a hard safety block applies"));
         assert!(prompt.contains("concise, natural, user-facing explanation"));
-        assert!(prompt.contains("same language as the request Reason"));
+        assert!(prompt.contains("Write reason in zh-CN"));
+        assert!(prompt.contains("takes precedence over the language used by the request Reason"));
         assert!(prompt.contains("Project instructions take precedence"));
     }
 
@@ -486,25 +512,68 @@ mod tests {
 
     #[test]
     fn normalization_preserves_medium_and_high_accept_risk() {
-        let medium = normalize_decision(AiApprovalDecision {
-            decision: AiApprovalDecisionKind::Accept,
-            risk: AiApprovalRisk::Medium,
-            reason: "Routine but moderate risk".to_string(),
-            reason_kind: AiApprovalReasonKind::AiReview,
-        });
-        let high = normalize_decision(AiApprovalDecision {
-            decision: AiApprovalDecisionKind::Accept,
-            risk: AiApprovalRisk::High,
-            reason: "High risk".to_string(),
-            reason_kind: AiApprovalReasonKind::AiReview,
-        });
+        let medium = normalize_decision(
+            AiApprovalDecision {
+                decision: AiApprovalDecisionKind::Accept,
+                risk: AiApprovalRisk::Medium,
+                reason: "Routine but moderate risk".to_string(),
+                reason_kind: AiApprovalReasonKind::AiReview,
+            },
+            None,
+        );
+        let high = normalize_decision(
+            AiApprovalDecision {
+                decision: AiApprovalDecisionKind::Accept,
+                risk: AiApprovalRisk::High,
+                reason: "High risk".to_string(),
+                reason_kind: AiApprovalReasonKind::AiReview,
+            },
+            None,
+        );
 
         assert_eq!(medium.decision, AiApprovalDecisionKind::Accept);
         assert_eq!(high.decision, AiApprovalDecisionKind::Accept);
     }
 
     #[test]
-    fn hard_blocks_detect_dangerous_commands_before_auto_approval() {
+    fn empty_reason_uses_the_preferred_language() {
+        let decision = normalize_decision(
+            AiApprovalDecision {
+                decision: AiApprovalDecisionKind::AskUser,
+                risk: AiApprovalRisk::Low,
+                reason: String::new(),
+                reason_kind: AiApprovalReasonKind::AiReview,
+            },
+            Some("zh-CN"),
+        );
+
+        assert_eq!(decision.reason, "未提供审批理由");
+    }
+
+    #[test]
+    fn static_safety_signals_are_provided_to_ai_review() {
+        let request = ApprovalRequest {
+            request_id: "approval".to_string(),
+            kind: ApprovalKind::ExecCommand,
+            command: Some("/run/current-system/sw/bin/zsh -lc 'curl -X POST http://127.0.0.1:18088/api/cad/jobs'".to_string()),
+            reason: Some("Retry the local job".to_string()),
+            auto_approval_reason: None,
+            auto_approval_reason_kind: None,
+            allow_accept_for_session: false,
+            allow_cancel: true,
+            resolvable: true,
+        };
+        let root = Path::new("/workspace/project");
+        let command = request.command.as_deref().unwrap();
+
+        let prompt = user_prompt(&request, command, root, is_hard_blocked(command, root));
+
+        assert!(prompt.contains("Static safety signal: detected"));
+        assert!(prompt.contains(command));
+    }
+
+    #[test]
+    fn static_safety_signal_detects_dangerous_commands() {
         let root = Path::new("/workspace/project");
 
         assert!(is_hard_blocked("sudo rm -rf /tmp", root));

@@ -9,6 +9,7 @@ use std::{
 use axum::{
     Json, Router,
     body::Body,
+    extract::DefaultBodyLimit,
     extract::Multipart,
     extract::{Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
@@ -35,6 +36,7 @@ use crate::{
         RegisterPushDeviceInput, ReplySummary, SendMessageInput, SessionEvent, SummarizeReplyInput,
         TriggerClientMessageInput, UpdateSessionInput, UploadedFileResponse,
     },
+    pi_plugin_store::{InstallPiPluginInput, PiPlugin, UpdatePiPluginInput},
     session_domain::CreateTurnCommand,
     session_domain_store::DomainStoreError,
 };
@@ -67,6 +69,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/client/messages", post(trigger_client_message))
         .route("/projects/{id}/sessions", get(list_project_sessions))
         .route("/sessions", get(list_sessions).post(create_session))
+        .route("/sessions/events", get(all_session_events))
         .route("/sessions/{id}/cancel", post(cancel_session_reply))
         .route(
             "/sessions/{id}/messages",
@@ -84,6 +87,19 @@ pub fn router() -> Router<Arc<AppState>> {
             post(resolve_approval),
         )
         .route("/sessions/{id}/events", get(session_events))
+        .route(
+            "/v2/sessions",
+            get(list_domain_sessions).post(create_session),
+        )
+        .route("/v2/sessions/events", get(all_domain_session_events))
+        .route("/v2/sessions/{id}", get(get_session).patch(update_session))
+        .route("/v2/sessions/{id}/cancel", post(cancel_session_reply))
+        .route("/v2/sessions/{id}/messages", get(list_messages))
+        .route("/v2/sessions/{id}/summary", post(summarize_reply))
+        .route(
+            "/v2/sessions/{id}/approvals/{request_id}",
+            post(resolve_approval),
+        )
         .route("/v2/sessions/{id}/state", get(domain_session_state))
         .route(
             "/v2/sessions/{id}/read-state",
@@ -91,12 +107,108 @@ pub fn router() -> Router<Arc<AppState>> {
         )
         .route("/v2/sessions/{id}/turns", post(create_domain_turn))
         .route("/v2/sessions/{id}/events", get(domain_session_events))
+        .route(
+            "/v2/pi/plugins",
+            get(list_pi_plugins).post(install_pi_plugin),
+        )
+        .route(
+            "/v2/pi/plugins/{id}",
+            axum::routing::patch(update_pi_plugin).delete(remove_pi_plugin),
+        )
+        .route("/v2/pi/plugins/{id}/validate", post(validate_pi_plugin))
+        .layer(DefaultBodyLimit::max(36 * 1024 * 1024))
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct PiPluginListQuery {
+    project_id: Option<String>,
+}
+
+async fn list_pi_plugins(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<PiPluginListQuery>,
+) -> Result<Json<ApiResponse<Vec<PiPlugin>>>, ApiError> {
+    let mut plugins = state.pi_plugins.list().map_err(pi_plugin_error)?;
+    if let Some(project_id) = query.project_id {
+        plugins.retain(|plugin| {
+            plugin.project_ids.is_empty() || plugin.project_ids.iter().any(|id| id == &project_id)
+        });
+    }
+    Ok(Json(ApiResponse { data: plugins }))
+}
+
+async fn install_pi_plugin(
+    State(state): State<Arc<AppState>>,
+    Json(input): Json<InstallPiPluginInput>,
+) -> Result<(StatusCode, Json<ApiResponse<PiPlugin>>), ApiError> {
+    let plugin = state
+        .pi_plugins
+        .install(input)
+        .await
+        .map_err(pi_plugin_error)?;
+    Ok((StatusCode::CREATED, Json(ApiResponse { data: plugin })))
+}
+
+async fn update_pi_plugin(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(input): Json<UpdatePiPluginInput>,
+) -> Result<Json<ApiResponse<PiPlugin>>, ApiError> {
+    Ok(Json(ApiResponse {
+        data: state
+            .pi_plugins
+            .update(&id, input)
+            .map_err(pi_plugin_error)?,
+    }))
+}
+
+async fn validate_pi_plugin(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<PiPlugin>>, ApiError> {
+    Ok(Json(ApiResponse {
+        data: state.pi_plugins.validate(&id).map_err(pi_plugin_error)?,
+    }))
+}
+
+async fn remove_pi_plugin(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    state.pi_plugins.remove(&id).map_err(pi_plugin_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn pi_plugin_error(error: anyhow::Error) -> ApiError {
+    let message = error.to_string();
+    let status = if message.contains("not found") {
+        StatusCode::NOT_FOUND
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    ApiError { status, message }
 }
 
 #[derive(Debug, Deserialize, Default)]
 struct DomainEventQuery {
     #[serde(default)]
     after: i64,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct DomainSessionListQuery {
+    project_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DomainStateQuery {
+    #[serde(default = "default_domain_turn_limit")]
+    limit: usize,
+    before_sequence: Option<i64>,
+}
+
+fn default_domain_turn_limit() -> usize {
+    50
 }
 
 #[derive(Debug, Deserialize)]
@@ -727,14 +839,14 @@ async fn send_message(
     Json(input): Json<SendMessageInput>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize_request(&headers, &state).await?;
-    let (user_message, pending_reply) =
-        state
-            .send_message(&id, input)
-            .await
-            .map_err(|err| ApiError {
-                status: StatusCode::NOT_FOUND,
-                message: err,
-            })?;
+    let approval_language = preferred_language(&headers);
+    let (user_message, pending_reply) = state
+        .send_message_with_approval_language(&id, input, approval_language)
+        .await
+        .map_err(|err| ApiError {
+            status: StatusCode::NOT_FOUND,
+            message: err,
+        })?;
 
     Ok((
         StatusCode::CREATED,
@@ -831,6 +943,7 @@ async fn list_agents(headers: HeaderMap, State(state): State<Arc<AppState>>) -> 
         agent_summary(&state, AgentKind::ClaudeCode).await,
         agent_summary(&state, AgentKind::OpenCode).await,
         agent_summary(&state, AgentKind::Acp).await,
+        agent_summary(&state, AgentKind::Pi).await,
     ];
     Json(ApiResponse { data: agents }).into_response()
 }
@@ -847,6 +960,7 @@ async fn list_agent_commands(
         agent_commands_summary(AgentKind::ClaudeCode),
         agent_commands_summary(AgentKind::OpenCode),
         agent_commands_summary(AgentKind::Acp),
+        agent_commands_summary(AgentKind::Pi),
     ];
     Json(ApiResponse { data: commands }).into_response()
 }
@@ -1037,6 +1151,13 @@ async fn agent_summary(state: &Arc<AppState>, kind: AgentKind) -> AgentSummary {
                 summary.readiness_message,
                 summary.diagnostic,
             )
+        } else if matches!(kind, AgentKind::Pi) {
+            (
+                true,
+                None,
+                adapter::agent_readiness_message(kind).await,
+                None,
+            )
         } else {
             let installed_path = adapter::find_executable_in_path(binary_name);
             let readiness_message = adapter::agent_readiness_message(kind).await;
@@ -1122,6 +1243,19 @@ fn agent_descriptor(
             false,
             vec![crate::models::ApiFormat::Acp],
             "",
+        ),
+        AgentKind::Pi => (
+            "pi",
+            "Pi Agent（内置）",
+            vec!["pi", "pi_agent_rust"],
+            true,
+            false,
+            vec![
+                crate::models::ApiFormat::OpenAiCompatible,
+                crate::models::ApiFormat::AnthropicMessages,
+                crate::models::ApiFormat::Codex,
+            ],
+            "pi",
         ),
         AgentKind::Custom => (
             "custom",
@@ -1245,6 +1379,26 @@ fn agent_commands_summary(kind: AgentKind) -> AgentCommandsSummary {
                 forwarding: AgentCommandForwarding::Bridge,
             },
         ],
+        AgentKind::Pi => vec![
+            AgentCommandSummary {
+                name: "/compact".to_string(),
+                args_hint: None,
+                description: "Compact the Pi Agent session context".to_string(),
+                forwarding: AgentCommandForwarding::Native,
+            },
+            AgentCommandSummary {
+                name: "/model".to_string(),
+                args_hint: Some("<provider> <model-id>".to_string()),
+                description: "Switch the active Pi Agent model".to_string(),
+                forwarding: AgentCommandForwarding::Native,
+            },
+            AgentCommandSummary {
+                name: "/name".to_string(),
+                args_hint: Some("<session-name>".to_string()),
+                description: "Set the Pi Agent session name".to_string(),
+                forwarding: AgentCommandForwarding::Native,
+            },
+        ],
         AgentKind::Acp | AgentKind::Custom => Vec::new(),
     };
     AgentCommandsSummary { kind, commands }
@@ -1328,13 +1482,54 @@ async fn session_events(
     ))
 }
 
+async fn all_session_events(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    authorize_request_status(&headers, &state).await?;
+    let last_event_id = headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok());
+    let subscription = state.subscribe_with_replay(last_event_id);
+    let initial_stream = match last_event_id {
+        Some(_) => match subscription.replay {
+            EventReplay::Events(events) => stream::iter(events.into_iter().filter_map(|event| {
+                global_session_event(&event.event)
+                    .then(|| sse_event_for_session_event(&event))
+                    .flatten()
+            }))
+            .boxed(),
+            EventReplay::SyncRequired => stream::once(async { sync_required_event() }).boxed(),
+        },
+        None => stream::once(async { sync_required_event() }).boxed(),
+    };
+    let high_watermark = subscription.high_watermark;
+    let broadcast_stream =
+        BroadcastStream::new(subscription.receiver).filter_map(move |item| async move {
+            match item {
+                Ok(event) if event.id > high_watermark && global_session_event(&event.event) => {
+                    sse_event_for_session_event(&event)
+                }
+                Err(_) => Some(sync_required_event()),
+                _ => None,
+            }
+        });
+    Ok(Sse::new(initial_stream.chain(broadcast_stream)).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keep-alive"),
+    ))
+}
+
 async fn domain_session_state(
     Path(id): Path<String>,
+    Query(query): Query<DomainStateQuery>,
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize_request_status(&headers, &state).await?;
-    let snapshot = state
+    let mut snapshot = state
         .domain_session_state(&id)
         .await
         .map_err(|message| ApiError {
@@ -1345,7 +1540,90 @@ async fn domain_session_state(
             status: StatusCode::NOT_FOUND,
             message: "session not found".to_string(),
         })?;
-    Ok(Json(ApiResponse { data: snapshot }))
+    let limit = query.limit.clamp(1, 200);
+    if let Some(before) = query.before_sequence {
+        snapshot.turns.retain(|turn| turn.sequence < before);
+    }
+    let has_more = snapshot.turns.len() > limit;
+    if has_more {
+        let keep_from = snapshot.turns.len() - limit;
+        snapshot.turns.drain(0..keep_from);
+    }
+    let next_before_sequence = has_more.then(|| snapshot.turns[0].sequence);
+    Ok(Json(ApiResponse {
+        data: serde_json::json!({
+            "session": snapshot.session,
+            "turns": snapshot.turns,
+            "cursor": snapshot.cursor,
+            "has_more_turns": has_more,
+            "next_before_sequence": next_before_sequence,
+        }),
+    }))
+}
+
+async fn list_domain_sessions(
+    Query(query): Query<DomainSessionListQuery>,
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, ApiError> {
+    authorize_request_status(&headers, &state).await?;
+    let project_id = query
+        .project_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let sessions = state
+        .list_domain_session_summaries(project_id)
+        .await
+        .map_err(|message| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message,
+        })?;
+    Ok(Json(ApiResponse { data: sessions }))
+}
+
+async fn all_domain_session_events(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    authorize_request_status(&headers, &state).await?;
+    let receiver = state.subscribe_domain_events();
+    let initial = stream::once(async {
+        domain_sse_event(crate::session_domain::SessionDomainEvent {
+            event_id: 0,
+            session_id: String::new(),
+            session_version: 0,
+            turn_id: None,
+            event_type: "stream.reset_required".to_string(),
+            entity_id: None,
+            entity_revision: None,
+            payload: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+        })
+        .expect("reset event serializes")
+    });
+    let live = BroadcastStream::new(receiver).filter_map(|item| async move {
+        let event = match item {
+            Ok(event) => event,
+            Err(_) => crate::session_domain::SessionDomainEvent {
+                event_id: 0,
+                session_id: String::new(),
+                session_version: 0,
+                turn_id: None,
+                event_type: "stream.reset_required".to_string(),
+                entity_id: None,
+                entity_revision: None,
+                payload: serde_json::json!({}),
+                created_at: chrono::Utc::now(),
+            },
+        };
+        domain_sse_event(event)
+    });
+    Ok(Sse::new(initial.chain(live)).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keep-alive"),
+    ))
 }
 
 async fn mark_domain_session_read(
@@ -1371,6 +1649,7 @@ async fn create_domain_turn(
     Json(command): Json<CreateTurnCommand>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize_request(&headers, &state).await?;
+    let approval_language = preferred_language(&headers);
     let result = state
         .create_domain_turn(&id, &command)
         .await
@@ -1412,7 +1691,12 @@ async fn create_domain_turn(
             model: command.model,
         };
         if let Err(error) = execution_state
-            .send_domain_message(&execution_session_id, &execution_turn_id, input)
+            .send_domain_message_with_approval_language(
+                &execution_session_id,
+                &execution_turn_id,
+                input,
+                approval_language,
+            )
             .await
         {
             execution_state
@@ -1422,6 +1706,18 @@ async fn create_domain_turn(
     });
 
     Ok((StatusCode::ACCEPTED, Json(ApiResponse { data: result })))
+}
+
+fn preferred_language(headers: &HeaderMap) -> Option<String> {
+    let value = headers.get(header::ACCEPT_LANGUAGE)?.to_str().ok()?;
+    let language = value.split(',').next()?.split(';').next()?.trim();
+    let normalized = language.replace('_', "-");
+    let primary = normalized.split('-').next()?.to_ascii_lowercase();
+    match primary.as_str() {
+        "zh" => Some("zh-CN".to_string()),
+        "en" => Some("en".to_string()),
+        _ => None,
+    }
 }
 
 async fn domain_session_events(
@@ -1455,7 +1751,7 @@ async fn domain_session_events(
             message: "event cursor is ahead of the session; reload session state".to_string(),
         });
     }
-    let mut latest_backlog_event = None;
+    let mut backlog = Vec::new();
     let mut cursor = query.after.max(0);
     while cursor < high_watermark {
         let page = state
@@ -1471,16 +1767,15 @@ async fn domain_session_events(
             });
         }
         cursor = page.last().map(|event| event.event_id).unwrap_or(cursor);
-        latest_backlog_event = page
-            .into_iter()
-            .filter(|event| event.event_id <= high_watermark)
-            .last()
-            .or(latest_backlog_event);
+        backlog.extend(
+            page.into_iter()
+                .filter(|event| event.event_id <= high_watermark),
+        );
     }
     let initial_state = Arc::clone(&state);
-    let initial = stream::iter(latest_backlog_event).filter_map(move |event| {
+    let initial = stream::iter(backlog).filter_map(move |event| {
         let state = Arc::clone(&initial_state);
-        async move { hydrate_domain_sse_event(&state, event, true) }
+        async move { Some(hydrate_domain_sse_event_or_reset(&state, event, true)) }
     });
     let live_session_id = id.clone();
     let live = BroadcastStream::new(receiver).filter_map(move |item| {
@@ -1506,22 +1801,16 @@ async fn domain_session_events(
         }
     });
     let live_state = Arc::clone(&state);
-    let live = tokio_stream::StreamExt::chunks_timeout(live, 512, Duration::from_millis(250))
-        .filter_map(move |chunk| {
-            let state = Arc::clone(&live_state);
-            async move {
-                let fallback_turn_id = chunk.iter().rev().find_map(|event| event.turn_id.clone());
-                let mut event = chunk.into_iter().last()?;
-                if event.turn_id.is_none() {
-                    event.turn_id = fallback_turn_id;
-                }
-                if event.event_type == "stream.reset_required" {
-                    domain_sse_event(event)
-                } else {
-                    hydrate_domain_sse_event(&state, event, true)
-                }
+    let live = live.filter_map(move |event| {
+        let state = Arc::clone(&live_state);
+        async move {
+            if event.event_type == "stream.reset_required" {
+                domain_sse_event(event)
+            } else {
+                Some(hydrate_domain_sse_event_or_reset(&state, event, false))
             }
-        });
+        }
+    });
 
     Ok(Sse::new(initial.chain(live)).keep_alive(
         KeepAlive::new()
@@ -1535,6 +1824,9 @@ fn hydrate_domain_sse_event(
     mut event: crate::session_domain::SessionDomainEvent,
     coalesced: bool,
 ) -> Option<Result<Event, Infallible>> {
+    if event.payload.get("session").is_some() {
+        return domain_sse_event(event);
+    }
     let (session, explicit_turn) = state
         .domain_event_snapshot(&event.session_id, event.turn_id.as_deref())
         .ok()??;
@@ -1552,6 +1844,26 @@ fn hydrate_domain_sse_event(
         "coalesced": coalesced,
     });
     domain_sse_event(event)
+}
+
+fn hydrate_domain_sse_event_or_reset(
+    state: &AppState,
+    event: crate::session_domain::SessionDomainEvent,
+    coalesced: bool,
+) -> Result<Event, Infallible> {
+    let reset_event = crate::session_domain::SessionDomainEvent {
+        event_id: event.event_id,
+        session_id: event.session_id.clone(),
+        session_version: event.session_version,
+        turn_id: event.turn_id.clone(),
+        event_type: "stream.reset_required".to_string(),
+        entity_id: None,
+        entity_revision: None,
+        payload: serde_json::json!({}),
+        created_at: chrono::Utc::now(),
+    };
+    hydrate_domain_sse_event(state, event, coalesced)
+        .unwrap_or_else(|| domain_sse_event(reset_event).expect("reset event serializes"))
 }
 
 fn domain_sse_event(
@@ -1705,6 +2017,17 @@ fn event_belongs_to_session(event: &SessionEvent, session_id: &str) -> bool {
         SessionEvent::ApprovalRequested(event) => event.session_id == session_id,
         SessionEvent::ApprovalResolved(event) => event.session_id == session_id,
     }
+}
+
+fn global_session_event(event: &SessionEvent) -> bool {
+    matches!(
+        event,
+        SessionEvent::SessionSnapshot(_)
+            | SessionEvent::SessionStatus(_)
+            | SessionEvent::AgentError(_)
+            | SessionEvent::ApprovalRequested(_)
+            | SessionEvent::ApprovalResolved(_)
+    )
 }
 
 fn event_name(event: &SessionEvent) -> &'static str {
@@ -2215,19 +2538,25 @@ fn sanitize_upload_lookup_id(id: &str) -> Option<String> {
 mod tests {
     use super::{
         AcpDiagnosticQuery, absolute_url_from_headers, agent_commands_summary, agent_summary,
-        completion_search_scope, content_type_for_path, content_type_for_upload_name,
-        encode_session_event, get_acp_agent_diagnostic, list_completion_items,
-        normalize_completion_prefix, paginate_messages, resolve_path_within_root,
-        sanitize_upload_file_name, sanitize_upload_lookup_id, uploads_dir,
+        all_session_events, cancel_session_reply, completion_search_scope, content_type_for_path,
+        content_type_for_upload_name, create_domain_turn, domain_session_events,
+        domain_session_state, encode_session_event, get_acp_agent_diagnostic, global_session_event,
+        hydrate_domain_sse_event_or_reset, list_completion_items, list_domain_sessions,
+        mark_domain_session_read, normalize_completion_prefix, paginate_messages,
+        preferred_language, resolve_approval, resolve_path_within_root, sanitize_upload_file_name,
+        sanitize_upload_lookup_id, session_events, uploads_dir,
     };
     use crate::{
         app_state::AppState,
         bridge_settings::{AiApprovalSettings, BridgeSettingsInput},
         models::{
-            AcpProfile, AcpServerConfig, AgentKind, AgentReadiness, ChatMessage,
-            ClientAuthRequestInput, FileCompletionQuery, HeaderKeyValue, MessageListQuery,
-            MessageRole, SessionEvent,
+            AcpProfile, AcpServerConfig, AgentKind, AgentReadiness, ApprovalChoice,
+            ApprovalDecisionInput, ApprovalKind, ApprovalRequest, ChatMessage,
+            ClientAuthRequestInput, CreateProjectInput, CreateSessionInput, FileCompletionQuery,
+            HeaderKeyValue, InputMode, MessageListQuery, MessageRole, SessionEvent,
+            TriggerClientMessageInput,
         },
+        session_domain::{Attachment, CreateTurnCommand},
     };
     use axum::{
         Json,
@@ -2285,6 +2614,906 @@ mod tests {
             format!("Bearer {token}").parse().unwrap(),
         );
         headers
+    }
+
+    async fn response_json(response: axum::response::Response) -> Value {
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should load");
+        serde_json::from_slice(&body).expect("response should be JSON")
+    }
+
+    #[test]
+    fn preferred_language_uses_supported_primary_locale() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ACCEPT_LANGUAGE, "zh-TW, en;q=0.8".parse().unwrap());
+        assert_eq!(preferred_language(&headers).as_deref(), Some("zh-CN"));
+
+        headers.insert(header::ACCEPT_LANGUAGE, "en_US".parse().unwrap());
+        assert_eq!(preferred_language(&headers).as_deref(), Some("en"));
+
+        headers.insert(header::ACCEPT_LANGUAGE, "fr-FR".parse().unwrap());
+        assert_eq!(preferred_language(&headers), None);
+    }
+
+    async fn create_api_test_session(state: &Arc<AppState>, suffix: &str) -> String {
+        let project = state
+            .create_project(CreateProjectInput {
+                name: format!("API project {suffix}"),
+                root_path: std::env::temp_dir().to_string_lossy().to_string(),
+            })
+            .await;
+        let session_id = format!("api-session-{suffix}-{}", uuid::Uuid::new_v4());
+        state
+            .create_session(CreateSessionInput {
+                client_session_id: session_id.clone(),
+                project_id: project.id,
+                title: Some(format!("API session {suffix}")),
+                agent: AgentKind::Custom,
+                brief_reply_mode: false,
+                provider_id: None,
+                reasoning_effort: None,
+                model: None,
+            })
+            .await
+            .expect("session should be created");
+        session_id
+    }
+
+    #[tokio::test]
+    async fn domain_session_handlers_cover_list_turn_execution_and_idempotency() {
+        let state = test_state("domain-session-lifecycle").await;
+        let session_id = create_api_test_session(&state, "lifecycle").await;
+        let headers = authorized_headers(&state).await;
+
+        let list_response = list_domain_sessions(
+            Query(super::DomainSessionListQuery { project_id: None }),
+            headers.clone(),
+            State(Arc::clone(&state)),
+        )
+        .await
+        .expect("list request should succeed")
+        .into_response();
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let list_json = response_json(list_response).await;
+        assert!(
+            list_json["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|session| session["id"] == session_id)
+        );
+
+        let command = CreateTurnCommand {
+            command_id: uuid::Uuid::new_v4().to_string(),
+            turn_id: uuid::Uuid::new_v4().to_string(),
+            user_message_id: uuid::Uuid::new_v4().to_string(),
+            content: "execute through v2 handler".to_string(),
+            attachments: Vec::new(),
+            input_mode: InputMode::Text,
+            system_prompt: None,
+            expected_session_version: None,
+            provider_id: None,
+            reasoning_effort: None,
+            model: None,
+        };
+        let create_response = create_domain_turn(
+            axum::extract::Path(session_id.clone()),
+            headers.clone(),
+            State(Arc::clone(&state)),
+            Json(command.clone()),
+        )
+        .await
+        .expect("turn request should succeed")
+        .into_response();
+        assert_eq!(create_response.status(), StatusCode::ACCEPTED);
+
+        let state_response = domain_session_state(
+            axum::extract::Path(session_id.clone()),
+            Query(super::DomainStateQuery {
+                limit: 50,
+                before_sequence: None,
+            }),
+            headers.clone(),
+            State(Arc::clone(&state)),
+        )
+        .await
+        .expect("state request should succeed")
+        .into_response();
+        let state_json = response_json(state_response).await;
+        assert!(state_json["data"]["session"]["active_turn_id"].is_string());
+        assert_eq!(state_json["data"]["turns"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            state_json["data"]["turns"][0]["user_message"]["content"],
+            command.content
+        );
+
+        let duplicate_response = create_domain_turn(
+            axum::extract::Path(session_id.clone()),
+            headers,
+            State(Arc::clone(&state)),
+            Json(command.clone()),
+        )
+        .await
+        .expect("duplicate request should succeed")
+        .into_response();
+        assert_eq!(duplicate_response.status(), StatusCode::OK);
+        let duplicate_json = response_json(duplicate_response).await;
+        assert_eq!(duplicate_json["data"]["created"], false);
+        assert_eq!(duplicate_json["data"]["turn"]["id"], command.turn_id);
+    }
+
+    #[tokio::test]
+    async fn domain_turn_handler_rejects_second_active_turn() {
+        let state = test_state("domain-active-turn-conflict").await;
+        let session_id = create_api_test_session(&state, "active-conflict").await;
+        let headers = authorized_headers(&state).await;
+        let command = |suffix: &str| CreateTurnCommand {
+            command_id: format!("command-{suffix}"),
+            turn_id: format!("turn-{suffix}"),
+            user_message_id: format!("user-{suffix}"),
+            content: format!("message {suffix}"),
+            attachments: Vec::new(),
+            input_mode: InputMode::Text,
+            system_prompt: None,
+            expected_session_version: None,
+            provider_id: None,
+            reasoning_effort: None,
+            model: None,
+        };
+        state
+            .create_domain_turn(&session_id, &command("first"))
+            .await
+            .expect("first turn should become active");
+
+        let result = create_domain_turn(
+            axum::extract::Path(session_id.clone()),
+            headers,
+            State(Arc::clone(&state)),
+            Json(command("second")),
+        )
+        .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("second active turn should conflict"),
+        };
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert!(error.message.contains("active turn"));
+        let snapshot = state
+            .domain_session_state(&session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.turns.len(), 1);
+        assert_eq!(
+            snapshot.session.active_turn_id.as_deref(),
+            Some("turn-first")
+        );
+    }
+
+    #[tokio::test]
+    async fn domain_session_list_handler_filters_by_project() {
+        let state = test_state("domain-list-project-filter").await;
+        let first_project = state
+            .create_project(CreateProjectInput {
+                name: "First project".to_string(),
+                root_path: std::env::temp_dir()
+                    .join("first")
+                    .to_string_lossy()
+                    .to_string(),
+            })
+            .await;
+        let second_project = state
+            .create_project(CreateProjectInput {
+                name: "Second project".to_string(),
+                root_path: std::env::temp_dir()
+                    .join("second")
+                    .to_string_lossy()
+                    .to_string(),
+            })
+            .await;
+        let first_session = format!("first-session-{}", uuid::Uuid::new_v4());
+        let second_session = format!("second-session-{}", uuid::Uuid::new_v4());
+        for (session_id, project_id) in [
+            (first_session.clone(), first_project.id.clone()),
+            (second_session.clone(), second_project.id.clone()),
+        ] {
+            state
+                .create_session(CreateSessionInput {
+                    client_session_id: session_id,
+                    project_id,
+                    title: Some("Session".to_string()),
+                    agent: AgentKind::Custom,
+                    brief_reply_mode: false,
+                    provider_id: None,
+                    reasoning_effort: None,
+                    model: None,
+                })
+                .await
+                .unwrap();
+        }
+        let headers = authorized_headers(&state).await;
+        let response = list_domain_sessions(
+            Query(super::DomainSessionListQuery {
+                project_id: Some(first_project.id),
+            }),
+            headers,
+            State(state),
+        )
+        .await
+        .expect("filtered list should load")
+        .into_response();
+        let json = response_json(response).await;
+        let sessions = json["data"].as_array().unwrap();
+        assert!(
+            sessions
+                .iter()
+                .any(|session| session["id"] == first_session)
+        );
+        assert!(
+            !sessions
+                .iter()
+                .any(|session| session["id"] == second_session)
+        );
+    }
+
+    #[tokio::test]
+    async fn domain_read_state_handler_clears_legacy_and_domain_unread() {
+        let state = test_state("domain-read-state").await;
+        let triggered = state
+            .trigger_client_message(TriggerClientMessageInput {
+                content: "unread reply".to_string(),
+                project_name: Some("Inbox".to_string()),
+                project_id: Some("read-state-project".to_string()),
+                title: Some("Unread session".to_string()),
+            })
+            .await
+            .unwrap();
+        let session_id = triggered.session.id;
+        assert_eq!(
+            state
+                .get_session(&session_id)
+                .await
+                .unwrap()
+                .session
+                .unread_count,
+            1
+        );
+        assert_eq!(
+            state
+                .domain_session_state(&session_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .session
+                .unread_count,
+            1
+        );
+        let headers = authorized_headers(&state).await;
+        let response = mark_domain_session_read(
+            axum::extract::Path(session_id.clone()),
+            headers,
+            State(Arc::clone(&state)),
+        )
+        .await
+        .expect("read state should update")
+        .into_response();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            state
+                .get_session(&session_id)
+                .await
+                .unwrap()
+                .session
+                .unread_count,
+            0
+        );
+        assert_eq!(
+            state
+                .domain_session_state(&session_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .session
+                .unread_count,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn domain_turn_handler_preserves_attachments_and_builds_provider_markdown() {
+        let state = test_state("domain-turn-attachments").await;
+        let session_id = create_api_test_session(&state, "attachments").await;
+        let headers = authorized_headers(&state).await;
+        let attachments = vec![
+            Attachment {
+                id: "image-1".to_string(),
+                kind: "image".to_string(),
+                file_name: "screen.png".to_string(),
+                content_type: "image/png".to_string(),
+                size_bytes: 10,
+                url: "http://localhost/uploads/screen.png".to_string(),
+                provider_reference: None,
+            },
+            Attachment {
+                id: "file-1".to_string(),
+                kind: "file".to_string(),
+                file_name: "notes.txt".to_string(),
+                content_type: "text/plain".to_string(),
+                size_bytes: 20,
+                url: "http://localhost/uploads/notes.txt".to_string(),
+                provider_reference: None,
+            },
+        ];
+        let command = CreateTurnCommand {
+            command_id: uuid::Uuid::new_v4().to_string(),
+            turn_id: uuid::Uuid::new_v4().to_string(),
+            user_message_id: uuid::Uuid::new_v4().to_string(),
+            content: "inspect files".to_string(),
+            attachments: attachments.clone(),
+            input_mode: InputMode::Text,
+            system_prompt: None,
+            expected_session_version: None,
+            provider_id: None,
+            reasoning_effort: None,
+            model: None,
+        };
+        let response = create_domain_turn(
+            axum::extract::Path(session_id.clone()),
+            headers,
+            State(Arc::clone(&state)),
+            Json(command),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let messages = state.list_messages(&session_id).await.unwrap_or_default();
+                if messages.iter().any(|message| {
+                    message
+                        .content
+                        .contains("![screen.png](http://localhost/uploads/screen.png)")
+                        && message
+                            .content
+                            .contains("[notes.txt](http://localhost/uploads/notes.txt)")
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("provider input should include attachment markdown");
+        let snapshot = state
+            .domain_session_state(&session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.turns[0].user_message.attachments.len(), 2);
+        assert_eq!(
+            snapshot.turns[0].user_message.attachments[0].id,
+            attachments[0].id
+        );
+        assert_eq!(
+            snapshot.turns[0].user_message.attachments[1].id,
+            attachments[1].id
+        );
+    }
+
+    #[tokio::test]
+    async fn session_event_handler_rejects_unknown_session() {
+        let state = test_state("session-events-missing").await;
+        let headers = authorized_headers(&state).await;
+        let error = session_events(
+            axum::extract::Path("missing-session".to_string()),
+            headers,
+            State(state),
+        )
+        .await
+        .expect_err("unknown session should be rejected");
+        assert_eq!(error.status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn global_session_event_handler_starts_with_sync_required() {
+        let state = test_state("global-session-events").await;
+        let headers = authorized_headers(&state).await;
+        let response = all_session_events(headers, State(state))
+            .await
+            .expect("global event stream should start")
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut stream = response.into_body().into_data_stream();
+        let first = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            futures_util::StreamExt::next(&mut stream),
+        )
+        .await
+        .expect("initial SSE event should arrive")
+        .expect("SSE stream should not end")
+        .expect("SSE chunk should be readable");
+        let text = String::from_utf8_lossy(&first);
+        assert!(text.contains("sync.required"));
+        assert!(text.contains("sync_required"));
+    }
+
+    #[tokio::test]
+    async fn cancel_handler_rejects_unknown_session() {
+        let state = test_state("cancel-missing-session").await;
+        let headers = authorized_headers(&state).await;
+        let result = cancel_session_reply(
+            axum::extract::Path("missing-session".to_string()),
+            headers,
+            State(state),
+        )
+        .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("unknown session cancellation should fail"),
+        };
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("unknown session"));
+    }
+
+    #[tokio::test]
+    async fn global_session_event_handler_streams_live_session_updates() {
+        let state = test_state("global-session-live-events").await;
+        let headers = authorized_headers(&state).await;
+        let response = all_session_events(headers, State(Arc::clone(&state)))
+            .await
+            .expect("global event stream should start")
+            .into_response();
+        let mut stream = response.into_body().into_data_stream();
+        let initial = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            futures_util::StreamExt::next(&mut stream),
+        )
+        .await
+        .expect("initial SSE event should arrive")
+        .expect("SSE stream should not end")
+        .expect("SSE chunk should be readable");
+        assert!(String::from_utf8_lossy(&initial).contains("sync.required"));
+
+        let session_id = create_api_test_session(&state, "live-event").await;
+        let update = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            futures_util::StreamExt::next(&mut stream),
+        )
+        .await
+        .expect("live SSE event should arrive")
+        .expect("SSE stream should remain open")
+        .expect("SSE chunk should be readable");
+        let text = String::from_utf8_lossy(&update);
+        assert!(text.contains("session.snapshot"));
+        assert!(text.contains(&session_id));
+    }
+
+    #[tokio::test]
+    async fn cancel_handler_interrupts_active_v2_turn() {
+        let state = test_state("cancel-active-domain-turn").await;
+        let session_id = create_api_test_session(&state, "cancel-active").await;
+        let headers = authorized_headers(&state).await;
+        let command = CreateTurnCommand {
+            command_id: uuid::Uuid::new_v4().to_string(),
+            turn_id: uuid::Uuid::new_v4().to_string(),
+            user_message_id: uuid::Uuid::new_v4().to_string(),
+            content: "cancel active turn".to_string(),
+            attachments: Vec::new(),
+            input_mode: InputMode::Text,
+            system_prompt: None,
+            expected_session_version: None,
+            provider_id: None,
+            reasoning_effort: None,
+            model: None,
+        };
+        let created = create_domain_turn(
+            axum::extract::Path(session_id.clone()),
+            headers.clone(),
+            State(Arc::clone(&state)),
+            Json(command.clone()),
+        )
+        .await
+        .expect("turn should be accepted")
+        .into_response();
+        assert_eq!(created.status(), StatusCode::ACCEPTED);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !state.turn_in_flight_for_test(&session_id).await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("turn should enter runtime");
+        let cancelled = cancel_session_reply(
+            axum::extract::Path(session_id.clone()),
+            headers,
+            State(Arc::clone(&state)),
+        )
+        .await
+        .expect("cancel should succeed")
+        .into_response();
+        assert_eq!(cancelled.status(), StatusCode::OK);
+        let json = response_json(cancelled).await;
+        assert_eq!(json["data"]["cancelled"], true);
+
+        let snapshot = state
+            .domain_session_state(&session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(snapshot.session.active_turn_id.is_none());
+        assert!(matches!(
+            snapshot.turns[0].status,
+            crate::session_domain::TurnStatus::Cancelled
+                | crate::session_domain::TurnStatus::Completed
+        ));
+        assert!(!state.turn_in_flight_for_test(&session_id).await);
+    }
+
+    #[tokio::test]
+    async fn approval_handler_forwards_choice_and_restores_running_state() {
+        let state = test_state("approval-handler").await;
+        let session_id = create_api_test_session(&state, "approval").await;
+        let headers = authorized_headers(&state).await;
+        let request = ApprovalRequest {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            kind: ApprovalKind::CommandExecution,
+            command: Some("cargo test".to_string()),
+            reason: Some("run project tests".to_string()),
+            auto_approval_reason: None,
+            auto_approval_reason_kind: None,
+            allow_accept_for_session: true,
+            allow_cancel: true,
+            resolvable: true,
+        };
+        let (approval_tx, mut approval_rx) = tokio::sync::mpsc::unbounded_channel();
+        state.set_approval_sender(&session_id, approval_tx).await;
+        state.raise_approval(&session_id, request.clone()).await;
+        let awaiting = state.get_session(&session_id).await.unwrap();
+        assert!(matches!(
+            awaiting.session.status,
+            crate::models::SessionStatus::AwaitingApproval
+        ));
+        assert_eq!(
+            awaiting
+                .session
+                .pending_approval
+                .as_ref()
+                .map(|pending| pending.request_id.as_str()),
+            Some(request.request_id.as_str())
+        );
+
+        let response = resolve_approval(
+            axum::extract::Path((session_id.clone(), request.request_id.clone())),
+            headers,
+            State(Arc::clone(&state)),
+            Json(ApprovalDecisionInput {
+                choice: ApprovalChoice::Accept,
+            }),
+        )
+        .await
+        .expect("approval should be forwarded")
+        .into_response();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(matches!(
+            approval_rx.recv().await,
+            Some(ApprovalChoice::Accept)
+        ));
+
+        state
+            .resolve_approval(&session_id, &request.request_id, ApprovalChoice::Accept)
+            .await;
+        let resolved = state.get_session(&session_id).await.unwrap();
+        assert!(matches!(
+            resolved.session.status,
+            crate::models::SessionStatus::Running
+        ));
+        assert!(resolved.session.pending_approval.is_none());
+    }
+
+    #[tokio::test]
+    async fn domain_session_handlers_restore_persisted_session_after_restart() {
+        let settings_path = test_path("restart-handler-settings");
+        let runtime_path = test_path("restart-handler-runtime");
+        let metadata_path = test_path("restart-handler-metadata");
+        let initial = Arc::new(
+            AppState::new_with_paths(
+                settings_path.clone(),
+                runtime_path.clone(),
+                metadata_path.clone(),
+            )
+            .await,
+        );
+        let project = initial
+            .create_project(CreateProjectInput {
+                name: "Restart project".to_string(),
+                root_path: std::env::temp_dir().to_string_lossy().to_string(),
+            })
+            .await;
+        let session_id = format!("restart-session-{}", uuid::Uuid::new_v4());
+        initial
+            .create_session(CreateSessionInput {
+                client_session_id: session_id.clone(),
+                project_id: project.id,
+                title: Some("Persistent API session".to_string()),
+                agent: AgentKind::Custom,
+                brief_reply_mode: false,
+                provider_id: None,
+                reasoning_effort: None,
+                model: None,
+            })
+            .await
+            .expect("session should persist");
+        drop(initial);
+
+        let restored =
+            Arc::new(AppState::new_with_paths(settings_path, runtime_path, metadata_path).await);
+        let headers = authorized_headers(&restored).await;
+        let detail = domain_session_state(
+            axum::extract::Path(session_id.clone()),
+            Query(super::DomainStateQuery {
+                limit: 50,
+                before_sequence: None,
+            }),
+            headers.clone(),
+            State(Arc::clone(&restored)),
+        )
+        .await
+        .expect("restored detail should load")
+        .into_response();
+        assert_eq!(detail.status(), StatusCode::OK);
+        let detail_json = response_json(detail).await;
+        assert_eq!(detail_json["data"]["session"]["id"], session_id);
+        assert_eq!(
+            detail_json["data"]["session"]["title"],
+            "Persistent API session"
+        );
+
+        let list = list_domain_sessions(
+            Query(super::DomainSessionListQuery { project_id: None }),
+            headers,
+            State(restored),
+        )
+        .await
+        .expect("restored list should load")
+        .into_response();
+        let list_json = response_json(list).await;
+        assert!(
+            list_json["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|session| session["id"] == session_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn domain_session_event_handler_rejects_future_cursor() {
+        let state = test_state("domain-events-future-cursor").await;
+        let session_id = create_api_test_session(&state, "future-cursor").await;
+        let headers = authorized_headers(&state).await;
+        let result = domain_session_events(
+            axum::extract::Path(session_id),
+            Query(super::DomainEventQuery { after: i64::MAX }),
+            headers,
+            State(state),
+        )
+        .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("future cursor should require a state reload"),
+        };
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert!(error.message.contains("cursor is ahead"));
+    }
+
+    #[tokio::test]
+    async fn domain_session_events_replay_every_backlog_event_in_cursor_order() {
+        let state = test_state("domain-events-ordered-replay").await;
+        let session_id = create_api_test_session(&state, "ordered-replay").await;
+        let command = CreateTurnCommand {
+            command_id: "ordered-command".to_string(),
+            turn_id: "ordered-turn".to_string(),
+            user_message_id: "ordered-user".to_string(),
+            content: "ordered replay".to_string(),
+            attachments: Vec::new(),
+            input_mode: InputMode::Text,
+            system_prompt: None,
+            expected_session_version: None,
+            provider_id: None,
+            reasoning_effort: None,
+            model: None,
+        };
+        state
+            .create_domain_turn(&session_id, &command)
+            .await
+            .expect("turn should create a second durable event");
+        let headers = authorized_headers(&state).await;
+        let response = domain_session_events(
+            axum::extract::Path(session_id),
+            Query(super::DomainEventQuery { after: 0 }),
+            headers,
+            State(state),
+        )
+        .await
+        .expect("SSE stream should open")
+        .into_response();
+        let mut stream = response.into_body().into_data_stream();
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let chunk = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                futures_util::StreamExt::next(&mut stream),
+            )
+            .await
+            .expect("backlog SSE event should arrive")
+            .expect("stream should remain open")
+            .expect("SSE chunk should be readable");
+            let text = String::from_utf8_lossy(&chunk);
+            let id = text
+                .lines()
+                .find_map(|line| line.strip_prefix("id: "))
+                .expect("SSE event should have an id")
+                .parse::<i64>()
+                .expect("SSE id should be numeric");
+            ids.push(id);
+        }
+        assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn domain_session_events_deliver_the_first_live_event_after_the_cursor() {
+        let state = test_state("domain-events-live-boundary").await;
+        let session_id = create_api_test_session(&state, "live-boundary").await;
+        let cursor = state
+            .domain_session_state(&session_id)
+            .await
+            .expect("domain state should load")
+            .expect("session should exist")
+            .cursor;
+        let headers = authorized_headers(&state).await;
+        let response = domain_session_events(
+            axum::extract::Path(session_id.clone()),
+            Query(super::DomainEventQuery { after: cursor }),
+            headers,
+            State(Arc::clone(&state)),
+        )
+        .await
+        .expect("SSE stream should open")
+        .into_response();
+        let mut stream = response.into_body().into_data_stream();
+        state
+            .create_domain_turn(
+                &session_id,
+                &CreateTurnCommand {
+                    command_id: "live-boundary-command".to_string(),
+                    turn_id: "live-boundary-turn".to_string(),
+                    user_message_id: "live-boundary-user".to_string(),
+                    content: "live event".to_string(),
+                    attachments: Vec::new(),
+                    input_mode: InputMode::Text,
+                    system_prompt: None,
+                    expected_session_version: None,
+                    provider_id: None,
+                    reasoning_effort: None,
+                    model: None,
+                },
+            )
+            .await
+            .expect("turn should create a live event");
+        let chunk = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            futures_util::StreamExt::next(&mut stream),
+        )
+        .await
+        .expect("live SSE event should arrive")
+        .expect("stream should remain open")
+        .expect("SSE chunk should be readable");
+        let text = String::from_utf8_lossy(&chunk);
+        assert!(text.contains(&format!("id: {}", cursor + 1)));
+        assert!(text.contains("turn.accepted"));
+        assert!(text.contains("\"coalesced\":false"));
+        assert!(text.contains("live-boundary-turn"));
+    }
+
+    #[tokio::test]
+    async fn failed_domain_event_hydration_emits_reset_event() {
+        let state = test_state("domain-event-hydration-reset").await;
+        let event = crate::session_domain::SessionDomainEvent {
+            event_id: 42,
+            session_id: "missing-session".to_string(),
+            session_version: 7,
+            turn_id: Some("missing-turn".to_string()),
+            event_type: "turn.status_changed".to_string(),
+            entity_id: None,
+            entity_revision: None,
+            payload: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+        };
+        let response = axum::response::Sse::new(tokio_stream::once(
+            hydrate_domain_sse_event_or_reset(&state, event, true),
+        ))
+        .into_response();
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("SSE body should load");
+        let body = String::from_utf8(body.to_vec()).expect("SSE body should be UTF-8");
+
+        assert!(body.contains("stream.reset_required"));
+        assert!(body.contains("id: 42"));
+    }
+
+    #[tokio::test]
+    async fn session_event_replay_is_isolated_to_requested_session() {
+        let state = test_state("session-event-replay-isolation").await;
+        let first_session = create_api_test_session(&state, "replay-first").await;
+        let second_session = create_api_test_session(&state, "replay-second").await;
+        let mut headers = authorized_headers(&state).await;
+        headers.insert("last-event-id", "0".parse().unwrap());
+
+        let response = session_events(
+            axum::extract::Path(second_session.clone()),
+            headers,
+            State(state),
+        )
+        .await
+        .expect("session replay should start")
+        .into_response();
+        let mut stream = response.into_body().into_data_stream();
+        let replay = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            futures_util::StreamExt::next(&mut stream),
+        )
+        .await
+        .expect("replayed event should arrive")
+        .expect("SSE stream should remain open")
+        .expect("SSE replay chunk should be readable");
+        let text = String::from_utf8_lossy(&replay);
+        assert!(text.contains("session.snapshot"));
+        assert!(text.contains(&second_session));
+        assert!(!text.contains(&first_session));
+    }
+
+    #[tokio::test]
+    async fn session_event_replay_preserves_event_id_order() {
+        let state = test_state("session-event-replay-order").await;
+        let session_id = create_api_test_session(&state, "replay-order").await;
+        state.publish_event(SessionEvent::MessageCreated(ChatMessage {
+            id: "replay-message".to_string(),
+            session_id: session_id.clone(),
+            role: MessageRole::Assistant,
+            content: "ordered event".to_string(),
+            created_at: chrono::Utc::now(),
+        }));
+        let mut headers = authorized_headers(&state).await;
+        headers.insert("last-event-id", "0".parse().unwrap());
+        let response = session_events(axum::extract::Path(session_id), headers, State(state))
+            .await
+            .expect("legacy SSE replay should open")
+            .into_response();
+        let mut stream = response.into_body().into_data_stream();
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let chunk = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                futures_util::StreamExt::next(&mut stream),
+            )
+            .await
+            .expect("replayed SSE event should arrive")
+            .expect("SSE stream should remain open")
+            .expect("SSE chunk should be readable");
+            let text = String::from_utf8_lossy(&chunk);
+            ids.push(
+                text.lines()
+                    .find_map(|line| line.strip_prefix("id: "))
+                    .expect("SSE event should have an id")
+                    .parse::<u64>()
+                    .expect("SSE id should be numeric"),
+            );
+        }
+        assert_eq!(ids, vec![1, 2]);
     }
 
     fn mock_kiro_acp_script_path() -> PathBuf {
@@ -2530,6 +3759,25 @@ for line in sys.stdin:
         assert_eq!(name, "session.snapshot");
         assert!(body.contains("\"type\":\"session_snapshot\""));
         assert!(body.contains("\"id\":\"session-1\""));
+    }
+
+    #[test]
+    fn global_session_stream_filters_high_frequency_detail_events() {
+        let session_id = "session-global".to_string();
+        assert!(global_session_event(&SessionEvent::SessionStatus(
+            crate::models::SessionStatusEvent {
+                session_id: session_id.clone(),
+                status: crate::models::SessionStatus::Failed,
+                error_message: Some("failed".to_string()),
+            }
+        )));
+        assert!(!global_session_event(&SessionEvent::MessageDelta(
+            crate::models::MessageDeltaEvent {
+                session_id,
+                message_id: "message-1".to_string(),
+                delta: "partial".to_string(),
+            }
+        )));
     }
 
     #[test]

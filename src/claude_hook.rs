@@ -172,7 +172,8 @@ pub async fn run_permission_hook(
         allow_cancel: true,
         resolvable: true,
     };
-    if let Ok(Some(decision)) = ai_approval::review_request(&ai_request, &project_root).await {
+    if let Ok(Some(decision)) = ai_approval::review_request(&ai_request, &project_root, None).await
+    {
         use ai_approval::AiApprovalDecisionKind;
         match decision.decision {
             AiApprovalDecisionKind::Accept => {

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::models::{ChatMessage, MessageRole};
 
@@ -39,8 +39,11 @@ fn merge_canonical_messages(
     provider_messages: Vec<ChatMessage>,
     bridge_messages: Vec<ChatMessage>,
 ) -> Vec<ChatMessage> {
+    let provider_context = provider_messages.clone();
     let mut merged = provider_messages;
     let bridge_context = bridge_messages.clone();
+    let mut matched_provider_user_ids = HashSet::new();
+    let mut matched_user_ids = HashMap::new();
     let mut seen_ids = merged
         .iter()
         .map(|message| message.id.clone())
@@ -57,22 +60,56 @@ fn merge_canonical_messages(
             continue;
         }
 
-        if let Some(existing_index) = merged.iter().position(|message| {
-            messages_are_equivalent_in_context(message, &bridge_message, &merged, &bridge_context)
-                || is_empty_assistant_placeholder_for_same_turn(
+        let equivalent_user_index = (bridge_message.role == MessageRole::User)
+            .then(|| {
+                merged
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, message)| {
+                        !matched_provider_user_ids.contains(&message.id)
+                            && messages_are_equivalent(message, &bridge_message)
+                    })
+                    .min_by_key(|(_, message)| {
+                        message
+                            .created_at
+                            .signed_duration_since(bridge_message.created_at)
+                            .num_milliseconds()
+                            .abs()
+                    })
+                    .map(|(index, _)| index)
+            })
+            .flatten();
+        if let Some(existing_index) = equivalent_user_index.or_else(|| {
+            merged.iter().position(|message| {
+                messages_are_equivalent_in_context(
+                    message,
+                    &bridge_message,
+                    &merged,
+                    &bridge_context,
+                ) || assistant_messages_belong_to_matched_users(
+                    message,
+                    &bridge_message,
+                    &provider_context,
+                    &bridge_context,
+                    &matched_user_ids,
+                ) || is_empty_assistant_placeholder_for_same_turn(
+                    message,
+                    &bridge_message,
+                    &merged,
+                    &bridge_context,
+                ) || is_final_assistant_reply_for_same_turn(
                     message,
                     &bridge_message,
                     &merged,
                     &bridge_context,
                 )
-                || is_final_assistant_reply_for_same_turn(
-                    message,
-                    &bridge_message,
-                    &merged,
-                    &bridge_context,
-                )
+            })
         }) {
             let existing = &mut merged[existing_index];
+            if bridge_message.role == MessageRole::User {
+                matched_provider_user_ids.insert(existing.id.clone());
+                matched_user_ids.insert(existing.id.clone(), bridge_message.id.clone());
+            }
             *existing = merge_equivalent_message(existing, &bridge_message);
             continue;
         }
@@ -84,6 +121,36 @@ fn merge_canonical_messages(
 
     sort_messages(&mut merged);
     merged
+}
+
+fn assistant_messages_belong_to_matched_users(
+    provider_message: &ChatMessage,
+    bridge_message: &ChatMessage,
+    provider_context: &[ChatMessage],
+    bridge_context: &[ChatMessage],
+    matched_user_ids: &HashMap<String, String>,
+) -> bool {
+    if provider_message.role != MessageRole::Assistant
+        || bridge_message.role != MessageRole::Assistant
+    {
+        return false;
+    }
+    let provider_content = provider_message.content.trim();
+    let bridge_content = bridge_message.content.trim();
+    if provider_content.is_empty()
+        || bridge_content.is_empty()
+        || (!contents_are_equivalent(&MessageRole::Assistant, provider_content, bridge_content)
+            && !assistant_contents_have_prefix(provider_content, bridge_content))
+    {
+        return false;
+    }
+    let Some(provider_user) = nearest_user_before(provider_context, provider_message) else {
+        return false;
+    };
+    let Some(bridge_user) = nearest_user_before(bridge_context, bridge_message) else {
+        return false;
+    };
+    matched_user_ids.get(&provider_user.id) == Some(&bridge_user.id)
 }
 
 fn is_empty_assistant_placeholder_for_same_turn(
@@ -205,8 +272,7 @@ fn messages_are_equivalent_in_context(
 ) -> bool {
     if messages_are_equivalent(provider_message, bridge_message) {
         if provider_message.role == MessageRole::User {
-            return user_turn_index(provider_context, provider_message)
-                == user_turn_index(bridge_context, bridge_message);
+            return false;
         }
         let provider_user = nearest_user_before(provider_context, provider_message);
         let bridge_user = nearest_user_before(bridge_context, bridge_message);
@@ -667,6 +733,76 @@ mod tests {
                 .filter(|message| message.role == MessageRole::Assistant)
                 .count(),
             2
+        );
+    }
+
+    #[test]
+    fn projection_deduplicates_user_messages_when_source_turn_indexes_are_offset() {
+        let now = Utc::now();
+        let provider = vec![
+            message(
+                "remote-old-user",
+                "remote",
+                MessageRole::User,
+                "older provider-only turn",
+                now - TimeDelta::minutes(5),
+            ),
+            message("remote-user", "remote", MessageRole::User, "继续", now),
+            message(
+                "remote-assistant",
+                "remote",
+                MessageRole::Assistant,
+                "继续处理完成",
+                now + TimeDelta::seconds(3),
+            ),
+        ];
+        let bridge = vec![
+            message(
+                "bridge-user",
+                "session",
+                MessageRole::User,
+                "继续",
+                now + TimeDelta::seconds(2),
+            ),
+            message(
+                "bridge-assistant",
+                "session",
+                MessageRole::Assistant,
+                "继续处理完成",
+                now + TimeDelta::seconds(4),
+            ),
+        ];
+
+        let projected = MessageProjection::from_sources("session", provider, bridge);
+
+        assert_eq!(
+            projected
+                .iter()
+                .filter(|message| message.role == MessageRole::User)
+                .count(),
+            2
+        );
+        assert_eq!(
+            projected
+                .iter()
+                .filter(|message| message.content == "继续")
+                .count(),
+            1
+        );
+        assert_eq!(
+            projected
+                .iter()
+                .find(|message| message.content == "继续")
+                .unwrap()
+                .id,
+            "bridge-user"
+        );
+        assert_eq!(
+            projected
+                .iter()
+                .filter(|message| message.role == MessageRole::Assistant)
+                .count(),
+            1
         );
     }
 

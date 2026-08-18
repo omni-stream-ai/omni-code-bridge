@@ -26,7 +26,7 @@ use tokio::io::AsyncReadExt;
 
 use crate::{
     ai_approval::{self, AiApprovalDecisionKind},
-    app_state::AppState,
+    app_state::{APPROVAL_LANGUAGE, AppState},
     approval_policy::{self, AutoApprovalDecision},
     bridge_settings::BridgeSettings,
     claude_hook::{
@@ -43,6 +43,7 @@ use crate::{
     session_domain::{ActivityKind, EntityState},
     session_store::{load_session_archive_summary, load_session_messages},
 };
+use pi as pi_agent_rust;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ProviderActivity {
@@ -198,9 +199,73 @@ mod provider_activity_kind_tests {
 const CODEX_IDLE_TICK_SECONDS: u64 = 15;
 const CODEX_COMMAND_SOFT_RECOVERY_IDLE_TICKS: u32 = 8;
 const CODEX_COMMAND_STALLED_IDLE_TICKS: u32 = 20;
+// `thread/read` can retain an in-progress command after its completion event was
+// lost. A process id in the read response is our only generic evidence that the
+// command is still live; without it, stop after a few observation windows.
+const CODEX_COMMAND_MAX_UNVERIFIED_PROBES: u32 = 3;
+const CODEX_RESPONSE_STALLED_IDLE_TICKS: u32 = 20;
 const CODEX_BACKGROUND_TASK_MAX_SECONDS: u64 = 30 * 60;
 const ACP_JSON_RPC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const ACP_READINESS_TIMEOUT: Duration = Duration::from_secs(5);
+const CODEX_JSON_RPC_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn response_wait_timed_out(
+    idle_ticks: &mut u32,
+    has_running_command: bool,
+    has_pending_approval: bool,
+    has_background_processes: bool,
+) -> bool {
+    if has_running_command || has_pending_approval || has_background_processes {
+        *idle_ticks = 0;
+        return false;
+    }
+    *idle_ticks += 1;
+    *idle_ticks >= CODEX_RESPONSE_STALLED_IDLE_TICKS
+}
+
+#[cfg(test)]
+mod codex_response_watchdog_tests {
+    use super::{CODEX_RESPONSE_STALLED_IDLE_TICKS, response_wait_timed_out};
+
+    #[test]
+    fn times_out_only_while_waiting_for_a_response_without_other_work() {
+        let mut idle_ticks = 0;
+        for _ in 1..CODEX_RESPONSE_STALLED_IDLE_TICKS {
+            assert!(!response_wait_timed_out(
+                &mut idle_ticks,
+                false,
+                false,
+                false
+            ));
+        }
+        assert!(response_wait_timed_out(
+            &mut idle_ticks,
+            false,
+            false,
+            false
+        ));
+
+        assert!(!response_wait_timed_out(
+            &mut idle_ticks,
+            true,
+            false,
+            false
+        ));
+        assert_eq!(idle_ticks, 0);
+        assert!(!response_wait_timed_out(
+            &mut idle_ticks,
+            false,
+            true,
+            false
+        ));
+        assert!(!response_wait_timed_out(
+            &mut idle_ticks,
+            false,
+            false,
+            true
+        ));
+    }
+}
 const AGENT_READINESS_CACHE_TTL: Duration = Duration::from_secs(5);
 #[cfg(test)]
 static ACP_JSON_RPC_HANDSHAKE_TIMEOUT_TEST_MS: AtomicU64 = AtomicU64::new(0);
@@ -263,6 +328,7 @@ impl ProviderRegistry {
         providers.insert(AgentKind::ClaudeCode, Arc::new(ClaudeCodeProvider::new()));
         providers.insert(AgentKind::OpenCode, Arc::new(OpenCodeProvider::new()));
         providers.insert(AgentKind::Acp, Arc::new(AcpProvider::new()));
+        providers.insert(AgentKind::Pi, Arc::new(PiAgentProvider));
         providers.insert(
             AgentKind::Custom,
             Arc::new(StubProvider::new(AgentKind::Custom)),
@@ -583,6 +649,585 @@ struct StubProvider {
     kind: AgentKind,
 }
 
+/// In-process provider backed by pi_agent_rust's stable SDK surface.
+struct PiAgentProvider;
+
+fn pi_activity_from_event(event: pi_agent_rust::sdk::AgentEvent) -> Option<ProviderActivity> {
+    use pi_agent_rust::sdk::AgentEvent;
+
+    let activity = match event {
+        AgentEvent::AgentStart { session_id } => ProviderActivity {
+            correlation_key: Some("pi:agent".to_string()),
+            kind: ActivityKind::Progress,
+            state: EntityState::Running,
+            title: "[pi] agent started".to_string(),
+            payload: serde_json::json!({ "source": "pi", "session_id": session_id }),
+        },
+        AgentEvent::AgentEnd { error, .. } => ProviderActivity {
+            correlation_key: Some("pi:agent".to_string()),
+            kind: ActivityKind::Progress,
+            state: if error.is_some() {
+                EntityState::Failed
+            } else {
+                EntityState::Completed
+            },
+            title: error.as_ref().map_or_else(
+                || "[pi] agent finished".to_string(),
+                |error| format!("[pi:error] {error}"),
+            ),
+            payload: serde_json::json!({ "source": "pi", "error": error }),
+        },
+        AgentEvent::TurnStart { turn_index, .. } => ProviderActivity {
+            correlation_key: Some(format!("pi:turn:{turn_index}")),
+            kind: ActivityKind::Progress,
+            state: EntityState::Running,
+            title: format!("[pi] turn {} started", turn_index + 1),
+            payload: serde_json::json!({ "source": "pi", "turn_index": turn_index }),
+        },
+        AgentEvent::TurnEnd { turn_index, .. } => ProviderActivity {
+            correlation_key: Some(format!("pi:turn:{turn_index}")),
+            kind: ActivityKind::Progress,
+            state: EntityState::Completed,
+            title: format!("[pi] turn {} finished", turn_index + 1),
+            payload: serde_json::json!({ "source": "pi", "turn_index": turn_index }),
+        },
+        AgentEvent::MessageUpdate {
+            assistant_message_event,
+            ..
+        } => match assistant_message_event {
+            pi_agent_rust::model::AssistantMessageEvent::ThinkingStart {
+                content_index, ..
+            } => ProviderActivity {
+                correlation_key: Some(format!("pi:thinking:{content_index}")),
+                kind: ActivityKind::Reasoning,
+                state: EntityState::Running,
+                title: "[pi:thinking] started".to_string(),
+                payload: serde_json::json!({ "source": "pi", "content_index": content_index }),
+            },
+            pi_agent_rust::model::AssistantMessageEvent::ThinkingDelta {
+                content_index,
+                delta,
+                ..
+            } => {
+                if delta.is_empty() {
+                    return None;
+                }
+                ProviderActivity {
+                    correlation_key: Some(format!("pi:thinking:{content_index}")),
+                    kind: ActivityKind::Reasoning,
+                    state: EntityState::Running,
+                    title: format!("[pi:thinking] {delta}"),
+                    payload: serde_json::json!({ "source": "pi", "content_index": content_index, "delta": delta }),
+                }
+            }
+            pi_agent_rust::model::AssistantMessageEvent::ThinkingEnd {
+                content_index,
+                content,
+                ..
+            } => ProviderActivity {
+                correlation_key: Some(format!("pi:thinking:{content_index}")),
+                kind: ActivityKind::Reasoning,
+                state: EntityState::Completed,
+                title: format!("[pi:thinking] {content}"),
+                payload: serde_json::json!({ "source": "pi", "content_index": content_index, "content": content }),
+            },
+            _ => return None,
+        },
+        AgentEvent::ToolExecutionStart {
+            tool_call_id,
+            tool_name,
+            args,
+        } => ProviderActivity {
+            correlation_key: Some(format!("pi:tool:{tool_call_id}")),
+            kind: ActivityKind::ToolCall,
+            state: EntityState::Running,
+            title: format!("[pi:{tool_name}] started"),
+            payload: serde_json::json!({ "source": "pi", "tool_call_id": tool_call_id, "tool_name": tool_name, "args": args }),
+        },
+        AgentEvent::ToolExecutionUpdate {
+            tool_call_id,
+            tool_name,
+            args,
+            partial_result,
+        } => ProviderActivity {
+            correlation_key: Some(format!("pi:tool:{tool_call_id}")),
+            kind: ActivityKind::ToolResult,
+            state: EntityState::Running,
+            title: format!("[pi:{tool_name}:output] running"),
+            payload: serde_json::json!({ "source": "pi", "tool_call_id": tool_call_id, "tool_name": tool_name, "args": args, "partial_result": partial_result }),
+        },
+        AgentEvent::ToolExecutionEnd {
+            tool_call_id,
+            tool_name,
+            result,
+            is_error,
+        } => ProviderActivity {
+            correlation_key: Some(format!("pi:tool:{tool_call_id}")),
+            kind: ActivityKind::ToolResult,
+            state: if is_error {
+                EntityState::Failed
+            } else {
+                EntityState::Completed
+            },
+            title: format!(
+                "[pi:{tool_name}:output] {}",
+                if is_error { "failed" } else { "completed" }
+            ),
+            payload: serde_json::json!({ "source": "pi", "tool_call_id": tool_call_id, "tool_name": tool_name, "result": result, "is_error": is_error }),
+        },
+        AgentEvent::AutoCompactionStart { reason } => ProviderActivity {
+            correlation_key: Some("pi:compaction".to_string()),
+            kind: ActivityKind::Progress,
+            state: EntityState::Running,
+            title: format!("[pi:compaction] {reason}"),
+            payload: serde_json::json!({ "source": "pi", "reason": reason }),
+        },
+        AgentEvent::AutoCompactionEnd {
+            aborted,
+            error_message,
+            ..
+        } => ProviderActivity {
+            correlation_key: Some("pi:compaction".to_string()),
+            kind: ActivityKind::Progress,
+            state: if aborted || error_message.is_some() {
+                EntityState::Failed
+            } else {
+                EntityState::Completed
+            },
+            title: error_message.as_ref().map_or_else(
+                || "[pi:compaction] completed".to_string(),
+                |error| format!("[pi:compaction] {error}"),
+            ),
+            payload: serde_json::json!({ "source": "pi", "aborted": aborted, "error": error_message }),
+        },
+        AgentEvent::AutoRetryStart {
+            attempt,
+            max_attempts,
+            delay_ms,
+            error_message,
+        } => ProviderActivity {
+            correlation_key: Some("pi:retry".to_string()),
+            kind: ActivityKind::Progress,
+            state: EntityState::Running,
+            title: format!(
+                "[pi:retry] attempt {attempt}/{max_attempts} in {delay_ms}ms: {error_message}"
+            ),
+            payload: serde_json::json!({ "source": "pi", "attempt": attempt, "max_attempts": max_attempts, "delay_ms": delay_ms, "error": error_message }),
+        },
+        AgentEvent::AutoRetryEnd {
+            success,
+            attempt,
+            final_error,
+        } => ProviderActivity {
+            correlation_key: Some("pi:retry".to_string()),
+            kind: ActivityKind::Progress,
+            state: if success {
+                EntityState::Completed
+            } else {
+                EntityState::Failed
+            },
+            title: final_error.as_ref().map_or_else(
+                || format!("[pi:retry] recovered on attempt {attempt}"),
+                |error| format!("[pi:retry] failed: {error}"),
+            ),
+            payload: serde_json::json!({ "source": "pi", "attempt": attempt, "success": success, "error": final_error }),
+        },
+        AgentEvent::ExtensionError {
+            extension_id,
+            event,
+            error,
+        } => ProviderActivity {
+            correlation_key: extension_id.as_ref().map(|id| format!("pi:extension:{id}")),
+            kind: ActivityKind::Progress,
+            state: EntityState::Failed,
+            title: format!("[pi:extension:error] {error}"),
+            payload: serde_json::json!({ "source": "pi", "extension_id": extension_id, "event": event, "error": error }),
+        },
+        _ => return None,
+    };
+    Some(activity)
+}
+
+fn pi_safe_id(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+fn configure_pi_provider(
+    config: &ResolvedProviderConfig,
+    session_id: &str,
+    model: Option<&str>,
+) -> Result<String> {
+    static MODELS_FILE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let _guard = MODELS_FILE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let raw_id = config.provider_id.as_deref().unwrap_or("selected");
+    let legacy_provider_id = format!("omni-bridge-{}", pi_safe_id(raw_id));
+    let provider_id = format!("{legacy_provider_id}-session-{}", pi_safe_id(session_id));
+    let api = match config.format {
+        crate::models::ApiFormat::Codex => "openai-responses",
+        crate::models::ApiFormat::OpenAiCompatible => "openai-completions",
+        crate::models::ApiFormat::AnthropicMessages => "anthropic-messages",
+        crate::models::ApiFormat::Acp => bail!("ACP format cannot be used by Pi Agent"),
+    };
+    let auth_header = !matches!(config.format, crate::models::ApiFormat::AnthropicMessages);
+
+    let models_path =
+        pi_agent_rust::models::default_models_path(&pi_agent_rust::sdk::Config::global_dir());
+    let mut root =
+        if models_path.exists() {
+            serde_json::from_slice::<Value>(&std::fs::read(&models_path).with_context(|| {
+                format!("read Pi model configuration {}", models_path.display())
+            })?)
+            .with_context(|| format!("parse Pi model configuration {}", models_path.display()))?
+        } else {
+            serde_json::json!({ "providers": {} })
+        };
+    let providers = root
+        .as_object_mut()
+        .context("Pi models.json root must be an object")?
+        .entry("providers")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .context("Pi models.json providers must be an object")?;
+    let legacy_models = providers
+        .get(&legacy_provider_id)
+        .and_then(|provider| provider.get("models"))
+        .cloned();
+    let provider = providers
+        .entry(provider_id.clone())
+        .or_insert_with(|| serde_json::json!({}));
+    let provider = provider
+        .as_object_mut()
+        .context("Pi provider configuration must be an object")?;
+    provider.insert(
+        "baseUrl".to_string(),
+        Value::String(config.base_url.clone()),
+    );
+    provider.insert("api".to_string(), Value::String(api.to_string()));
+    provider.insert("authHeader".to_string(), Value::Bool(auth_header));
+    if let Some(model) = model {
+        provider.insert(
+            "models".to_string(),
+            serde_json::json!([{ "id": model, "name": model }]),
+        );
+    } else if let Some(models) = legacy_models {
+        provider.insert("models".to_string(), models);
+    } else if !provider
+        .get("models")
+        .and_then(Value::as_array)
+        .is_some_and(|models| !models.is_empty())
+    {
+        bail!(
+            "Pi provider {} has no model configured and no models saved in {}",
+            config.provider_id.as_deref().unwrap_or("selected"),
+            models_path.display()
+        );
+    }
+    if let Some(parent) = models_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create Pi config directory {}", parent.display()))?;
+    }
+    let temp_path = models_path.with_extension(format!("json.tmp-{}", std::process::id()));
+    std::fs::write(&temp_path, serde_json::to_vec_pretty(&root)?)
+        .with_context(|| format!("write Pi model configuration {}", temp_path.display()))?;
+    std::fs::rename(&temp_path, &models_path).with_context(|| {
+        format!(
+            "replace Pi model configuration {} with {}",
+            models_path.display(),
+            temp_path.display()
+        )
+    })?;
+    Ok(provider_id)
+}
+
+#[async_trait]
+impl AgentProvider for PiAgentProvider {
+    async fn run_session(
+        &self,
+        state: Arc<AppState>,
+        session: SessionSummary,
+        input: ChatMessage,
+        system_prompt: Option<String>,
+        reply: ChatMessage,
+        provider_config: Option<ResolvedProviderConfig>,
+        _reasoning_effort: Option<ReasoningEffort>,
+    ) -> Result<()> {
+        let mut extension_paths = state
+            .pi_plugins
+            .enabled_paths(&session.project_id)
+            .context("resolve managed Pi plugins")?;
+        extension_paths.extend(
+            std::env::var("PI_EXTENSION_PATHS")
+                .ok()
+                .into_iter()
+                .flat_map(|value| {
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|p| !p.is_empty())
+                        .map(PathBuf::from)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>(),
+        );
+        extension_paths.sort();
+        extension_paths.dedup();
+        let cwd = std::env::current_dir().context("resolve pi agent working directory")?;
+        let selected_model = session
+            .model
+            .clone()
+            .or_else(|| provider_config.as_ref().and_then(|c| c.model.clone()));
+        let pi_provider = provider_config
+            .as_ref()
+            .map(|config| configure_pi_provider(config, &session.id, selected_model.as_deref()))
+            .transpose()?;
+        let expected_pi_provider = pi_provider.clone();
+        let expected_pi_model = selected_model.clone();
+        let options = pi_agent_rust::sdk::SessionOptions {
+            provider: pi_provider,
+            model: selected_model,
+            api_key: provider_config
+                .as_ref()
+                .map(|config| config.api_key.clone()),
+            system_prompt,
+            working_directory: Some(cwd),
+            no_session: true,
+            extension_paths,
+            ..Default::default()
+        };
+        let mut handle = pi_agent_rust::sdk::create_agent_session(options)
+            .await
+            .context("create pi_agent_rust SDK session")?;
+        if let Some(expected_provider) = expected_pi_provider {
+            let (actual_provider, actual_model) = handle.model();
+            let unexpected_model = expected_pi_model
+                .as_ref()
+                .is_some_and(|expected_model| actual_model != *expected_model);
+            if actual_provider != expected_provider || unexpected_model {
+                let expected_model = expected_pi_model.as_deref().unwrap_or("<provider default>");
+                bail!(
+                    "Pi SDK selected {actual_provider}/{actual_model}, expected {expected_provider}/{expected_model}; refusing to use an unintended endpoint"
+                );
+            }
+        }
+        // Built-in commands are handled here for bridge-specific session
+        // mutations. Extension slash commands are resolved by the Pi SDK when
+        // the prompt is submitted, so they must continue through the normal
+        // prompt path below.
+        if let Some(command) = input.content.strip_prefix('/') {
+            let mut parts = command.split_whitespace();
+            match parts.next().unwrap_or_default() {
+                "compact" if parts.next().is_none() => {
+                    handle.compact(|_| {}).await.context("compact pi session")?;
+                    state
+                        .emit_assistant_message_snapshot(
+                            &session.id,
+                            &reply.id,
+                            "Pi session compacted.",
+                        )
+                        .await;
+                    state
+                        .finish_assistant_message(&session.id, &reply.id)
+                        .await
+                        .map_err(anyhow::Error::msg)?;
+                    return Ok(());
+                }
+                "model" => {
+                    let provider = parts.next();
+                    let model = parts.next();
+                    if let (Some(provider), Some(model)) = (provider, model) {
+                        if parts.next().is_none() {
+                            handle
+                                .set_model(provider, model)
+                                .await
+                                .context("set pi model")?;
+                            state
+                                .update_session_settings(
+                                    &session.id,
+                                    None,
+                                    None,
+                                    Some(Some(model.to_string())),
+                                )
+                                .await
+                                .map_err(anyhow::Error::msg)?;
+                            let message = format!("Pi model set to {provider}/{model}.");
+                            state
+                                .emit_assistant_message_snapshot(&session.id, &reply.id, &message)
+                                .await;
+                            state
+                                .finish_assistant_message(&session.id, &reply.id)
+                                .await
+                                .map_err(anyhow::Error::msg)?;
+                            return Ok(());
+                        }
+                    }
+                }
+                "name" => {
+                    let name = parts.collect::<Vec<_>>().join(" ");
+                    if !name.is_empty() {
+                        handle
+                            .set_session_name(name)
+                            .await
+                            .context("set pi session name")?;
+                        state
+                            .emit_assistant_message_snapshot(
+                                &session.id,
+                                &reply.id,
+                                "Pi session renamed.",
+                            )
+                            .await;
+                        state
+                            .finish_assistant_message(&session.id, &reply.id)
+                            .await
+                            .map_err(anyhow::Error::msg)?;
+                        return Ok(());
+                    }
+                }
+                _ => {}
+            }
+        }
+        let session_id = session.id.clone();
+        let reply_id = reply.id.clone();
+        let text = Arc::new(std::sync::Mutex::new(String::new()));
+        let text_for_events = Arc::clone(&text);
+        let state_for_events = Arc::clone(&state);
+        let state_for_stream = Arc::clone(&state);
+        let activity_session_id = session.id.clone();
+        let activity_turn_id = crate::app_state::DOMAIN_TURN_ID.try_with(Clone::clone).ok();
+        let (pi_event_tx, mut pi_event_rx) = mpsc::unbounded_channel();
+        let activity_task = tokio::spawn(async move {
+            let consume_events = async {
+                while let Some(event) = pi_event_rx.recv().await {
+                    if let Some(activity) = pi_activity_from_event(event) {
+                        state_for_events
+                            .emit_provider_activity(&activity_session_id, activity)
+                            .await;
+                    }
+                }
+            };
+            if let Some(turn_id) = activity_turn_id {
+                crate::app_state::DOMAIN_TURN_ID
+                    .scope(turn_id, consume_events)
+                    .await;
+            } else {
+                consume_events.await;
+            }
+        });
+        let stream_turn_id = crate::app_state::DOMAIN_TURN_ID.try_with(Clone::clone).ok();
+        let pi_event_handler = Arc::new(move |event| {
+            if let pi_agent_rust::sdk::AgentEvent::MessageUpdate {
+                assistant_message_event,
+                ..
+            } = &event
+            {
+                if let pi_agent_rust::model::AssistantMessageEvent::TextDelta { delta, .. } =
+                    assistant_message_event
+                {
+                    let snapshot = {
+                        let mut text = text_for_events.lock().expect("pi text lock poisoned");
+                        text.push_str(delta);
+                        text.clone()
+                    };
+                    let state = Arc::clone(&state_for_stream);
+                    let session_id = session_id.clone();
+                    let reply_id = reply_id.clone();
+                    let turn_id = stream_turn_id.clone();
+                    tokio::spawn(async move {
+                        let emit = state.emit_assistant_message_snapshot(
+                            &session_id,
+                            &reply_id,
+                            &snapshot,
+                        );
+                        if let Some(turn_id) = turn_id {
+                            crate::app_state::DOMAIN_TURN_ID.scope(turn_id, emit).await;
+                        } else {
+                            emit.await;
+                        }
+                    });
+                }
+            }
+            let _ = pi_event_tx.send(event);
+        });
+        let event_handler = Arc::clone(&pi_event_handler);
+        let assistant = match handle
+            .prompt(input.content, move |event| event_handler(event))
+            .await
+        {
+            Ok(assistant) => assistant,
+            Err(error) if pi_network_unreachable(&error) => {
+                state
+                    .emit_provider_activity(
+                        &session.id,
+                        ProviderActivity {
+                            correlation_key: Some("pi:network-retry".to_string()),
+                            kind: ActivityKind::Progress,
+                            state: EntityState::Running,
+                            title: "[pi:retry] network unreachable; retrying current turn"
+                                .to_string(),
+                            payload: serde_json::json!({
+                                "source": "pi",
+                                "reason": "network_unreachable",
+                                "attempt": 1
+                            }),
+                        },
+                    )
+                    .await;
+                let event_handler = Arc::clone(&pi_event_handler);
+                handle
+                    .continue_turn(move |event| event_handler(event))
+                    .await
+                    .context("resume pi_agent_rust prompt after network unreachable")?
+            }
+            Err(error) => return Err(error).context("run pi_agent_rust prompt"),
+        };
+        drop(pi_event_handler);
+        activity_task
+            .await
+            .context("join Pi Agent event processor")?;
+        let mut completed_text = String::new();
+        for block in assistant.content {
+            if let pi_agent_rust::sdk::ContentBlock::Text(content) = block {
+                completed_text.push_str(&content.text);
+            }
+        }
+        let final_text = if completed_text.is_empty() {
+            text.lock().expect("pi text lock poisoned").clone()
+        } else {
+            completed_text
+        };
+        if final_text.is_empty() {
+            bail!("Pi Agent completed without a text response");
+        }
+        // Await the authoritative final snapshot before completing the message.
+        // Streaming updates are best-effort and may still be queued on Tokio.
+        state
+            .emit_assistant_message_snapshot(&session.id, &reply.id, &final_text)
+            .await;
+        state
+            .finish_assistant_message(&session.id, &reply.id)
+            .await
+            .map_err(anyhow::Error::msg)?;
+        Ok(())
+    }
+}
+
+fn pi_network_unreachable(error: &pi_agent_rust::sdk::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("network is unreachable") || message.contains("os error 101")
+}
+
 impl StubProvider {
     fn new(kind: AgentKind) -> Self {
         Self { kind }
@@ -605,6 +1250,7 @@ impl AgentProvider for StubProvider {
             AgentKind::ClaudeCode => "ClaudeCode",
             AgentKind::OpenCode => "OpenCode",
             AgentKind::Acp => "ACP",
+            AgentKind::Pi => "Pi Agent",
             AgentKind::Custom => "CustomAgent",
             AgentKind::Codex => "Codex",
         };
@@ -647,6 +1293,7 @@ mod tests {
         AUTO_PROVIDER_ID, AcpProfile, AcpServerConfig, HeaderKeyValue, InputMode, MessageRole,
         SendMessageInput, SessionStatus,
     };
+    use crate::session_domain::{CreateTurnCommand, TurnStatus};
     use std::time::Duration;
 
     #[test]
@@ -659,6 +1306,51 @@ mod tests {
                 "missing provider for {kind:?}"
             );
         }
+    }
+
+    #[test]
+    fn pi_tool_events_map_to_correlated_activities() {
+        let started = pi_activity_from_event(pi_agent_rust::sdk::AgentEvent::ToolExecutionStart {
+            tool_call_id: "call-1".to_string(),
+            tool_name: "bash".to_string(),
+            args: serde_json::json!({ "command": "cargo check" }),
+        })
+        .expect("tool start activity");
+        assert_eq!(started.kind, ActivityKind::ToolCall);
+        assert_eq!(started.state, EntityState::Running);
+        assert_eq!(started.correlation_key.as_deref(), Some("pi:tool:call-1"));
+
+        let finished = pi_activity_from_event(pi_agent_rust::sdk::AgentEvent::ToolExecutionEnd {
+            tool_call_id: "call-1".to_string(),
+            tool_name: "bash".to_string(),
+            result: pi_agent_rust::sdk::ToolOutput {
+                content: Vec::new(),
+                details: Some(serde_json::json!({ "exit_code": 0 })),
+                is_error: false,
+            },
+            is_error: false,
+        })
+        .expect("tool end activity");
+        assert_eq!(finished.kind, ActivityKind::ToolResult);
+        assert_eq!(finished.state, EntityState::Completed);
+        assert_eq!(finished.correlation_key, started.correlation_key);
+    }
+
+    #[test]
+    fn pi_failed_tool_event_maps_to_failed_activity() {
+        let activity = pi_activity_from_event(pi_agent_rust::sdk::AgentEvent::ToolExecutionEnd {
+            tool_call_id: "call-failed".to_string(),
+            tool_name: "read".to_string(),
+            result: pi_agent_rust::sdk::ToolOutput {
+                content: Vec::new(),
+                details: None,
+                is_error: true,
+            },
+            is_error: true,
+        })
+        .expect("failed tool activity");
+        assert_eq!(activity.state, EntityState::Failed);
+        assert_eq!(activity.kind, ActivityKind::ToolResult);
     }
 
     #[test]
@@ -1274,6 +1966,31 @@ mod tests {
     }
 
     #[test]
+    fn codex_command_watchdog_only_stops_unverified_commands() {
+        let mut state = CodexAppServerStreamingState::default();
+        let _ = state.ingest_value(&serde_json::json!({
+            "method": "item/started",
+            "params": {
+                "item": {
+                    "id": "cmd-1",
+                    "type": "commandExecution",
+                    "command": "curl https://example.test",
+                    "status": "inProgress"
+                }
+            }
+        }));
+
+        assert_eq!(state.record_unverified_command_probe("cmd-1"), Some(1));
+        assert!(state.confirm_running_command("cmd-1", "pty-42".to_string()));
+        assert_eq!(state.record_unverified_command_probe("cmd-1"), Some(1));
+        assert_eq!(state.record_unverified_command_probe("cmd-1"), Some(2));
+        assert_eq!(
+            state.record_unverified_command_probe("cmd-1"),
+            Some(CODEX_COMMAND_MAX_UNVERIFIED_PROBES)
+        );
+    }
+
+    #[test]
     fn codex_command_status_snapshot_reads_live_command_and_latest_turn() {
         let response = serde_json::json!({
             "thread": {
@@ -1744,7 +2461,7 @@ mod tests {
 
     #[tokio::test]
     async fn acp_provider_completes_prompt_and_permission_flow() {
-        let _guard = acp_test_lock();
+        let _guard = acp_test_lock().await;
         let state = Arc::new(test_state("kiro-acp-permission").await);
         configure_mock_acp(&state, "permission").await;
         let project = state
@@ -1762,6 +2479,7 @@ mod tests {
                 brief_reply_mode: false,
                 provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                 reasoning_effort: None,
+                model: None,
             })
             .await
             .expect("session should be created");
@@ -1811,7 +2529,7 @@ mod tests {
 
     #[tokio::test]
     async fn acp_provider_sends_session_cancel() {
-        let _guard = acp_test_lock();
+        let _guard = acp_test_lock().await;
         let state = Arc::new(test_state("kiro-acp-cancel").await);
         configure_mock_acp(&state, "cancel").await;
         let project = state
@@ -1829,6 +2547,7 @@ mod tests {
                 brief_reply_mode: false,
                 provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                 reasoning_effort: None,
+                model: None,
             })
             .await
             .expect("session should be created");
@@ -1864,7 +2583,7 @@ mod tests {
 
     #[tokio::test]
     async fn acp_provider_handles_secret_storage_requests() {
-        let _guard = acp_test_lock();
+        let _guard = acp_test_lock().await;
         let state = Arc::new(test_state("kiro-acp-secret-storage").await);
         configure_mock_acp(&state, "secret-storage").await;
         let project = state
@@ -1882,6 +2601,7 @@ mod tests {
                 brief_reply_mode: false,
                 provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                 reasoning_effort: None,
+                model: None,
             })
             .await
             .expect("session should be created");
@@ -1923,7 +2643,7 @@ mod tests {
 
     #[tokio::test]
     async fn acp_provider_falls_back_when_saved_session_cannot_load() {
-        let _guard = acp_test_lock();
+        let _guard = acp_test_lock().await;
         let state = Arc::new(test_state("kiro-acp-load-fails").await);
         configure_mock_acp(&state, "load-fails").await;
         let project = state
@@ -1941,6 +2661,7 @@ mod tests {
                 brief_reply_mode: false,
                 provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                 reasoning_effort: None,
+                model: None,
             })
             .await
             .expect("session should be created");
@@ -1990,6 +2711,7 @@ mod tests {
 
     #[tokio::test]
     async fn generic_http_acp_provider_completes_json_turn_and_reuses_session_ref() {
+        let _lock = generic_http_test_lock().await;
         let request_log = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -2040,6 +2762,7 @@ mod tests {
                 brief_reply_mode: false,
                 provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                 reasoning_effort: None,
+                model: None,
             })
             .await
             .expect("session should be created");
@@ -2136,6 +2859,7 @@ mod tests {
 
     #[tokio::test]
     async fn generic_http_acp_provider_completes_sse_turn() {
+        let _lock = generic_http_test_lock().await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("listener should bind");
@@ -2173,6 +2897,7 @@ data: {\"type\":\"done\"}\n\n",
                 brief_reply_mode: false,
                 provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                 reasoning_effort: None,
+                model: None,
             })
             .await
             .expect("session should be created");
@@ -2217,6 +2942,7 @@ data: {\"type\":\"done\"}\n\n",
 
     #[tokio::test]
     async fn generic_http_acp_provider_replies_to_approval_requests() {
+        let _lock = generic_http_test_lock().await;
         let approvals = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
         let turn_started = Arc::new(tokio::sync::Notify::new());
         let pending_turn_stream = Arc::new(tokio::sync::Mutex::new(None::<tokio::net::TcpStream>));
@@ -2309,6 +3035,7 @@ data: {\"type\":\"done\"}\n\n",
                 brief_reply_mode: false,
                 provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                 reasoning_effort: None,
+                model: None,
             })
             .await
             .expect("session should be created");
@@ -2364,6 +3091,7 @@ data: {\"type\":\"done\"}\n\n",
 
     #[tokio::test]
     async fn generic_http_acp_provider_sends_cancel_request() {
+        let _lock = generic_http_test_lock().await;
         let cancels = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
         let turn_started = Arc::new(tokio::sync::Notify::new());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -2462,6 +3190,7 @@ data: {\"type\":\"done\"}\n\n",
                 brief_reply_mode: false,
                 provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                 reasoning_effort: None,
+                model: None,
             })
             .await
             .expect("session should be created");
@@ -2505,7 +3234,7 @@ data: {\"type\":\"done\"}\n\n",
 
     #[tokio::test]
     async fn acp_initialize_timeout_fails_session() {
-        let _guard = acp_test_lock();
+        let _guard = acp_test_lock().await;
         let _timeout = AcpTimeoutOverride::new(Duration::from_millis(200));
         let state = Arc::new(test_state("kiro-acp-init-timeout").await);
         configure_mock_acp(&state, "hang-initialize").await;
@@ -2524,6 +3253,7 @@ data: {\"type\":\"done\"}\n\n",
                 brief_reply_mode: false,
                 provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                 reasoning_effort: None,
+                model: None,
             })
             .await
             .expect("session should be created");
@@ -2563,7 +3293,7 @@ data: {\"type\":\"done\"}\n\n",
 
     #[tokio::test]
     async fn acp_initialize_exit_surfaces_stderr_message() {
-        let _guard = acp_test_lock();
+        let _guard = acp_test_lock().await;
         let state = Arc::new(test_state("kiro-acp-init-exit").await);
         configure_mock_acp(&state, "exit-initialize-error").await;
         let project = state
@@ -2581,6 +3311,7 @@ data: {\"type\":\"done\"}\n\n",
                 brief_reply_mode: false,
                 provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                 reasoning_effort: None,
+                model: None,
             })
             .await
             .expect("session should be created");
@@ -2636,9 +3367,9 @@ data: {\"type\":\"done\"}\n\n",
         }
     }
 
-    fn acp_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    async fn acp_test_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        LOCK.lock().await
     }
 
     async fn configure_mock_acp(state: &Arc<AppState>, scenario: &str) {
@@ -2688,6 +3419,11 @@ data: {\"type\":\"done\"}\n\n",
             })
             .await
             .expect("mock generic HTTP ACP settings should update");
+    }
+
+    async fn generic_http_test_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        LOCK.lock().await
     }
 
     async fn test_state(prefix: &str) -> AppState {
@@ -2795,6 +3531,215 @@ for line in sys.stdin:
         path
     }
 
+    #[cfg(unix)]
+    async fn codex_test_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        LOCK.lock().await
+    }
+
+    #[cfg(unix)]
+    struct MockCodexEnvironment {
+        previous_binary: Option<std::ffi::OsString>,
+        previous_scenario: Option<std::ffi::OsString>,
+        previous_log: Option<std::ffi::OsString>,
+        pub log_path: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl MockCodexEnvironment {
+        fn new(scenario: &str) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+
+            let unique = format!(
+                "{}-{}",
+                std::process::id(),
+                chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+            );
+            let script_path = std::env::temp_dir().join(format!("mock-codex-{unique}.py"));
+            let log_path = std::env::temp_dir().join(format!("mock-codex-{unique}.log"));
+            std::fs::write(&script_path, MOCK_CODEX_APP_SERVER)
+                .expect("mock Codex app-server should be written");
+            let mut permissions = std::fs::metadata(&script_path)
+                .expect("mock Codex metadata should load")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&script_path, permissions)
+                .expect("mock Codex app-server should be executable");
+
+            let previous_binary = std::env::var_os("OMNI_CODE_CODEX_BIN");
+            let previous_scenario = std::env::var_os("OMNI_CODE_MOCK_CODEX_SCENARIO");
+            let previous_log = std::env::var_os("OMNI_CODE_MOCK_CODEX_LOG");
+            // SAFETY: Codex subprocess tests are serialized by `codex_test_lock`.
+            unsafe {
+                std::env::set_var("OMNI_CODE_CODEX_BIN", &script_path);
+                std::env::set_var("OMNI_CODE_MOCK_CODEX_SCENARIO", scenario);
+                std::env::set_var("OMNI_CODE_MOCK_CODEX_LOG", &log_path);
+            }
+            Self {
+                previous_binary,
+                previous_scenario,
+                previous_log,
+                log_path,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for MockCodexEnvironment {
+        fn drop(&mut self) {
+            fn restore(name: &str, value: Option<&std::ffi::OsString>) {
+                // SAFETY: Codex subprocess tests are serialized by `codex_test_lock`.
+                unsafe {
+                    if let Some(value) = value {
+                        std::env::set_var(name, value);
+                    } else {
+                        std::env::remove_var(name);
+                    }
+                }
+            }
+            restore("OMNI_CODE_CODEX_BIN", self.previous_binary.as_ref());
+            restore(
+                "OMNI_CODE_MOCK_CODEX_SCENARIO",
+                self.previous_scenario.as_ref(),
+            );
+            restore("OMNI_CODE_MOCK_CODEX_LOG", self.previous_log.as_ref());
+        }
+    }
+
+    #[cfg(unix)]
+    const MOCK_CODEX_APP_SERVER: &str = r#"#!/usr/bin/env python3
+import json
+import os
+import sys
+
+scenario = os.environ.get("OMNI_CODE_MOCK_CODEX_SCENARIO", "success")
+log_path = os.environ.get("OMNI_CODE_MOCK_CODEX_LOG")
+turn_request_id = None
+
+def write(value):
+    sys.stdout.write(json.dumps(value, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+def log(method):
+    if log_path:
+        with open(log_path, "a", encoding="utf-8") as handle:
+            handle.write(method + "\n")
+
+def complete(text="Complete reply with the final tail"):
+    write({"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"itemId":"assistant-1","delta":"Complete reply"}})
+    write({"jsonrpc":"2.0","method":"item/completed","params":{"item":{"id":"assistant-1","type":"agentMessage","phase":"final_answer","text":text}}})
+    write({"jsonrpc":"2.0","method":"turn/completed","params":{"turn":{"id":"mock-turn","status":"completed"}}})
+
+for line in sys.stdin:
+    value = json.loads(line)
+    method = value.get("method", "")
+    request_id = value.get("id")
+    if method:
+        log(method)
+
+    if method == "initialize":
+        write({"jsonrpc":"2.0","id":request_id,"result":{"serverInfo":{"name":"mock-codex","version":"test"}}})
+    elif method == "thread/resume" and scenario == "resume-failure":
+        write({"jsonrpc":"2.0","id":request_id,"error":{"code":-32001,"message":"mock thread no longer exists"}})
+    elif method in ("thread/start", "thread/resume", "thread/fork"):
+        write({"jsonrpc":"2.0","id":request_id,"result":{"thread":{"id":"mock-thread","approvalPolicy":"on-request","approvalsReviewer":"user"}}})
+    elif method == "thread/archive":
+        write({"jsonrpc":"2.0","id":request_id,"result":{}})
+    elif method == "turn/start":
+        turn_request_id = request_id
+        write({"jsonrpc":"2.0","id":request_id,"result":{"turn":{"id":"mock-turn"}}})
+        write({"jsonrpc":"2.0","method":"turn/started","params":{"turn":{"id":"mock-turn","status":"inProgress"}}})
+        if scenario == "failure":
+            write({"jsonrpc":"2.0","method":"turn/completed","params":{"turn":{"id":"mock-turn","status":"failed","error":{"message":"mock provider failed"}}}})
+        elif scenario == "cancel":
+            write({"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"itemId":"assistant-1","delta":"partial before cancel"}})
+        elif scenario == "approval":
+            write({"jsonrpc":"2.0","id":77,"method":"item/commandExecution/requestApproval","params":{"command":"rm -rf /","reason":"run tests","availableDecisions":["accept","acceptForSession","cancel"]}})
+        else:
+            write({"jsonrpc":"2.0","method":"item/started","params":{"item":{"id":"cmd-1","type":"commandExecution","command":"cargo test","status":"inProgress"}}})
+            write({"jsonrpc":"2.0","method":"item/commandExecution/outputDelta","params":{"itemId":"cmd-1","delta":"tests running"}})
+            write({"jsonrpc":"2.0","method":"item/completed","params":{"item":{"id":"cmd-1","type":"commandExecution","command":"cargo test","status":"completed","exitCode":0}}})
+            write({"jsonrpc":"2.0","method":"turn/diff/updated","params":{"turnId":"mock-turn","diff":"diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1 +1 @@\n-old\n+new"}})
+            complete()
+    elif request_id == 77:
+        if value.get("result", {}).get("decision") != "accept":
+            sys.stderr.write("unexpected approval response: " + json.dumps(value) + "\n")
+            sys.exit(2)
+        write({"jsonrpc":"2.0","method":"serverRequest/resolved","params":{"requestId":77}})
+        complete("Approved reply with the final tail")
+    else:
+        write({"jsonrpc":"2.0","id":request_id,"error":{"code":-32601,"message":"unsupported mock method: " + method}})
+"#;
+
+    #[cfg(unix)]
+    async fn create_mock_codex_session(state: &Arc<AppState>, suffix: &str) -> SessionSummary {
+        let project = state
+            .create_project(crate::models::CreateProjectInput {
+                name: format!("Mock Codex {suffix}"),
+                root_path: std::env::temp_dir().to_string_lossy().to_string(),
+            })
+            .await;
+        state
+            .create_session(crate::models::CreateSessionInput {
+                client_session_id: format!("mock-codex-{suffix}"),
+                project_id: project.id,
+                title: Some(format!("Mock Codex {suffix}")),
+                agent: AgentKind::Codex,
+                brief_reply_mode: false,
+                provider_id: None,
+                reasoning_effort: None,
+                model: None,
+            })
+            .await
+            .expect("mock Codex session should be created")
+    }
+
+    #[cfg(unix)]
+    async fn start_mock_codex_turn(
+        state: &Arc<AppState>,
+        session: &SessionSummary,
+        index: usize,
+    ) -> String {
+        let turn_id = format!("turn-{index}");
+        let user_message_id = format!("user-{index}");
+        state
+            .create_domain_turn(
+                &session.id,
+                &CreateTurnCommand {
+                    command_id: format!("command-{index}"),
+                    turn_id: turn_id.clone(),
+                    user_message_id: user_message_id.clone(),
+                    content: format!("message {index}"),
+                    attachments: Vec::new(),
+                    input_mode: InputMode::Text,
+                    system_prompt: None,
+                    expected_session_version: None,
+                    provider_id: None,
+                    reasoning_effort: None,
+                    model: None,
+                },
+            )
+            .await
+            .expect("domain turn should be accepted");
+        state
+            .send_domain_message(
+                &session.id,
+                &turn_id,
+                SendMessageInput {
+                    content: format!("message {index}"),
+                    input_mode: InputMode::Text,
+                    system_prompt: None,
+                    client_message_id: Some(user_message_id),
+                    provider_id: None,
+                    reasoning_effort: None,
+                    model: None,
+                },
+            )
+            .await
+            .expect("mock Codex turn should start");
+        turn_id
+    }
+
     async fn wait_for_pending_approval(state: &Arc<AppState>, session_id: &str) -> ApprovalRequest {
         for _ in 0..50 {
             if let Some(detail) = state.get_session(session_id).await {
@@ -2876,7 +3821,7 @@ for line in sys.stdin:
         state: &Arc<AppState>,
         session_id: &str,
     ) -> std::result::Result<(), String> {
-        for _ in 0..100 {
+        for _ in 0..400 {
             if !state.turn_in_flight_for_test(session_id).await {
                 return Ok(());
             }
@@ -2911,6 +3856,257 @@ for line in sys.stdin:
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         Err(format!("timed out waiting for session status {expected:?}"))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_provider_runs_complete_domain_turn_and_resumes_thread() {
+        let _lock = codex_test_lock().await;
+        let mock = MockCodexEnvironment::new("success");
+        let state = Arc::new(test_state("codex-full-chain-success").await);
+        let session = create_mock_codex_session(&state, "success").await;
+
+        start_mock_codex_turn(&state, &session, 1).await;
+        wait_for_turn_completion(&state, &session.id)
+            .await
+            .expect("first Codex turn should complete");
+        start_mock_codex_turn(&state, &session, 2).await;
+        wait_for_turn_completion(&state, &session.id)
+            .await
+            .expect("resumed Codex turn should complete");
+
+        let detail = state
+            .get_session(&session.id)
+            .await
+            .expect("session detail should exist");
+        assert!(matches!(detail.session.status, SessionStatus::Idle));
+        assert_eq!(
+            detail.session.runtime_session_ref.as_deref(),
+            Some("mock-thread")
+        );
+        let messages = state
+            .list_messages(&session.id)
+            .await
+            .expect("messages should exist");
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| matches!(message.role, MessageRole::Assistant))
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Complete reply with the final tail",
+                "Complete reply with the final tail"
+            ]
+        );
+
+        let domain = state
+            .domain_session_state(&session.id)
+            .await
+            .expect("domain state should load")
+            .expect("domain session should exist");
+        assert_eq!(domain.turns.len(), 2);
+        assert!(
+            domain
+                .turns
+                .iter()
+                .all(|turn| turn.status == TurnStatus::Completed)
+        );
+        assert!(domain.turns.iter().all(|turn| {
+            turn.segments.iter().any(|segment| {
+                segment
+                    .message
+                    .as_ref()
+                    .is_some_and(|message| message.content == "Complete reply with the final tail")
+            })
+        }));
+        assert!(domain.turns.iter().all(|turn| {
+            turn.segments
+                .iter()
+                .flat_map(|segment| &segment.activities)
+                .any(|activity| activity.title.contains("cargo test"))
+        }));
+        assert!(domain.turns.iter().all(|turn| !turn.artifacts.is_empty()));
+        let events = state
+            .domain_events_after(&session.id, 0, 10_000)
+            .expect("Codex domain events should be readable");
+        assert_eq!(
+            events.last().map(|event| event.event_id),
+            Some(domain.cursor)
+        );
+        assert!(
+            events
+                .windows(2)
+                .all(|pair| pair[1].event_id == pair[0].event_id + 1)
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "turn.accepted")
+                .count(),
+            2
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "turn.status_changed")
+        );
+
+        let methods =
+            std::fs::read_to_string(&mock.log_path).expect("mock Codex request log should exist");
+        assert_eq!(methods.matches("thread/start\n").count(), 1);
+        assert_eq!(methods.matches("thread/resume\n").count(), 1);
+        assert_eq!(methods.matches("turn/start\n").count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_provider_recovers_from_resume_failure_with_a_new_thread() {
+        let _lock = codex_test_lock().await;
+        let mock = MockCodexEnvironment::new("resume-failure");
+        let state = Arc::new(test_state("codex-full-chain-resume-fallback").await);
+        let session = create_mock_codex_session(&state, "resume-fallback").await;
+
+        start_mock_codex_turn(&state, &session, 1).await;
+        wait_for_turn_completion(&state, &session.id)
+            .await
+            .expect("initial Codex turn should complete");
+        start_mock_codex_turn(&state, &session, 2).await;
+        wait_for_turn_completion(&state, &session.id)
+            .await
+            .expect("fallback Codex turn should complete");
+
+        let detail = state.get_session(&session.id).await.unwrap();
+        assert!(matches!(detail.session.status, SessionStatus::Idle));
+        assert_eq!(
+            detail.session.runtime_session_ref.as_deref(),
+            Some("mock-thread")
+        );
+        let methods =
+            std::fs::read_to_string(&mock.log_path).expect("mock Codex request log should exist");
+        assert_eq!(methods.matches("thread/resume\n").count(), 1);
+        assert_eq!(methods.matches("thread/start\n").count(), 2);
+        assert_eq!(methods.matches("turn/start\n").count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_summary_runs_through_the_mock_app_server() {
+        let _lock = codex_test_lock().await;
+        let mock = MockCodexEnvironment::new("success");
+        let state = Arc::new(test_state("codex-summary-full-chain").await);
+        let session = create_mock_codex_session(&state, "summary").await;
+
+        let summary = summarize_with_codex(state, &session, "long assistant response")
+            .await
+            .expect("Codex summary should complete");
+
+        assert_eq!(summary, "Complete reply with the final tail");
+        let methods =
+            std::fs::read_to_string(&mock.log_path).expect("mock Codex request log should exist");
+        assert_eq!(methods.matches("initialize\n").count(), 1);
+        assert_eq!(methods.matches("thread/start\n").count(), 1);
+        assert_eq!(methods.matches("turn/start\n").count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_provider_completes_approval_round_trip() {
+        let _lock = codex_test_lock().await;
+        let _mock = MockCodexEnvironment::new("approval");
+        let state = Arc::new(test_state("codex-full-chain-approval").await);
+        let session = create_mock_codex_session(&state, "approval").await;
+
+        start_mock_codex_turn(&state, &session, 1).await;
+        let approval = wait_for_pending_approval(&state, &session.id).await;
+        assert_eq!(approval.command.as_deref(), Some("rm -rf /"));
+        state
+            .submit_approval(&session.id, &approval.request_id, ApprovalChoice::Accept)
+            .await
+            .expect("approval should be forwarded to Codex");
+        wait_for_turn_completion(&state, &session.id)
+            .await
+            .expect("approved Codex turn should complete");
+
+        let detail = state.get_session(&session.id).await.unwrap();
+        assert!(matches!(detail.session.status, SessionStatus::Idle));
+        assert!(detail.session.pending_approval.is_none());
+        wait_for_assistant_message_text(&state, &session.id, "Approved reply with the final tail")
+            .await
+            .expect("approved final reply should be preserved");
+        let domain = state
+            .domain_session_state(&session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(domain.turns[0].status, TurnStatus::Completed);
+        assert!(domain.session.pending_approval_id.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_provider_cancel_interrupts_live_domain_turn() {
+        let _lock = codex_test_lock().await;
+        let _mock = MockCodexEnvironment::new("cancel");
+        let state = Arc::new(test_state("codex-full-chain-cancel").await);
+        let session = create_mock_codex_session(&state, "cancel").await;
+
+        start_mock_codex_turn(&state, &session, 1).await;
+        wait_for_assistant_message_text(&state, &session.id, "partial before cancel")
+            .await
+            .expect("partial reply should stream before cancellation");
+        assert!(
+            state
+                .cancel_turn(&session.id)
+                .await
+                .expect("cancel should succeed")
+        );
+        wait_for_turn_completion(&state, &session.id)
+            .await
+            .expect("cancelled worker should be cleaned up");
+
+        let detail = state.get_session(&session.id).await.unwrap();
+        assert!(matches!(detail.session.status, SessionStatus::Interrupted));
+        let domain = state
+            .domain_session_state(&session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(domain.turns[0].status, TurnStatus::Cancelled);
+        assert!(domain.session.active_turn_id.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_provider_failure_fails_domain_turn_and_releases_runtime() {
+        let _lock = codex_test_lock().await;
+        let _mock = MockCodexEnvironment::new("failure");
+        let state = Arc::new(test_state("codex-full-chain-failure").await);
+        let session = create_mock_codex_session(&state, "failure").await;
+
+        start_mock_codex_turn(&state, &session, 1).await;
+        wait_for_session_status(&state, &session.id, SessionStatus::Failed)
+            .await
+            .expect("provider failure should reach the session");
+        wait_for_turn_completion(&state, &session.id)
+            .await
+            .expect("failed worker should be cleaned up");
+
+        let detail = state.get_session(&session.id).await.unwrap();
+        assert!(
+            detail
+                .session
+                .last_message_preview
+                .as_deref()
+                .is_some_and(|message| message.contains("mock provider failed"))
+        );
+        let domain = state
+            .domain_session_state(&session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(domain.turns[0].status, TurnStatus::Failed);
+        assert!(domain.session.active_turn_id.is_none());
     }
 
     #[test]
@@ -3463,6 +4659,10 @@ impl AgentProvider for CodexProvider {
     }
 
     async fn list_messages(&self, session_id: &str) -> Option<Vec<ChatMessage>> {
+        #[cfg(test)]
+        if std::env::var_os("OMNI_CODE_CODEX_BIN").is_some() {
+            return None;
+        }
         self.load_messages_for_session(session_id)
     }
 
@@ -5485,6 +6685,7 @@ async fn run_codex(
     let mut pending_approval: Option<PendingApproval> = None;
     let mut queued_approvals: VecDeque<PendingApproval> = VecDeque::new();
     let mut command_status_probe: Option<CommandStatusProbe> = None;
+    let mut response_idle_ticks = 0_u32;
     let mut turn_finished = false;
     let mut last_rendered = String::new();
     let background_deadline =
@@ -5507,6 +6708,7 @@ async fn run_codex(
                 };
                 let line = line.map_err(anyhow::Error::msg)?;
                 debug_log!("[codex:stdout] {line}");
+                response_idle_ticks = 0;
                 idle_sleep.as_mut().reset(tokio::time::Instant::now() + idle_deadline);
                 if !raw_stdout.is_empty() {
                     raw_stdout.push('\n');
@@ -5537,46 +6739,25 @@ async fn run_codex(
                                 .and_then(Value::as_str)
                                 .unwrap_or("unknown error")
                         );
+                        if parsed.record_unverified_command_probe(&probe.item_id)
+                            == Some(CODEX_COMMAND_MAX_UNVERIFIED_PROBES)
+                        {
+                            let message = "Codex did not confirm a live process or report completion for a stalled command; waiting was stopped and this turn can be resumed.";
+                            state
+                                .interrupt_turn_for_recovery(&session.id, message.to_string())
+                                .await;
+                            return Ok(());
+                        }
                     } else {
                         let snapshot = command_status_snapshot(
                             value.get("result").unwrap_or(&Value::Null),
                             &probe.item_id,
                         );
-                        match snapshot.command_status.as_deref() {
-                            Some("inProgress") => {
-                                if let Some(running) = parsed.running_command.as_mut() {
-                                    running.process_id = snapshot.process_id.clone();
-                                }
-                                debug_log!(
-                                    "[codex:watchdog] session={} command is still in progress process_id={:?}: {}",
-                                    session.id, snapshot.process_id, probe.command
-                                );
-                                parsed.latest_status = Some(render_command_stalled_summary(
-                                    &probe.command,
-                                    "confirmed in progress; continuing to wait",
-                                ));
-                            }
-                            Some(status) => {
-                                debug_log!(
-                                    "[codex:watchdog] session={} recovered terminal command status={}: {}",
-                                    session.id, status, probe.command
-                                );
-                                parsed.running_command = None;
-                                parsed.latest_status = Some(render_command_summary(
-                                    &probe.command,
-                                    status,
-                                    None,
-                                ));
-                            }
-                            None => {
-                                debug_log!(
-                                    "[codex:watchdog] session={} thread/read did not contain command item={}",
-                                    session.id, probe.item_id
-                                );
-                            }
-                        }
                         match snapshot.turn_status.as_deref() {
-                            Some("completed" | "interrupted") => turn_finished = true,
+                            Some("completed" | "interrupted") => {
+                                parsed.running_command = None;
+                                turn_finished = true;
+                            }
                             Some("failed") => bail!(
                                 "{}",
                                 snapshot
@@ -5585,6 +6766,57 @@ async fn run_codex(
                                     .unwrap_or("codex turn failed")
                             ),
                             _ => {}
+                        }
+                        if !turn_finished {
+                            match snapshot.command_status.as_deref() {
+                                Some("inProgress") if snapshot.process_id.is_some() => {
+                                    let process_id = snapshot.process_id.expect("guarded above");
+                                    let confirmed = parsed
+                                        .confirm_running_command(&probe.item_id, process_id.clone());
+                                    debug_log!(
+                                        "[codex:watchdog] session={} command is confirmed in progress process_id={}: {}",
+                                        session.id, process_id, probe.command
+                                    );
+                                    if confirmed {
+                                        parsed.latest_status = Some(render_command_stalled_summary(
+                                            &probe.command,
+                                            "task is still running; confirmed by Codex",
+                                        ));
+                                    }
+                                }
+                                Some(status) => {
+                                    if status != "inProgress" {
+                                        debug_log!(
+                                            "[codex:watchdog] session={} recovered terminal command status={}: {}",
+                                            session.id, status, probe.command
+                                        );
+                                        parsed.running_command = None;
+                                        parsed.latest_status = Some(render_command_summary(
+                                            &probe.command,
+                                            status,
+                                            None,
+                                        ));
+                                    } else {
+                                        debug_log!(
+                                            "[codex:watchdog] session={} command remains in progress without a process id: {}",
+                                            session.id, probe.command
+                                        );
+                                    }
+                                }
+                                None => debug_log!(
+                                    "[codex:watchdog] session={} thread/read did not contain command item={}",
+                                    session.id, probe.item_id
+                                ),
+                            }
+                            if parsed.record_unverified_command_probe(&probe.item_id)
+                                == Some(CODEX_COMMAND_MAX_UNVERIFIED_PROBES)
+                            {
+                                let message = "Codex did not confirm a live process or report completion for a stalled command; waiting was stopped and this turn can be resumed.";
+                                state
+                                    .interrupt_turn_for_recovery(&session.id, message.to_string())
+                                    .await;
+                                return Ok(());
+                            }
                         }
                     }
                 }
@@ -5621,7 +6853,7 @@ async fn run_codex(
                         }).await;
                     }
                     CodexAppServerEvent::ApprovalRequested(mut pending) => {
-                        if let Some(choice) = auto_approve_codex_request(&mut pending.request, &project_root).await? {
+                        if let Some(choice) = auto_approve_codex_request_for_state(&state, &mut pending.request, &project_root).await? {
                             send_json_rpc_response(
                                 &mut stdin,
                                 &pending.request.request_id,
@@ -5717,6 +6949,17 @@ async fn run_codex(
             _ = &mut idle_sleep => {
                 let previous_status = parsed.current_status().map(ToString::to_string);
                 let watchdog_action = parsed.mark_idle_waiting(pending_approval.is_some());
+                if response_wait_timed_out(
+                    &mut response_idle_ticks,
+                    parsed.running_command.is_some(),
+                    pending_approval.is_some(),
+                    parsed.has_background_processes(),
+                ) {
+                    bail!(
+                        "codex produced no events for {} minutes while waiting for turn completion",
+                        CODEX_IDLE_TICK_SECONDS * u64::from(response_idle_ticks) / 60
+                    );
+                }
                 match watchdog_action {
                     Some(CommandWatchdogAction::SoftRecovery { command }) => {
                         debug_log!(
@@ -5725,25 +6968,45 @@ async fn run_codex(
                         );
                     }
                     Some(CommandWatchdogAction::Probe { item_id, command }) => {
-                        let request_id = send_json_rpc_request(
-                            &mut stdin,
-                            &mut next_request_id,
-                            "thread/read",
-                            serde_json::json!({
-                                "threadId": thread_id,
-                                "includeTurns": true,
-                            }),
-                        )
-                        .await?;
-                        command_status_probe = Some(CommandStatusProbe {
-                            request_id,
-                            item_id,
-                            command: command.clone(),
-                        });
-                        debug_log!(
-                            "[codex:watchdog] session={} checking command status after missing completion event: {}",
-                            session.id, command
-                        );
+                        if command_status_probe.is_some() {
+                            debug_log!(
+                                "[codex:watchdog] session={} command status probe is still unanswered: {}",
+                                session.id, command
+                            );
+                            if parsed.record_unverified_command_probe(&item_id)
+                                == Some(CODEX_COMMAND_MAX_UNVERIFIED_PROBES)
+                            {
+                                let message = "Codex did not confirm a live process or report completion for a stalled command; waiting was stopped and this turn can be resumed.";
+                                state
+                                    .interrupt_turn_for_recovery(&session.id, message.to_string())
+                                    .await;
+                                return Ok(());
+                            }
+                            parsed.latest_status = Some(render_command_stalled_summary(
+                                &command,
+                                "waiting for Codex to confirm whether the task is still running",
+                            ));
+                        } else {
+                            let request_id = send_json_rpc_request(
+                                &mut stdin,
+                                &mut next_request_id,
+                                "thread/read",
+                                serde_json::json!({
+                                    "threadId": thread_id,
+                                    "includeTurns": true,
+                                }),
+                            )
+                            .await?;
+                            command_status_probe = Some(CommandStatusProbe {
+                                request_id,
+                                item_id,
+                                command: command.clone(),
+                            });
+                            debug_log!(
+                                "[codex:watchdog] session={} checking command status after missing completion event: {}",
+                                session.id, command
+                            );
+                        }
                     }
                     None => {}
                 }
@@ -6109,7 +7372,7 @@ async fn run_claude_code(
                 if pending_approval.is_none() {
                     if let Some(request) = next_claude_permission_request(&state_dir, &run_id, &mut seen_permission_requests).await? {
                         let mut approval = request.as_approval_request();
-                        if let Some(choice) = auto_approve_codex_request(&mut approval, &project_root).await? {
+                        if let Some(choice) = auto_approve_codex_request_for_state(&state, &mut approval, &project_root).await? {
                             let mut response = response_from_choice(&choice);
                             response.request_id = approval.request_id.clone();
                             tokio::fs::write(
@@ -6551,7 +7814,7 @@ async fn run_acp_http(
                         }
                         if let Some(mut request) = acp_event_to_approval(&event) {
                             if let Some(choice) =
-                                auto_approve_codex_request(&mut request, &project_root).await?
+                                auto_approve_codex_request_for_state(&state, &mut request, &project_root).await?
                             {
                                 send_acp_http_approval_decision(
                                     &client,
@@ -7007,7 +8270,7 @@ async fn run_stdio_acp(
                         .context("ACP stdio permission request did not include id")?;
                     let params = value.get("params").unwrap_or(&Value::Null);
                     let mut request = acp_permission_request_to_approval(&request_id, params);
-                    if let Some(choice) = auto_approve_codex_request(&mut request, &project_root).await? {
+                    if let Some(choice) = auto_approve_codex_request_for_state(&state, &mut request, &project_root).await? {
                         send_json_rpc_response(
                             &mut stdin,
                             &request_id,
@@ -7254,6 +8517,9 @@ async fn summarize_with_codex(
         }
     }
 
+    // Signal that no more JSON-RPC requests will be sent so a stdio app-server
+    // can finish its read loop before we wait for it to exit.
+    drop(stdin);
     let status = child.wait().await?;
     let stderr = stderr_task
         .await
@@ -7417,9 +8683,7 @@ async fn push_incremental_text(
     next_text: &str,
 ) {
     if let Some(delta) = next_text.strip_prefix(last_rendered.as_str()) {
-        if !delta.is_empty()
-            && (delta.chars().count() >= 64 || delta.contains('\n') || last_rendered.is_empty())
-        {
+        if !delta.is_empty() {
             state
                 .emit_assistant_message_snapshot(session_id, message_id, next_text)
                 .await;
@@ -7699,6 +8963,7 @@ struct RunningCommand {
     process_id: Option<String>,
     idle_ticks: u32,
     recovery_requested: bool,
+    unverified_probe_count: u32,
 }
 
 struct CommandStatusProbe {
@@ -8200,6 +9465,7 @@ impl CodexAppServerStreamingState {
                                 .map(ToString::to_string),
                             idle_ticks: 0,
                             recovery_requested: false,
+                            unverified_probe_count: 0,
                         });
                     }
                 } else if method == "item/completed" {
@@ -8308,6 +9574,28 @@ impl CodexAppServerStreamingState {
             self.latest_status = Some(waiting.to_string());
             None
         }
+    }
+
+    fn record_unverified_command_probe(&mut self, item_id: &str) -> Option<u32> {
+        let running = self
+            .running_command
+            .as_mut()
+            .filter(|running| running.item_id == item_id)?;
+        running.unverified_probe_count += 1;
+        Some(running.unverified_probe_count)
+    }
+
+    fn confirm_running_command(&mut self, item_id: &str, process_id: String) -> bool {
+        let Some(running) = self
+            .running_command
+            .as_mut()
+            .filter(|running| running.item_id == item_id)
+        else {
+            return false;
+        };
+        running.process_id = Some(process_id);
+        running.unverified_probe_count = 0;
+        true
     }
 
     fn finish_text(&self) -> Option<String> {
@@ -8659,6 +9947,24 @@ async fn write_json_line(writer: &mut (impl AsyncWrite + Unpin), value: &Value) 
 }
 
 async fn wait_for_json_rpc_response(
+    stdout_rx: &mut mpsc::UnboundedReceiver<std::result::Result<String, String>>,
+    raw_stdout: &mut String,
+    request_id: u64,
+) -> Result<Value> {
+    tokio::time::timeout(
+        CODEX_JSON_RPC_RESPONSE_TIMEOUT,
+        wait_for_json_rpc_response_unbounded(stdout_rx, raw_stdout, request_id),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "JSON-RPC runtime timed out waiting for response id={request_id} after {}s",
+            CODEX_JSON_RPC_RESPONSE_TIMEOUT.as_secs()
+        )
+    })?
+}
+
+async fn wait_for_json_rpc_response_unbounded(
     stdout_rx: &mut mpsc::UnboundedReceiver<std::result::Result<String, String>>,
     raw_stdout: &mut String,
     request_id: u64,
@@ -11372,6 +12678,20 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
+async fn auto_approve_codex_request_for_state(
+    state: &AppState,
+    request: &mut ApprovalRequest,
+    project_root: &std::path::Path,
+) -> Result<Option<ApprovalChoice>> {
+    // Approval settings belong to the active Bridge instance. Reading only the
+    // process-global settings file lets isolated ACP/Codex sessions inherit a
+    // stale enabled flag and unexpectedly make a network AI-review request.
+    if !state.settings_store().get().await.ai_approval.enabled {
+        return Ok(None);
+    }
+    auto_approve_codex_request(request, project_root).await
+}
+
 async fn auto_approve_codex_request(
     request: &mut ApprovalRequest,
     project_root: &std::path::Path,
@@ -11381,19 +12701,19 @@ async fn auto_approve_codex_request(
             let Some(command) = request.command.as_deref() else {
                 return Ok(None);
             };
-            if ai_approval::is_hard_blocked(command, project_root) {
-                request.auto_approval_reason = Some(
-                    "This command matched a hard safety rule and requires your review.".to_string(),
-                );
-                request.auto_approval_reason_kind = Some("hard_block".to_string());
-                return Ok(None);
-            }
             if let Some(decision) = approval_policy::should_auto_approve(command, project_root) {
                 return Ok(match decision {
                     AutoApprovalDecision::Accept => Some(ApprovalChoice::Accept),
                 });
             }
-            let decision = match ai_approval::review_request(request, project_root).await {
+            let preferred_language = APPROVAL_LANGUAGE.try_with(Clone::clone).ok();
+            let decision = match ai_approval::review_request(
+                request,
+                project_root,
+                preferred_language.as_deref(),
+            )
+            .await
+            {
                 Ok(decision) => decision,
                 Err(error) => {
                     eprintln!(
@@ -11495,6 +12815,7 @@ async fn command_exists(name: &str) -> bool {
 pub async fn agent_readiness_message(kind: AgentKind) -> Option<String> {
     match kind {
         AgentKind::Acp => acp_readiness_message().await,
+        AgentKind::Pi => None,
         _ => None,
     }
 }
@@ -12318,6 +13639,7 @@ pub fn manual_install_hint(agent: AgentKind) -> String {
              Kiro (local stdio): install `kiro-cli`, run `kiro-cli login`, then configure `profile: stdio` with `command: kiro-cli` and `args: [\"acp\"]`\n  \
              Generic HTTP: configure `profile: generic_http` with an ACP-compatible endpoint URL"
             .to_string(),
+        AgentKind::Pi => "Pi Agent is embedded as a Rust dependency; configure PI_EXTENSION_PATHS for plugins.".to_string(),
         AgentKind::Custom => "Custom agent does not support auto-install".to_string(),
     }
 }
@@ -12352,6 +13674,14 @@ pub async fn install_agent(agent: AgentKind) -> crate::models::AgentInstallResul
                 message: Some(
                     "ACP agent does not support auto-install. For Kiro, install `kiro-cli` and run `kiro-cli login`; for generic HTTP ACP, configure the endpoint in settings.".to_string(),
                 ),
+                installed_path: None,
+            };
+        }
+        AgentKind::Pi => {
+            return crate::models::AgentInstallResult {
+                agent,
+                success: false,
+                message: Some("Pi Agent is embedded in omni-code-bridge; no external installation is required.".to_string()),
                 installed_path: None,
             };
         }

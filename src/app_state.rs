@@ -18,7 +18,11 @@ use tokio::{
 use uuid::Uuid;
 
 tokio::task_local! {
-    static DOMAIN_TURN_ID: String;
+    pub(crate) static DOMAIN_TURN_ID: String;
+}
+
+tokio::task_local! {
+    pub(crate) static APPROVAL_LANGUAGE: String;
 }
 
 use crate::{
@@ -42,7 +46,8 @@ use crate::{
     secret_store::SecretStore,
     session_domain::{
         ActivityKind, AgentProjection, ArtifactKind, CreateTurnCommand, CreateTurnResult,
-        EntityState, MessagePurpose, SessionDomainEvent, SessionState, TurnStatus,
+        DomainSessionStatus, EntityState, MessagePurpose, SessionDomainEvent, SessionState,
+        TurnStatus,
     },
     session_domain_store::{DomainStoreError, SessionDomainStore},
     session_store::project_id_for_path,
@@ -224,6 +229,7 @@ pub struct AppState {
     secret_store: SecretStore,
     push: PushService,
     session_domain: Arc<SessionDomainStore>,
+    pub(crate) pi_plugins: crate::pi_plugin_store::PiPluginStore,
     runtime_store_path: PathBuf,
     session_metadata_store_path: PathBuf,
 }
@@ -377,6 +383,9 @@ impl AppState {
             secret_store: SecretStore::load().await,
             push: PushService::new(),
             session_domain,
+            pi_plugins: crate::pi_plugin_store::PiPluginStore::new(pi_plugin_store_path(
+                &session_metadata_store_path,
+            )),
             runtime_store_path,
             session_metadata_store_path,
         };
@@ -480,6 +489,9 @@ impl AppState {
             secret_store: SecretStore::load().await,
             push: PushService::new(),
             session_domain,
+            pi_plugins: crate::pi_plugin_store::PiPluginStore::new(pi_plugin_store_path(
+                &session_metadata_store_path,
+            )),
             runtime_store_path,
             session_metadata_store_path,
         };
@@ -581,6 +593,9 @@ impl AppState {
             secret_store: SecretStore::load().await,
             push: PushService::new(),
             session_domain,
+            pi_plugins: crate::pi_plugin_store::PiPluginStore::new(pi_plugin_store_path(
+                &session_metadata_store_path,
+            )),
             runtime_store_path,
             session_metadata_store_path,
         };
@@ -615,20 +630,58 @@ impl AppState {
     }
 
     async fn recover_domain_active_turns(&self) -> Result<(), String> {
-        let interrupted = self.session_domain.interrupt_active_turns()?;
-        for session_id in interrupted {
+        let interrupted = self
+            .session_domain
+            .interrupt_active_turns()?
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let legacy_active_session_ids = self
+            .sessions
+            .read()
+            .await
+            .values()
+            .filter(|session| {
+                matches!(
+                    session.status,
+                    SessionStatus::Running
+                        | SessionStatus::AwaitingApproval
+                        | SessionStatus::Waiting
+                ) || session.pending_approval.is_some()
+            })
+            .map(|session| session.id.clone())
+            .collect::<Vec<_>>();
+        for session_id in legacy_active_session_ids {
+            let Some(domain_state) = self.session_domain.session_state(&session_id)? else {
+                continue;
+            };
+            if domain_state.session.active_turn_id.is_some() {
+                continue;
+            }
+            let recovered_status = if interrupted.contains(&session_id) {
+                SessionStatus::Interrupted
+            } else {
+                match domain_state.session.status {
+                    DomainSessionStatus::Idle => SessionStatus::Idle,
+                    DomainSessionStatus::Failed => SessionStatus::Failed,
+                    DomainSessionStatus::Running | DomainSessionStatus::AwaitingApproval => {
+                        continue;
+                    }
+                }
+            };
+            let was_interrupted = matches!(recovered_status, SessionStatus::Interrupted);
             let summary = {
                 let mut sessions = self.sessions.write().await;
                 let Some(session) = sessions.get_mut(&session_id) else {
                     continue;
                 };
-                session.status = SessionStatus::Interrupted;
+                session.status = recovered_status;
                 session.pending_approval = None;
+                session.last_message_preview = domain_state.session.last_message_preview;
                 session.updated_at = Utc::now();
                 session.clone()
             };
             self.update_runtime_state(&session_id, |runtime| {
-                runtime.interrupted = true;
+                runtime.interrupted = was_interrupted;
                 runtime.turn_in_flight = false;
                 runtime.turn_abort = None;
                 runtime.cancel_tx = None;
@@ -1131,7 +1184,7 @@ impl AppState {
             runtime_session_ref: None,
             provider_id: input.provider_id,
             reasoning_effort: input.reasoning_effort,
-            model: None,
+            model: input.model,
         };
 
         {
@@ -1331,7 +1384,18 @@ impl AppState {
     ) -> Result<Option<SessionState>, String> {
         if let Some(state) = self.session_domain.session_state(session_id)?
             && !state.turns.is_empty()
+            && !self
+                .session_domain
+                .needs_legacy_history_reimport(session_id)?
         {
+            if state.session.agent == AgentKind::Codex
+                && state.session.status == DomainSessionStatus::Idle
+                && let Some(messages) = self.list_messages(session_id).await
+                && completed_codex_history_is_ready(&state, &messages)
+            {
+                self.session_domain
+                    .refresh_completed_assistant_history(session_id, &messages)?;
+            }
             let diffs = self
                 .session_diffs
                 .read()
@@ -1368,6 +1432,61 @@ impl AppState {
         self.session_domain
             .import_diff_history(session_id, &diffs)?;
         self.session_domain.session_state(session_id)
+    }
+
+    pub async fn list_domain_session_summaries(
+        &self,
+        project_id: Option<&str>,
+    ) -> Result<Vec<SessionSummary>, String> {
+        // The domain list is used as the synchronization snapshot. Refresh the
+        // provider-backed aggregate so sessions discovered after startup are included.
+        self.invalidate_list_cache().await;
+        let legacy_sessions = self.list_sessions().await;
+        for session in &legacy_sessions {
+            self.session_domain.ensure_session(&session)?;
+            self.session_domain.sync_session_metadata(&session)?;
+        }
+        let domain_sessions = self.session_domain.list_sessions(project_id)?;
+        let legacy = legacy_sessions
+            .into_iter()
+            .map(|session| (session.id.clone(), session))
+            .collect::<HashMap<_, _>>();
+        let runtime = self.runtime.lock().await;
+        let mut summaries = domain_sessions
+            .into_iter()
+            .filter_map(|domain| {
+                let base = legacy.get(&domain.id)?;
+                let pending_approval = runtime
+                    .get(&domain.id)
+                    .and_then(|entry| entry.pending_approval.clone());
+                Some(SessionSummary {
+                    id: domain.id,
+                    project_id: domain.project_id,
+                    title: domain.title,
+                    agent: domain.agent,
+                    brief_reply_mode: domain.config.brief_reply_mode,
+                    status: match domain.status {
+                        DomainSessionStatus::Idle => SessionStatus::Idle,
+                        DomainSessionStatus::Running => SessionStatus::Running,
+                        DomainSessionStatus::AwaitingApproval => SessionStatus::AwaitingApproval,
+                        DomainSessionStatus::Failed => SessionStatus::Failed,
+                    },
+                    // The provider/canonical summary is the source of truth for
+                    // archived-session activity. Domain timestamps can reflect a
+                    // local import or projection rather than a conversation update.
+                    updated_at: base.updated_at,
+                    unread_count: domain.unread_count,
+                    last_message_preview: domain.last_message_preview,
+                    pending_approval,
+                    runtime_session_ref: base.runtime_session_ref.clone(),
+                    provider_id: domain.config.provider_id,
+                    reasoning_effort: domain.config.reasoning_effort,
+                    model: domain.config.model,
+                })
+            })
+            .collect::<Vec<_>>();
+        summaries.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        Ok(summaries)
     }
 
     pub async fn create_domain_turn(
@@ -1416,16 +1535,21 @@ impl AppState {
         self.session_domain.event_snapshot(session_id, turn_id)
     }
 
-    fn project_agent_event(&self, session_id: &str, event: AgentProjection) {
+    fn try_project_agent_event(
+        &self,
+        session_id: &str,
+        event: AgentProjection,
+    ) -> Result<(), String> {
         let turn_id = DOMAIN_TURN_ID.try_with(Clone::clone);
         let Ok(turn_id) = turn_id else {
-            debug_log!("[domain] ignored unbound projection for session={session_id}");
-            return;
+            return Ok(());
         };
-        if let Err(error) = self
-            .session_domain
+        self.session_domain
             .project_agent_event(session_id, &turn_id, event)
-        {
+    }
+
+    fn project_agent_event(&self, session_id: &str, event: AgentProjection) {
+        if let Err(error) = self.try_project_agent_event(session_id, event) {
             debug_log!("[domain] failed to project event for session={session_id}: {error}");
         }
     }
@@ -1521,6 +1645,11 @@ impl AppState {
                     || *format == ApiFormat::Acp
             }
             AgentKind::Acp => *format == ApiFormat::Acp,
+            AgentKind::Pi => {
+                *format == ApiFormat::OpenAiCompatible
+                    || *format == ApiFormat::AnthropicMessages
+                    || *format == ApiFormat::Codex
+            }
             AgentKind::Custom => *format == ApiFormat::OpenAiCompatible,
         };
 
@@ -1759,6 +1888,11 @@ impl AppState {
                     || provider.format == ApiFormat::Acp
             }
             AgentKind::Acp => provider.format == ApiFormat::Acp,
+            AgentKind::Pi => {
+                provider.format == ApiFormat::OpenAiCompatible
+                    || provider.format == ApiFormat::AnthropicMessages
+                    || provider.format == ApiFormat::Codex
+            }
             AgentKind::Custom => provider.format == ApiFormat::OpenAiCompatible,
         };
 
@@ -1792,10 +1926,21 @@ impl AppState {
         })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn send_message(
         self: &Arc<Self>,
         session_id: &str,
         input: SendMessageInput,
+    ) -> Result<(ChatMessage, ChatMessage), String> {
+        self.send_message_with_approval_language(session_id, input, None)
+            .await
+    }
+
+    pub async fn send_message_with_approval_language(
+        self: &Arc<Self>,
+        session_id: &str,
+        input: SendMessageInput,
+        approval_language: Option<String>,
     ) -> Result<(ChatMessage, ChatMessage), String> {
         let domain_turn_id = DOMAIN_TURN_ID.try_with(Clone::clone).ok();
         let client_message_id = input
@@ -1830,25 +1975,32 @@ impl AppState {
             return Err("session is already processing a message".to_string());
         }
 
+        let selected_model = input
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        if let Some(model) = selected_model.clone()
+            && let Err(error) = self
+                .update_session_settings(session_id, None, None, Some(Some(model)))
+                .await
+        {
+            self.finish_turn(session_id).await;
+            return Err(error);
+        }
+
         let session_snapshot = self
             .find_session(session_id)
             .await
             .ok_or_else(|| format!("unknown session: {session_id}"));
-        let mut session_snapshot = match session_snapshot {
+        let session_snapshot = match session_snapshot {
             Ok(session) => session,
             Err(error) => {
                 self.finish_turn(session_id).await;
                 return Err(error);
             }
         };
-        if let Some(model) = input
-            .model
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            session_snapshot.model = Some(model.to_string());
-        }
         if let Err(error) = self.clear_session_unread(session_id).await {
             self.finish_turn(session_id).await;
             return Err(error);
@@ -1973,19 +2125,25 @@ impl AppState {
 
         let state = Arc::clone(self);
         let reasoning_effort = input.reasoning_effort.or(session_snapshot.reasoning_effort);
-        let provider = self
-            .provider_for_agent(session_snapshot.agent)
-            .ok_or_else(|| format!("unsupported agent: {:?}", session_snapshot.agent))?;
+        let Some(provider) = self.provider_for_agent(session_snapshot.agent) else {
+            let error = format!("unsupported agent: {:?}", session_snapshot.agent);
+            self.fail_session(session_id, error.clone()).await;
+            self.finish_turn(session_id).await;
+            return Err(error);
+        };
         let session_id = session_id.to_string();
         let session_id_for_task = session_id.clone();
         let user_message_for_task = user_message.clone();
         let pending_reply_for_task = pending_reply.clone();
         let domain_turn_id_for_runtime = domain_turn_id.clone();
-        let handle = tokio::spawn(async move {
+        let worker_state = Arc::clone(&state);
+        let worker_turn_id = domain_turn_id.clone();
+        let worker_approval_language = approval_language.clone();
+        let worker = tokio::spawn(async move {
             let run = async {
                 provider
                     .run_session(
-                        state.clone(),
+                        worker_state.clone(),
                         session_snapshot,
                         user_message_for_task,
                         system_prompt,
@@ -1995,24 +2153,51 @@ impl AppState {
                     )
                     .await
             };
-            let result = if let Some(turn_id) = domain_turn_id {
-                DOMAIN_TURN_ID.scope(turn_id, run).await
+            let run = async {
+                if let Some(turn_id) = worker_turn_id {
+                    DOMAIN_TURN_ID.scope(turn_id, run).await
+                } else {
+                    run.await
+                }
+            };
+            if let Some(language) = worker_approval_language {
+                APPROVAL_LANGUAGE.scope(language, run).await
             } else {
                 run.await
-            };
-            if let Err(error) = result {
-                eprintln!(
-                    "[session] session={} failed: {:#}",
-                    session_id_for_task, error
-                );
-                state
-                    .fail_session(&session_id_for_task, error.to_string())
-                    .await;
             }
-            state.clear_approval_sender(&session_id_for_task).await;
-            state.finish_turn(&session_id_for_task).await;
         });
-        let abort_handle = handle.abort_handle();
+        let abort_handle = worker.abort_handle();
+        tokio::spawn(async move {
+            let cleanup = async {
+                match worker.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        let message = format!("{error:#}");
+                        eprintln!(
+                            "[session] session={} failed: {}",
+                            session_id_for_task, message
+                        );
+                        state.fail_session(&session_id_for_task, message).await;
+                    }
+                    Err(error) if error.is_cancelled() => {}
+                    Err(error) => {
+                        let message = format!("provider task terminated unexpectedly: {error}");
+                        eprintln!(
+                            "[session] session={} failed: {message}",
+                            session_id_for_task
+                        );
+                        state.fail_session(&session_id_for_task, message).await;
+                    }
+                }
+                state.finish_turn(&session_id_for_task).await;
+                state.clear_approval_sender(&session_id_for_task).await;
+            };
+            if let Some(turn_id) = domain_turn_id {
+                DOMAIN_TURN_ID.scope(turn_id, cleanup).await;
+            } else {
+                cleanup.await;
+            }
+        });
         if let Some(turn_id) = domain_turn_id_for_runtime {
             self.set_turn_abort_for_turn(&session_id, &turn_id, Some(abort_handle))
                 .await;
@@ -2023,6 +2208,7 @@ impl AppState {
         Ok((user_message, pending_reply))
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn send_domain_message(
         self: &Arc<Self>,
         session_id: &str,
@@ -2031,6 +2217,21 @@ impl AppState {
     ) -> Result<(ChatMessage, ChatMessage), String> {
         DOMAIN_TURN_ID
             .scope(turn_id.to_string(), self.send_message(session_id, input))
+            .await
+    }
+
+    pub async fn send_domain_message_with_approval_language(
+        self: &Arc<Self>,
+        session_id: &str,
+        turn_id: &str,
+        input: SendMessageInput,
+        approval_language: Option<String>,
+    ) -> Result<(ChatMessage, ChatMessage), String> {
+        DOMAIN_TURN_ID
+            .scope(
+                turn_id.to_string(),
+                self.send_message_with_approval_language(session_id, input, approval_language),
+            )
             .await
     }
 
@@ -2489,8 +2690,14 @@ impl AppState {
         let content = assistant_message.content.clone();
         let assistant_message_id = assistant_message.id.clone();
 
-        self.patch_session(session_id, SessionStatus::Idle, Some(content.clone()))
-            .await;
+        // Metadata persistence must not keep a completed provider turn alive.
+        // `patch_session` updates the in-memory session before awaiting disk I/O,
+        // so a later metadata retry can safely converge the durable copy.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            self.patch_session(session_id, SessionStatus::Idle, Some(content.clone())),
+        )
+        .await;
         self.clear_interrupted(session_id).await;
         self.clear_pending_approval(session_id).await;
         self.publish_event(SessionEvent::MessageCreated(assistant_message));
@@ -2499,7 +2706,7 @@ impl AppState {
             status: SessionStatus::Idle,
             error_message: None,
         }));
-        self.project_agent_event(
+        self.try_project_agent_event(
             session_id,
             AgentProjection::AssistantMessage {
                 message_id: assistant_message_id.clone(),
@@ -2507,16 +2714,19 @@ impl AppState {
                 state: EntityState::Completed,
                 content: content.clone(),
             },
-        );
-        self.project_agent_event(
+        )?;
+        self.try_project_agent_event(
             session_id,
             AgentProjection::TurnStatus {
                 status: TurnStatus::Completed,
                 error: None,
             },
-        );
-        self.mark_session_unread(session_id, &assistant_message_id)
-            .await?;
+        )?;
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            self.mark_session_unread(session_id, &assistant_message_id),
+        )
+        .await;
         if let Some(session) = self.find_session(session_id).await {
             let devices = self
                 .devices
@@ -2642,6 +2852,40 @@ impl AppState {
             AgentProjection::TurnStatus {
                 status: TurnStatus::Failed,
                 error: Some(message),
+            },
+        );
+    }
+
+    /// Ends the current turn when the provider lost its completion signal.
+    /// This deliberately does not send a provider cancellation: without a live
+    /// process handle, the bridge cannot safely claim ownership of external work.
+    pub async fn interrupt_turn_for_recovery(&self, session_id: &str, message: String) {
+        if !self.bound_domain_turn_is_active(session_id) {
+            return;
+        }
+        self.update_runtime_state(session_id, |entry| {
+            entry.interrupted = true;
+            entry.approval_tx = None;
+            entry.pending_approval = None;
+        })
+        .await;
+        let preview = self
+            .latest_assistant_preview(session_id)
+            .await
+            .or(Some(message));
+        self.patch_session(session_id, SessionStatus::Interrupted, preview)
+            .await;
+        self.clear_pending_approval(session_id).await;
+        self.publish_event(SessionEvent::SessionStatus(SessionStatusEvent {
+            session_id: session_id.to_string(),
+            status: SessionStatus::Interrupted,
+            error_message: None,
+        }));
+        self.project_agent_event(
+            session_id,
+            AgentProjection::TurnStatus {
+                status: TurnStatus::Cancelled,
+                error: None,
             },
         );
     }
@@ -3625,6 +3869,22 @@ impl AppState {
     }
 }
 
+fn completed_codex_history_is_ready(state: &SessionState, messages: &[ChatMessage]) -> bool {
+    let Some(domain_final) = state
+        .turns
+        .iter()
+        .rev()
+        .flat_map(|turn| turn.segments.iter().rev())
+        .filter_map(|segment| segment.message.as_ref())
+        .find(|message| message.purpose == MessagePurpose::Final)
+    else {
+        return false;
+    };
+    messages.iter().rev().find_map(|message| {
+        (message.role == MessageRole::Assistant).then_some(message.content.trim())
+    }) == Some(domain_final.content.trim())
+}
+
 fn classify_activity_kind(content: &str) -> ActivityKind {
     let normalized = content.to_ascii_lowercase();
     if normalized.starts_with("[reasoning]") {
@@ -3881,6 +4141,14 @@ fn domain_store_path(metadata_path: &Path) -> PathBuf {
     metadata_path.with_file_name(format!("{file_name}.v2.sqlite3"))
 }
 
+fn pi_plugin_store_path(metadata_path: &Path) -> PathBuf {
+    metadata_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from(".omni-code"))
+        .join("pi-plugins")
+}
+
 async fn write_persisted_runtime(
     path: &PathBuf,
     runtime: &HashMap<String, PersistedSessionRuntimeState>,
@@ -4013,7 +4281,7 @@ mod tests {
         sync::Arc,
         time::{SystemTime, UNIX_EPOCH},
     };
-    use tokio::sync::Mutex as TokioMutex;
+    use tokio::sync::{Mutex as TokioMutex, mpsc};
 
     #[test]
     fn always_allow_rule_expands_to_similar_operations_and_keeps_hard_blocks() {
@@ -4090,6 +4358,24 @@ mod tests {
             _reasoning_effort: Option<crate::models::ReasoningEffort>,
         ) -> Result<()> {
             Ok(())
+        }
+    }
+
+    struct PanickingProvider;
+
+    #[async_trait]
+    impl AgentProvider for PanickingProvider {
+        async fn run_session(
+            &self,
+            _state: Arc<AppState>,
+            _session: SessionSummary,
+            _input: ChatMessage,
+            _system_prompt: Option<String>,
+            _reply: ChatMessage,
+            _provider_config: Option<ResolvedProviderConfig>,
+            _reasoning_effort: Option<crate::models::ReasoningEffort>,
+        ) -> Result<()> {
+            panic!("simulated provider task panic");
         }
     }
 
@@ -4175,6 +4461,7 @@ mod tests {
             brief_reply_mode: false,
             provider_id: None,
             reasoning_effort: None,
+            model: Some("gpt-session-a".to_string()),
         };
 
         let first = state.create_session(input.clone()).await.unwrap();
@@ -4182,6 +4469,8 @@ mod tests {
 
         assert_eq!(first.id, "client-stable-session");
         assert_eq!(second.id, first.id);
+        assert_eq!(first.model.as_deref(), Some("gpt-session-a"));
+        assert_eq!(second.model, first.model);
         assert_eq!(state.sessions.read().await.len(), 1);
     }
 
@@ -4211,6 +4500,7 @@ mod tests {
                 brief_reply_mode: false,
                 provider_id: None,
                 reasoning_effort: None,
+                model: None,
             })
             .await
             .unwrap();
@@ -4252,6 +4542,7 @@ mod tests {
                 brief_reply_mode: false,
                 provider_id: None,
                 reasoning_effort: None,
+                model: None,
             })
             .await
             .expect("session should be created");
@@ -4315,6 +4606,7 @@ mod tests {
                 brief_reply_mode: false,
                 provider_id: None,
                 reasoning_effort: None,
+                model: None,
             })
             .await
             .expect("session should be created");
@@ -4350,6 +4642,7 @@ mod tests {
                 brief_reply_mode: false,
                 provider_id: None,
                 reasoning_effort: None,
+                model: None,
             })
             .await
             .expect("session should be created");
@@ -4425,6 +4718,7 @@ mod tests {
                 brief_reply_mode: false,
                 provider_id: None,
                 reasoning_effort: None,
+                model: None,
             })
             .await
             .expect("session should be created");
@@ -4507,7 +4801,7 @@ mod tests {
             agent: AgentKind::Codex,
             brief_reply_mode: false,
             status: SessionStatus::Idle,
-            updated_at: Utc::now(),
+            updated_at: Utc::now() - chrono::TimeDelta::days(7),
             unread_count: 0,
             last_message_preview: Some("history".to_string()),
             pending_approval: None,
@@ -4591,6 +4885,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn domain_session_list_includes_provider_only_sessions() {
+        let provider = Arc::new(TestMessageProvider::new(HashMap::new()));
+        let registry = ProviderRegistry::from_map(HashMap::from([(
+            AgentKind::Codex,
+            provider.clone() as Arc<dyn AgentProvider>,
+        )]));
+        let state = test_state_with_providers("domain-provider-list", registry).await;
+        let provider_session = SessionSummary {
+            id: "provider-only-list-session".to_string(),
+            project_id: "provider-project".to_string(),
+            title: "Provider history".to_string(),
+            agent: AgentKind::Codex,
+            brief_reply_mode: false,
+            status: SessionStatus::Idle,
+            updated_at: Utc::now(),
+            unread_count: 0,
+            last_message_preview: Some("history".to_string()),
+            pending_approval: None,
+            runtime_session_ref: None,
+            provider_id: None,
+            reasoning_effort: None,
+            model: None,
+        };
+        provider.set_session(provider_session.clone()).await;
+
+        let sessions = state
+            .list_domain_session_summaries(Some("provider-project"))
+            .await
+            .expect("domain session list should load");
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, provider_session.id);
+        assert_eq!(sessions[0].title, provider_session.title);
+        assert_eq!(sessions[0].updated_at, provider_session.updated_at);
+    }
+
+    #[tokio::test]
     async fn list_sessions_collapses_transitive_provider_threads_into_local_session() {
         let provider = Arc::new(TestMessageProvider::new(HashMap::new()));
         let registry = ProviderRegistry::from_map(HashMap::from([(
@@ -4613,6 +4944,7 @@ mod tests {
                 brief_reply_mode: false,
                 provider_id: None,
                 reasoning_effort: None,
+                model: None,
             })
             .await
             .expect("session should be created");
@@ -4671,6 +5003,7 @@ mod tests {
                 brief_reply_mode: false,
                 provider_id: None,
                 reasoning_effort: None,
+                model: None,
             })
             .await
             .expect("session should be created");
@@ -4800,6 +5133,7 @@ mod tests {
                 brief_reply_mode: false,
                 provider_id: None,
                 reasoning_effort: None,
+                model: None,
             })
             .await
             .expect("session should be created");
@@ -4889,6 +5223,7 @@ mod tests {
                 brief_reply_mode: false,
                 provider_id: None,
                 reasoning_effort: None,
+                model: None,
             })
             .await
             .expect("session should be created");
@@ -4955,6 +5290,7 @@ mod tests {
                 brief_reply_mode: false,
                 provider_id: None,
                 reasoning_effort: None,
+                model: None,
             })
             .await
             .expect("session should be created");
@@ -5030,6 +5366,7 @@ mod tests {
                 brief_reply_mode: false,
                 provider_id: None,
                 reasoning_effort: None,
+                model: None,
             })
             .await
             .expect("session should be created");
@@ -5195,6 +5532,7 @@ mod tests {
                 brief_reply_mode: false,
                 provider_id: None,
                 reasoning_effort: None,
+                model: None,
             })
             .await
             .expect("session should be created");
@@ -5448,6 +5786,7 @@ mod tests {
                 brief_reply_mode: false,
                 provider_id: None,
                 reasoning_effort: None,
+                model: None,
             })
             .await
             .expect("session should be created");
@@ -5493,6 +5832,7 @@ mod tests {
                 brief_reply_mode: false,
                 provider_id: None,
                 reasoning_effort: None,
+                model: None,
             })
             .await
             .expect("session should be created");
@@ -5547,6 +5887,288 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completed_assistant_unread_state_stays_in_sync_with_domain_read_state() {
+        let state = test_state("unread-domain-sync").await;
+        let project = state
+            .create_project(CreateProjectInput {
+                name: "Project".to_string(),
+                root_path: std::env::temp_dir().to_string_lossy().to_string(),
+            })
+            .await;
+        let session = state
+            .create_session(CreateSessionInput {
+                client_session_id: Uuid::new_v4().to_string(),
+                project_id: project.id,
+                title: Some("Session".to_string()),
+                agent: AgentKind::Codex,
+                brief_reply_mode: false,
+                provider_id: None,
+                reasoning_effort: None,
+                model: None,
+            })
+            .await
+            .unwrap();
+        let assistant = ChatMessage {
+            id: "assistant-unread".to_string(),
+            session_id: session.id.clone(),
+            role: MessageRole::Assistant,
+            content: "completed reply".to_string(),
+            created_at: Utc::now(),
+        };
+        let turn_id = Uuid::new_v4().to_string();
+        state
+            .create_domain_turn(
+                &session.id,
+                &CreateTurnCommand {
+                    command_id: Uuid::new_v4().to_string(),
+                    turn_id: turn_id.clone(),
+                    user_message_id: Uuid::new_v4().to_string(),
+                    content: "question".to_string(),
+                    attachments: Vec::new(),
+                    input_mode: InputMode::Text,
+                    system_prompt: None,
+                    expected_session_version: None,
+                    provider_id: None,
+                    reasoning_effort: None,
+                    model: None,
+                },
+            )
+            .await
+            .unwrap();
+        state.push_message(assistant.clone()).await;
+        DOMAIN_TURN_ID
+            .scope(
+                turn_id,
+                state.finish_assistant_message(&session.id, &assistant.id),
+            )
+            .await
+            .unwrap();
+
+        let legacy = state.get_session(&session.id).await.unwrap();
+        let domain = state
+            .domain_session_state(&session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(legacy.session.unread_count, 1);
+        assert_eq!(domain.session.unread_count, 1);
+
+        state
+            .mark_session_read(&session.id, &assistant.id)
+            .await
+            .unwrap();
+        let legacy = state.get_session(&session.id).await.unwrap();
+        let domain = state
+            .domain_session_state(&session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(legacy.session.unread_count, 0);
+        assert_eq!(domain.session.unread_count, 0);
+    }
+
+    #[tokio::test]
+    async fn recovery_interrupt_stops_the_active_turn_without_marking_it_failed() {
+        let state = test_state("watchdog-recovery-interrupt").await;
+        let project = state
+            .create_project(CreateProjectInput {
+                name: "Project".to_string(),
+                root_path: std::env::temp_dir().to_string_lossy().to_string(),
+            })
+            .await;
+        let session = state
+            .create_session(CreateSessionInput {
+                client_session_id: Uuid::new_v4().to_string(),
+                project_id: project.id,
+                title: Some("Session".to_string()),
+                agent: AgentKind::Codex,
+                brief_reply_mode: false,
+                provider_id: None,
+                reasoning_effort: None,
+                model: None,
+            })
+            .await
+            .unwrap();
+        let turn_id = Uuid::new_v4().to_string();
+        state
+            .create_domain_turn(
+                &session.id,
+                &CreateTurnCommand {
+                    command_id: Uuid::new_v4().to_string(),
+                    turn_id: turn_id.clone(),
+                    user_message_id: Uuid::new_v4().to_string(),
+                    content: "wait for a tool".to_string(),
+                    attachments: Vec::new(),
+                    input_mode: InputMode::Text,
+                    system_prompt: None,
+                    expected_session_version: None,
+                    provider_id: None,
+                    reasoning_effort: None,
+                    model: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        DOMAIN_TURN_ID
+            .scope(
+                turn_id,
+                state.interrupt_turn_for_recovery(
+                    &session.id,
+                    "Codex lost the completion event".to_string(),
+                ),
+            )
+            .await;
+
+        let detail = state.get_session(&session.id).await.unwrap();
+        assert!(matches!(detail.session.status, SessionStatus::Interrupted));
+        let domain = state
+            .domain_session_state(&session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(domain.turns[0].status, TurnStatus::Cancelled);
+        assert!(domain.session.active_turn_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn approval_submission_rejects_wrong_or_unresolvable_request_without_forwarding() {
+        let state = test_state("approval-validation").await;
+        let project = state
+            .create_project(CreateProjectInput {
+                name: "Project".to_string(),
+                root_path: std::env::temp_dir().to_string_lossy().to_string(),
+            })
+            .await;
+        let session = state
+            .create_session(CreateSessionInput {
+                client_session_id: Uuid::new_v4().to_string(),
+                project_id: project.id,
+                title: Some("Session".to_string()),
+                agent: AgentKind::Codex,
+                brief_reply_mode: false,
+                provider_id: None,
+                reasoning_effort: None,
+                model: None,
+            })
+            .await
+            .unwrap();
+        let (approval_tx, mut approval_rx) = mpsc::unbounded_channel();
+        state.set_approval_sender(&session.id, approval_tx).await;
+        let mut request = ApprovalRequest {
+            request_id: "approval-1".to_string(),
+            kind: crate::models::ApprovalKind::CommandExecution,
+            command: Some("cargo test".to_string()),
+            reason: None,
+            auto_approval_reason: None,
+            auto_approval_reason_kind: None,
+            allow_accept_for_session: false,
+            allow_cancel: true,
+            resolvable: false,
+        };
+        state.raise_approval(&session.id, request.clone()).await;
+
+        let wrong = state
+            .submit_approval(&session.id, "approval-other", ApprovalChoice::Accept)
+            .await
+            .unwrap_err();
+        assert!(wrong.contains("unknown approval request"));
+        assert!(approval_rx.try_recv().is_err());
+
+        let unresolvable = state
+            .submit_approval(&session.id, &request.request_id, ApprovalChoice::Accept)
+            .await
+            .unwrap_err();
+        assert!(unresolvable.contains("cannot be resolved"));
+        assert!(approval_rx.try_recv().is_err());
+
+        request.resolvable = true;
+        state.raise_approval(&session.id, request.clone()).await;
+        state
+            .submit_approval(&session.id, &request.request_id, ApprovalChoice::Accept)
+            .await
+            .unwrap();
+        assert!(matches!(approval_rx.try_recv(), Ok(ApprovalChoice::Accept)));
+    }
+
+    #[tokio::test]
+    async fn stale_read_acknowledgement_does_not_clear_newer_unread_message() {
+        let state = test_state("stale-read-ack").await;
+        let project = state
+            .create_project(CreateProjectInput {
+                name: "Project".to_string(),
+                root_path: std::env::temp_dir().to_string_lossy().to_string(),
+            })
+            .await;
+        let session = state
+            .create_session(CreateSessionInput {
+                client_session_id: Uuid::new_v4().to_string(),
+                project_id: project.id,
+                title: Some("Session".to_string()),
+                agent: AgentKind::Codex,
+                brief_reply_mode: false,
+                provider_id: None,
+                reasoning_effort: None,
+                model: None,
+            })
+            .await
+            .unwrap();
+        let now = Utc::now();
+        let first = test_message(
+            "assistant-first",
+            &session.id,
+            MessageRole::Assistant,
+            "first reply",
+            now,
+        );
+        let second = test_message(
+            "assistant-second",
+            &session.id,
+            MessageRole::Assistant,
+            "second reply",
+            now + chrono::TimeDelta::seconds(1),
+        );
+        state.push_message(first.clone()).await;
+        state.push_message(second.clone()).await;
+        state
+            .mark_session_unread(&session.id, &first.id)
+            .await
+            .unwrap();
+        state
+            .mark_session_unread(&session.id, &second.id)
+            .await
+            .unwrap();
+
+        let stale = state
+            .mark_session_read(&session.id, &first.id)
+            .await
+            .unwrap();
+        assert_eq!(stale.unread_count, 1);
+        assert_eq!(
+            state
+                .unread_message_ids
+                .read()
+                .await
+                .get(&session.id)
+                .map(String::as_str),
+            Some(second.id.as_str())
+        );
+
+        let current = state
+            .mark_session_read(&session.id, &second.id)
+            .await
+            .unwrap();
+        assert_eq!(current.unread_count, 0);
+        assert!(
+            !state
+                .unread_message_ids
+                .read()
+                .await
+                .contains_key(&session.id)
+        );
+    }
+
+    #[tokio::test]
     async fn finish_assistant_message_refreshes_provider_final_snapshot() {
         let now = Utc::now();
         let provider = Arc::new(TestMessageProvider::new(HashMap::new()));
@@ -5570,6 +6192,7 @@ mod tests {
                 brief_reply_mode: false,
                 provider_id: None,
                 reasoning_effort: None,
+                model: None,
             })
             .await
             .expect("session should be created");
@@ -5654,6 +6277,7 @@ mod tests {
                 brief_reply_mode: false,
                 provider_id: None,
                 reasoning_effort: None,
+                model: None,
             })
             .await
             .expect("session should be created");
@@ -5737,6 +6361,7 @@ mod tests {
                 brief_reply_mode: false,
                 provider_id: None,
                 reasoning_effort: None,
+                model: None,
             })
             .await
             .expect("session should be created");
@@ -5783,6 +6408,7 @@ mod tests {
                 brief_reply_mode: false,
                 provider_id: None,
                 reasoning_effort: Some(crate::models::ReasoningEffort::Medium),
+                model: None,
             })
             .await
             .expect("session should be created");
@@ -5829,6 +6455,7 @@ mod tests {
                 brief_reply_mode: false,
                 provider_id: None,
                 reasoning_effort: None,
+                model: None,
             })
             .await
             .expect("session should be created");
@@ -5878,6 +6505,7 @@ mod tests {
                 brief_reply_mode: false,
                 provider_id: None,
                 reasoning_effort: None,
+                model: None,
             })
             .await
             .expect("session should be created");
@@ -5910,6 +6538,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restart_reconciles_stale_legacy_approval_with_terminal_domain_state() {
+        let settings_path = test_path("reconcile-approval-settings");
+        let runtime_path = test_path("reconcile-approval-runtime");
+        let metadata_path = test_path("reconcile-approval-metadata");
+        let state = AppState::new_with_paths(
+            settings_path.clone(),
+            runtime_path.clone(),
+            metadata_path.clone(),
+        )
+        .await;
+        let project = state
+            .create_project(CreateProjectInput {
+                name: "Project".to_string(),
+                root_path: std::env::temp_dir().to_string_lossy().to_string(),
+            })
+            .await;
+        let session = state
+            .create_session(CreateSessionInput {
+                client_session_id: Uuid::new_v4().to_string(),
+                project_id: project.id,
+                title: Some("Session".to_string()),
+                agent: AgentKind::Codex,
+                brief_reply_mode: false,
+                provider_id: None,
+                reasoning_effort: None,
+                model: None,
+            })
+            .await
+            .expect("session should be created");
+        {
+            let mut sessions = state.sessions.write().await;
+            sessions.get_mut(&session.id).unwrap().status = SessionStatus::AwaitingApproval;
+        }
+        state.write_session_metadata().await.unwrap();
+        state.recover_domain_active_turns().await.unwrap();
+        let recovered = state.find_session(&session.id).await.unwrap();
+        assert!(matches!(recovered.status, SessionStatus::Idle));
+        assert!(recovered.pending_approval.is_none());
+        let body = tokio::fs::read_to_string(metadata_path)
+            .await
+            .expect("metadata should be written");
+        let metadata: PersistedSessionMetadata =
+            serde_json::from_str(&body).expect("metadata should parse");
+        let persisted = metadata.sessions[&session.id].session.as_ref().unwrap();
+        assert!(matches!(persisted.status, SessionStatus::Idle));
+        assert!(persisted.pending_approval.is_none());
+    }
+
+    #[tokio::test]
     async fn cancel_turn_interrupts_detached_running_session() {
         let state = test_state("cancel-detached-running").await;
         let project = state
@@ -5927,6 +6604,7 @@ mod tests {
                 brief_reply_mode: false,
                 provider_id: None,
                 reasoning_effort: None,
+                model: None,
             })
             .await
             .expect("session should be created");
@@ -5973,6 +6651,7 @@ mod tests {
                 brief_reply_mode: false,
                 provider_id: None,
                 reasoning_effort: None,
+                model: None,
             })
             .await
             .expect("session should be created");
@@ -6023,6 +6702,7 @@ mod tests {
                 brief_reply_mode: false,
                 provider_id: None,
                 reasoning_effort: None,
+                model: None,
             })
             .await
             .expect("session should be created");
@@ -6102,6 +6782,7 @@ mod tests {
                 brief_reply_mode: false,
                 provider_id: None,
                 reasoning_effort: None,
+                model: None,
             })
             .await
             .expect("session should be created");
@@ -6276,5 +6957,191 @@ mod tests {
         assert!(runtime.turn_in_flight);
         assert!(runtime.approval_tx.is_some());
         assert!(runtime.cancel_tx.is_some());
+    }
+
+    #[tokio::test]
+    async fn provider_task_panic_fails_domain_turn_and_clears_runtime() {
+        let registry = ProviderRegistry::from_map(HashMap::from([(
+            AgentKind::Codex,
+            Arc::new(PanickingProvider) as Arc<dyn AgentProvider>,
+        )]));
+        let state = Arc::new(test_state_with_providers("provider-panic", registry).await);
+        let project = state
+            .create_project(CreateProjectInput {
+                name: "Project".to_string(),
+                root_path: std::env::temp_dir().to_string_lossy().to_string(),
+            })
+            .await;
+        let session = state
+            .create_session(CreateSessionInput {
+                client_session_id: Uuid::new_v4().to_string(),
+                project_id: project.id,
+                title: Some("Session".to_string()),
+                agent: AgentKind::Codex,
+                brief_reply_mode: false,
+                provider_id: None,
+                reasoning_effort: None,
+                model: None,
+            })
+            .await
+            .expect("session should be created");
+        let turn_id = Uuid::new_v4().to_string();
+        state
+            .create_domain_turn(
+                &session.id,
+                &CreateTurnCommand {
+                    command_id: Uuid::new_v4().to_string(),
+                    turn_id: turn_id.clone(),
+                    user_message_id: Uuid::new_v4().to_string(),
+                    content: "trigger panic".to_string(),
+                    attachments: Vec::new(),
+                    input_mode: InputMode::Text,
+                    system_prompt: None,
+                    expected_session_version: None,
+                    provider_id: None,
+                    reasoning_effort: None,
+                    model: None,
+                },
+            )
+            .await
+            .expect("turn should be created");
+
+        state
+            .send_domain_message(
+                &session.id,
+                &turn_id,
+                SendMessageInput {
+                    content: "trigger panic".to_string(),
+                    input_mode: InputMode::Text,
+                    system_prompt: None,
+                    client_message_id: None,
+                    provider_id: None,
+                    reasoning_effort: None,
+                    model: None,
+                },
+            )
+            .await
+            .expect("message should be accepted");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let state_snapshot = state
+                    .domain_session_state(&session.id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if state_snapshot.turns[0].status == TurnStatus::Failed
+                    && !state.turn_in_flight_for_test(&session.id).await
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("panic supervisor should settle the turn");
+
+        let state_snapshot = state
+            .domain_session_state(&session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state_snapshot.session.status, DomainSessionStatus::Failed);
+        assert_eq!(state_snapshot.session.active_turn_id, None);
+        assert_eq!(state_snapshot.turns[0].status, TurnStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn missing_provider_fails_domain_turn_and_releases_session_runtime() {
+        let state = Arc::new(
+            test_state_with_providers(
+                "missing-provider-runtime",
+                ProviderRegistry::from_map(HashMap::new()),
+            )
+            .await,
+        );
+        let project = state
+            .create_project(CreateProjectInput {
+                name: "Project".to_string(),
+                root_path: std::env::temp_dir().to_string_lossy().to_string(),
+            })
+            .await;
+        let session = state
+            .create_session(CreateSessionInput {
+                client_session_id: Uuid::new_v4().to_string(),
+                project_id: project.id,
+                title: Some("Session".to_string()),
+                agent: AgentKind::Codex,
+                brief_reply_mode: false,
+                provider_id: None,
+                reasoning_effort: None,
+                model: None,
+            })
+            .await
+            .expect("session should be created");
+        let command = CreateTurnCommand {
+            command_id: Uuid::new_v4().to_string(),
+            turn_id: Uuid::new_v4().to_string(),
+            user_message_id: Uuid::new_v4().to_string(),
+            content: "first attempt".to_string(),
+            attachments: Vec::new(),
+            input_mode: InputMode::Text,
+            system_prompt: None,
+            expected_session_version: None,
+            provider_id: None,
+            reasoning_effort: None,
+            model: None,
+        };
+        state
+            .create_domain_turn(&session.id, &command)
+            .await
+            .expect("turn should be created");
+
+        let error = state
+            .send_domain_message(
+                &session.id,
+                &command.turn_id,
+                SendMessageInput {
+                    content: command.content.clone(),
+                    input_mode: InputMode::Text,
+                    system_prompt: None,
+                    client_message_id: Some(command.user_message_id.clone()),
+                    provider_id: None,
+                    reasoning_effort: None,
+                    model: None,
+                },
+            )
+            .await
+            .expect_err("missing provider should fail");
+        assert!(error.contains("unsupported agent"));
+        assert!(!state.turn_in_flight_for_test(&session.id).await);
+
+        let snapshot = state
+            .domain_session_state(&session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.session.status, DomainSessionStatus::Failed);
+        assert_eq!(snapshot.session.active_turn_id, None);
+        assert_eq!(snapshot.turns[0].status, TurnStatus::Failed);
+
+        let retry_error = state
+            .send_message(
+                &session.id,
+                SendMessageInput {
+                    content: "second attempt".to_string(),
+                    input_mode: InputMode::Text,
+                    system_prompt: None,
+                    client_message_id: Some(Uuid::new_v4().to_string()),
+                    provider_id: None,
+                    reasoning_effort: None,
+                    model: None,
+                },
+            )
+            .await
+            .expect_err("retry should reach provider resolution");
+        assert!(retry_error.contains("unsupported agent"));
+        assert!(!retry_error.contains("already processing"));
+        assert!(!state.turn_in_flight_for_test(&session.id).await);
     }
 }
