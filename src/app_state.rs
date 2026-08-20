@@ -3755,7 +3755,7 @@ impl AppState {
         self.invalidate_list_cache().await;
     }
 
-    async fn find_project(&self, project_id: &str) -> Option<ProjectSummary> {
+    pub(crate) async fn find_project(&self, project_id: &str) -> Option<ProjectSummary> {
         if let Some(project) = self.projects.read().await.get(project_id).cloned() {
             return Some(project);
         }

@@ -1471,15 +1471,20 @@ async fn list_pi_extension_commands(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize_request(&headers, &state).await?;
-    if state.get_session(&id).await.is_none() {
-        return Err(ApiError {
-            status: StatusCode::NOT_FOUND,
-            message: "session not found".to_string(),
-        });
+    let detail = state.get_session(&id).await.ok_or(ApiError {
+        status: StatusCode::NOT_FOUND,
+        message: "session not found".to_string(),
+    })?;
+    if detail.session.agent != AgentKind::Pi {
+        return Ok(Json(ApiResponse { data: Vec::new() }));
     }
-    Ok(Json(ApiResponse {
-        data: state.pi_extension_commands(&id),
-    }))
+    let mut commands = state.pi_extension_commands(&id);
+    if commands.is_empty() {
+        commands = adapter::discover_pi_extension_commands(Arc::clone(&state), &detail.session)
+            .await
+            .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    }
+    Ok(Json(ApiResponse { data: commands }))
 }
 
 async fn session_events(

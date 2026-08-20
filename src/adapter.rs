@@ -716,6 +716,69 @@ impl pi_agent_rust::sdk::ExtensionUiHandler for BridgePiExtensionUiHandler {
     }
 }
 
+fn pi_extension_commands_from_handle(
+    handle: &pi_agent_rust::sdk::AgentSessionHandle,
+) -> Vec<crate::models::PiExtensionCommand> {
+    handle
+        .session()
+        .extensions
+        .as_ref()
+        .map(|region| region.manager().list_commands())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|command| {
+            let name = command.get("name")?.as_str()?.trim();
+            if name.is_empty() {
+                return None;
+            }
+            Some(crate::models::PiExtensionCommand {
+                name: format!("/{}", name.trim_start_matches('/')),
+                description: command
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                source: command
+                    .get("extension_id")
+                    .or_else(|| command.get("source"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            })
+        })
+        .collect()
+}
+
+pub(crate) async fn discover_pi_extension_commands(
+    state: Arc<AppState>,
+    session: &SessionSummary,
+) -> Result<Vec<crate::models::PiExtensionCommand>> {
+    let extension_paths = state
+        .pi_plugins
+        .enabled_paths(&session.project_id)
+        .context("resolve managed Pi plugins for command discovery")?;
+    if extension_paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let project = state
+        .find_project(&session.project_id)
+        .await
+        .context("resolve Pi session project for command discovery")?;
+    let handle = pi_agent_rust::sdk::create_agent_session(pi_agent_rust::sdk::SessionOptions {
+        working_directory: Some(PathBuf::from(project.root_path)),
+        no_session: true,
+        extension_paths,
+        extension_ui_handler: Some(Arc::new(BridgePiExtensionUiHandler {
+            state: Arc::clone(&state),
+            session_id: session.id.clone(),
+        })),
+        ..Default::default()
+    })
+    .await
+    .context("load Pi plugins for command discovery")?;
+    let commands = pi_extension_commands_from_handle(&handle);
+    state.publish_pi_extension_commands(&session.id, commands.clone());
+    Ok(commands)
+}
+
 fn pi_activity_from_event(event: pi_agent_rust::sdk::AgentEvent) -> Option<ProviderActivity> {
     use pi_agent_rust::sdk::AgentEvent;
 
@@ -1078,32 +1141,7 @@ impl AgentProvider for PiAgentProvider {
         let mut handle = pi_agent_rust::sdk::create_agent_session(options)
             .await
             .context("create pi_agent_rust SDK session")?;
-        let extension_commands = handle
-            .session()
-            .extensions
-            .as_ref()
-            .map(|region| region.manager().list_commands())
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|command| {
-                let name = command.get("name")?.as_str()?.trim();
-                if name.is_empty() {
-                    return None;
-                }
-                Some(crate::models::PiExtensionCommand {
-                    name: format!("/{}", name.trim_start_matches('/')),
-                    description: command
-                        .get("description")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
-                    source: command
-                        .get("extension_id")
-                        .or_else(|| command.get("source"))
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
-                })
-            })
-            .collect();
+        let extension_commands = pi_extension_commands_from_handle(&handle);
         state.publish_pi_extension_commands(&session.id, extension_commands);
         if let Some(expected_provider) = expected_pi_provider {
             let (actual_provider, actual_model) = handle.model();
