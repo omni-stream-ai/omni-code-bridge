@@ -33,9 +33,9 @@ use crate::{
         ApiResponse, AppUpdateManifest, ApprovalDecisionInput, CancelSessionReplyResult,
         ClientAuthRequestInput, CreateProjectInput, CreateSessionInput, FileCompletionItem,
         FileCompletionQuery, MarkSessionReadInput, MessageListPage, MessageListQuery,
-        PiExtensionUiResponseInput, RegisterPushDeviceInput, ReplySummary, SendMessageInput,
-        SessionEvent, SummarizeReplyInput, TriggerClientMessageInput, UpdateSessionInput,
-        UploadedFileResponse,
+        PiExtensionCommand, PiExtensionUiResponseInput, RegisterPushDeviceInput, ReplySummary,
+        SendMessageInput, SessionEvent, SummarizeReplyInput, TriggerClientMessageInput,
+        UpdateSessionInput, UploadedFileResponse,
     },
     pi_plugin_store::{InstallPiPluginInput, PiPlugin, UpdatePiPluginInput},
     session_domain::CreateTurnCommand,
@@ -1480,9 +1480,18 @@ async fn list_pi_extension_commands(
     }
     let mut commands = state.pi_extension_commands(&id);
     if commands.is_empty() {
-        commands = adapter::discover_pi_extension_commands(Arc::clone(&state), &detail.session)
-            .await
-            .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+        commands = state
+            .pi_plugins
+            .declared_commands(&detail.session.project_id)
+            .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?
+            .into_iter()
+            .map(|command| PiExtensionCommand {
+                name: command.name,
+                description: None,
+                source: Some(command.source),
+            })
+            .collect();
+        state.publish_pi_extension_commands(&id, commands.clone());
     }
     Ok(Json(ApiResponse { data: commands }))
 }

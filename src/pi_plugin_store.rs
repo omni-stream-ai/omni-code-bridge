@@ -59,6 +59,12 @@ pub struct PiPlugin {
     pub permissions: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct PiPluginCommand {
+    pub name: String,
+    pub source: String,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct InstallPiPluginInput {
     pub source: PiPluginSource,
@@ -136,6 +142,43 @@ impl PiPluginStore {
             paths.push(path);
         }
         Ok(paths)
+    }
+
+    /// Extract literal command registrations without booting extension code.
+    pub fn declared_commands(&self, project_id: &str) -> Result<Vec<PiPluginCommand>> {
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| anyhow!("Pi plugin store lock poisoned"))?;
+        let mut commands = Vec::new();
+        for plugin in self.read_registry()?.plugins {
+            if !plugin.enabled
+                || (!plugin.project_ids.is_empty()
+                    && !plugin.project_ids.iter().any(|id| id == project_id))
+            {
+                continue;
+            }
+            let entry = self.safe_installed_path(&plugin.entry_path)?;
+            let root = entry
+                .parent()
+                .ok_or_else(|| anyhow!("Pi plugin entry has no parent"))?;
+            let mut files = Vec::new();
+            collect_source_files(root, &mut files)?;
+            for file in files {
+                let Ok(source) = fs::read_to_string(&file) else {
+                    continue;
+                };
+                for name in literal_registered_commands(&source) {
+                    commands.push(PiPluginCommand {
+                        name,
+                        source: plugin.name.clone(),
+                    });
+                }
+            }
+        }
+        commands.sort_by(|a, b| a.name.cmp(&b.name).then(a.source.cmp(&b.source)));
+        commands.dedup_by(|a, b| a.name == b.name && a.source == b.source);
+        Ok(commands)
     }
 
     pub async fn install(&self, input: InstallPiPluginInput) -> Result<PiPlugin> {
@@ -653,6 +696,80 @@ fn plugin_metadata(root: &Path) -> Result<(PathBuf, String, Option<String>, Vec<
     Ok((entry, name, version, permissions))
 }
 
+fn collect_source_files(root: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in
+        fs::read_dir(root).with_context(|| format!("read plugin directory {}", root.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.is_dir() {
+            collect_source_files(&path, files)?;
+        } else if metadata.is_file()
+            && matches!(
+                path.extension().and_then(|value| value.to_str()),
+                Some("js" | "ts" | "mjs" | "cjs")
+            )
+        {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn literal_registered_commands(source: &str) -> Vec<String> {
+    let mut constants = std::collections::HashMap::new();
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("const ") {
+            if let Some((name, value)) = rest.split_once('=') {
+                let name = name.trim();
+                let value = value.trim().trim_end_matches(';').trim();
+                if value.len() >= 2
+                    && matches!(value.as_bytes()[0], b'\'' | b'"')
+                    && value.as_bytes().last() == value.as_bytes().first()
+                {
+                    constants.insert(name.to_string(), value[1..value.len() - 1].to_string());
+                }
+            }
+        }
+    }
+    let needle = "registerCommand";
+    let mut commands = Vec::new();
+    let mut offset = 0;
+    while let Some(relative) = source[offset..].find(needle) {
+        let start = offset + relative + needle.len();
+        let rest = source[start..].trim_start();
+        let Some(rest) = rest.strip_prefix('(') else {
+            offset = start;
+            continue;
+        };
+        let rest = rest.trim_start();
+        let first = rest.chars().next();
+        let resolved = if let Some(quote) = first.filter(|ch| matches!(ch, '\'' | '"')) {
+            let body = &rest[quote.len_utf8()..];
+            let Some(end) = body.find(quote) else { break };
+            body[..end].trim().to_string()
+        } else {
+            let identifier = rest
+                .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+                .next()
+                .unwrap_or("");
+            constants.get(identifier).cloned().unwrap_or_default()
+        };
+        let name = resolved.trim();
+        if !name.is_empty()
+            && name
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '/'))
+        {
+            commands.push(format!("/{}", name.trim_start_matches('/')));
+        }
+        offset = start + needle.len();
+    }
+    commands
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -735,5 +852,18 @@ mod tests {
         unpack_npm_archive(&archive, &target).unwrap();
         assert_eq!(fs::read(target.join("index.js")).unwrap(), content);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn scans_literal_and_constant_command_names() {
+        let source = r#"
+            const COMMAND_NAME = "figma-remote-auth";
+            pi.registerCommand("mcp", {});
+            pi.registerCommand(COMMAND_NAME, {});
+        "#;
+        assert_eq!(
+            literal_registered_commands(source),
+            vec!["/mcp".to_string(), "/figma-remote-auth".to_string()]
+        );
     }
 }
