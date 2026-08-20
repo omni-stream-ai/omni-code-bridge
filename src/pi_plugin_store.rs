@@ -22,6 +22,7 @@ use tokio::{
 use uuid::Uuid;
 
 const MAX_PLUGIN_BYTES: usize = 25 * 1024 * 1024;
+const PIJS_BUNDLE_NAME: &str = ".omni-pijs-bundle.mjs";
 const MAX_PLUGIN_FILES: usize = 2_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -292,6 +293,8 @@ impl PiPluginStore {
                     .ok_or_else(|| anyhow!("npm pack did not produce a package archive"))?;
                 unpack_npm_archive(&archive, staging)?;
                 fs::remove_file(archive)?;
+                install_npm_dependencies(staging).await?;
+                bundle_npm_plugin(staging).await?;
             }
             PiPluginSourceKind::Upload => {
                 let encoded = input
@@ -621,6 +624,83 @@ fn unpack_npm_archive(archive: &Path, target: &Path) -> Result<()> {
     Ok(())
 }
 
+async fn install_npm_dependencies(root: &Path) -> Result<()> {
+    let output = timeout(
+        Duration::from_secs(300),
+        Command::new("npm")
+            .args([
+                "install",
+                "--omit=dev",
+                "--ignore-scripts",
+                "--no-audit",
+                "--no-fund",
+            ])
+            .env("npm_config_ignore_scripts", "true")
+            .current_dir(root)
+            .output(),
+    )
+    .await
+    .map_err(|_| anyhow!("npm dependency installation timed out after 300 seconds"))??;
+    if !output.status.success() {
+        bail!(
+            "npm dependency installation failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+async fn bundle_npm_plugin(root: &Path) -> Result<()> {
+    let (entry, _, _, _) = plugin_metadata(root)?;
+    let output = timeout(
+        Duration::from_secs(300),
+        Command::new("npm")
+            .args([
+                "exec",
+                "--yes",
+                "--package=esbuild@0.28.2",
+                "--",
+                "esbuild",
+            ])
+            .arg(&entry)
+            .args([
+                "--bundle",
+                "--platform=node",
+                "--format=esm",
+                "--minify-identifiers",
+                "--banner:js=import { createRequire as __omniCreateRequire } from \"node:module\"; const require = __omniCreateRequire(import.meta.url);",
+                "--external:@earendil-works/pi-coding-agent",
+                "--external:@earendil-works/pi-ai",
+                "--external:@earendil-works/pi-ai/compat",
+                "--external:@earendil-works/pi-tui",
+                "--external:typebox",
+                "--external:node:*",
+            ])
+            .arg(format!("--outfile={PIJS_BUNDLE_NAME}"))
+            .env("npm_config_ignore_scripts", "true")
+            .current_dir(root)
+            .output(),
+    )
+    .await
+    .map_err(|_| anyhow!("npm plugin bundling timed out after 300 seconds"))??;
+    if !output.status.success() {
+        bail!(
+            "npm plugin bundling failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    if !root.join(PIJS_BUNDLE_NAME).is_file() {
+        bail!("npm plugin bundling did not produce {PIJS_BUNDLE_NAME}");
+    }
+    let dependencies = root.join("node_modules");
+    if dependencies.exists() {
+        tokio::fs::remove_dir_all(dependencies)
+            .await
+            .context("remove bundled npm dependencies")?;
+    }
+    Ok(())
+}
+
 fn scan_tree(root: &Path) -> Result<()> {
     let temp = tempfile_scan(root)?;
     ensure_size(temp.1)?;
@@ -675,10 +755,14 @@ fn digest_tree(root: &Path) -> Result<String> {
 }
 fn plugin_metadata(root: &Path) -> Result<(PathBuf, String, Option<String>, Vec<String>)> {
     let spec = resolve_extension_load_spec(root).map_err(|e| anyhow!(e.to_string()))?;
-    let (entry, fallback_name, fallback_version) = match spec {
+    let (mut entry, fallback_name, fallback_version) = match spec {
         ExtensionLoadSpec::Js(s) => (s.entry_path, s.name, s.version),
         ExtensionLoadSpec::NativeRust(s) => (s.entry_path, s.name, s.version),
     };
+    let bundled_entry = root.join(PIJS_BUNDLE_NAME);
+    if bundled_entry.is_file() {
+        entry = bundled_entry;
+    }
     let manifest = load_extension_manifest(root).map_err(|e| anyhow!(e.to_string()))?;
     let name = manifest
         .as_ref()
@@ -865,5 +949,32 @@ mod tests {
             literal_registered_commands(source),
             vec!["/mcp".to_string(), "/figma-remote-auth".to_string()]
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires npm registry access"]
+    async fn installs_npm_plugin_as_pijs_bundle() {
+        let (root, store) = store();
+        let plugin = store
+            .install(InstallPiPluginInput {
+                source: PiPluginSource {
+                    kind: PiPluginSourceKind::Npm,
+                    value: "npm:pi-mcp-adapter@2.26.1".into(),
+                },
+                id: Some("mcp-adapter".into()),
+                sha256: None,
+                content_base64: None,
+                file_name: None,
+                enabled: true,
+                project_ids: Vec::new(),
+                config: Map::new(),
+            })
+            .await
+            .expect("npm plugin should install");
+        assert!(plugin.entry_path.ends_with(PIJS_BUNDLE_NAME));
+        assert!(root.join(&plugin.entry_path).is_file());
+        assert!(!root.join("installed/mcp-adapter/node_modules").exists());
+        let commands = store.declared_commands("").expect("scan commands");
+        assert!(commands.iter().any(|command| command.name == "/mcp"));
     }
 }

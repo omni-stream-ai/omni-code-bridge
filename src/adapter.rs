@@ -1577,6 +1577,23 @@ export default function init(pi) {
         assert!(result.to_string().contains(r#"\"allowed\":true"#));
     }
 
+    #[tokio::test]
+    #[ignore = "requires a locally bundled pi-mcp-adapter fixture"]
+    async fn bundled_pi_mcp_adapter_loads_in_sdk() {
+        let path = std::env::var("PI_MCP_BUNDLE_PATH").expect("PI_MCP_BUNDLE_PATH is required");
+        let handle = pi_agent_rust::sdk::create_agent_session(pi_agent_rust::sdk::SessionOptions {
+            working_directory: Some(std::env::temp_dir()),
+            no_session: true,
+            extension_paths: vec![PathBuf::from(path)],
+            ..Default::default()
+        })
+        .await
+        .expect("bundled MCP adapter should load");
+        let commands = pi_extension_commands_from_handle(&handle);
+        assert!(commands.iter().any(|command| command.name == "/mcp"));
+        assert!(commands.iter().any(|command| command.name == "/mcp-auth"));
+    }
+
     #[test]
     fn codex_streaming_state_parses_content_status_and_completion() {
         let mut state = CodexAppServerStreamingState::default();
