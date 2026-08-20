@@ -586,6 +586,53 @@ pub struct ApprovalDecisionInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PiExtensionUiRequest {
+    pub request_id: String,
+    pub method: String,
+    pub payload: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extension_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PiExtensionUiRequestEvent {
+    pub session_id: String,
+    pub request: PiExtensionUiRequest,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PiExtensionUiResponseInput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<serde_json::Value>,
+    #[serde(default)]
+    pub cancelled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PiExtensionUiResolvedEvent {
+    pub session_id: String,
+    pub request_id: String,
+    pub cancelled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PiExtensionCommand {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PiExtensionCommandsEvent {
+    pub session_id: String,
+    pub commands: Vec<PiExtensionCommand>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum SessionEvent {
     SessionSnapshot(SessionSummary),
@@ -597,6 +644,9 @@ pub enum SessionEvent {
     AgentError(AgentErrorEvent),
     ApprovalRequested(ApprovalRequestEvent),
     ApprovalResolved(ApprovalResolvedEvent),
+    PiExtensionUiRequested(PiExtensionUiRequestEvent),
+    PiExtensionUiResolved(PiExtensionUiResolvedEvent),
+    PiExtensionCommandsUpdated(PiExtensionCommandsEvent),
 }
 
 #[derive(Debug, Clone, Serialize)]

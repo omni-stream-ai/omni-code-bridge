@@ -33,8 +33,9 @@ use crate::{
         ApiResponse, AppUpdateManifest, ApprovalDecisionInput, CancelSessionReplyResult,
         ClientAuthRequestInput, CreateProjectInput, CreateSessionInput, FileCompletionItem,
         FileCompletionQuery, MarkSessionReadInput, MessageListPage, MessageListQuery,
-        RegisterPushDeviceInput, ReplySummary, SendMessageInput, SessionEvent, SummarizeReplyInput,
-        TriggerClientMessageInput, UpdateSessionInput, UploadedFileResponse,
+        PiExtensionUiResponseInput, RegisterPushDeviceInput, ReplySummary, SendMessageInput,
+        SessionEvent, SummarizeReplyInput, TriggerClientMessageInput, UpdateSessionInput,
+        UploadedFileResponse,
     },
     pi_plugin_store::{InstallPiPluginInput, PiPlugin, UpdatePiPluginInput},
     session_domain::CreateTurnCommand,
@@ -86,6 +87,11 @@ pub fn router() -> Router<Arc<AppState>> {
             "/sessions/{id}/approvals/{request_id}",
             post(resolve_approval),
         )
+        .route(
+            "/sessions/{id}/pi-ui/{request_id}",
+            post(resolve_pi_extension_ui),
+        )
+        .route("/sessions/{id}/pi-ui", get(list_pending_pi_extension_ui))
         .route("/sessions/{id}/events", get(session_events))
         .route(
             "/v2/sessions",
@@ -99,6 +105,15 @@ pub fn router() -> Router<Arc<AppState>> {
         .route(
             "/v2/sessions/{id}/approvals/{request_id}",
             post(resolve_approval),
+        )
+        .route(
+            "/v2/sessions/{id}/pi-ui/{request_id}",
+            post(resolve_pi_extension_ui),
+        )
+        .route("/v2/sessions/{id}/pi-ui", get(list_pending_pi_extension_ui))
+        .route(
+            "/v2/sessions/{id}/pi-commands",
+            get(list_pi_extension_commands),
         )
         .route("/v2/sessions/{id}/state", get(domain_session_state))
         .route(
@@ -1419,6 +1434,54 @@ async fn resolve_approval(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn resolve_pi_extension_ui(
+    Path((id, request_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Json(input): Json<PiExtensionUiResponseInput>,
+) -> Result<impl IntoResponse, ApiError> {
+    authorize_request(&headers, &state).await?;
+    state
+        .resolve_pi_extension_ui(&id, &request_id, input)
+        .await
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_pending_pi_extension_ui(
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, ApiError> {
+    authorize_request(&headers, &state).await?;
+    if state.get_session(&id).await.is_none() {
+        return Err(ApiError {
+            status: StatusCode::NOT_FOUND,
+            message: "session not found".to_string(),
+        });
+    }
+    Ok(Json(ApiResponse {
+        data: state.pending_pi_extension_ui(&id).await,
+    }))
+}
+
+async fn list_pi_extension_commands(
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, ApiError> {
+    authorize_request(&headers, &state).await?;
+    if state.get_session(&id).await.is_none() {
+        return Err(ApiError {
+            status: StatusCode::NOT_FOUND,
+            message: "session not found".to_string(),
+        });
+    }
+    Ok(Json(ApiResponse {
+        data: state.pi_extension_commands(&id),
+    }))
+}
+
 async fn session_events(
     Path(id): Path<String>,
     headers: HeaderMap,
@@ -2016,6 +2079,9 @@ fn event_belongs_to_session(event: &SessionEvent, session_id: &str) -> bool {
         SessionEvent::AgentError(error) => error.session_id == session_id,
         SessionEvent::ApprovalRequested(event) => event.session_id == session_id,
         SessionEvent::ApprovalResolved(event) => event.session_id == session_id,
+        SessionEvent::PiExtensionUiRequested(event) => event.session_id == session_id,
+        SessionEvent::PiExtensionUiResolved(event) => event.session_id == session_id,
+        SessionEvent::PiExtensionCommandsUpdated(event) => event.session_id == session_id,
     }
 }
 
@@ -2027,6 +2093,9 @@ fn global_session_event(event: &SessionEvent) -> bool {
             | SessionEvent::AgentError(_)
             | SessionEvent::ApprovalRequested(_)
             | SessionEvent::ApprovalResolved(_)
+            | SessionEvent::PiExtensionUiRequested(_)
+            | SessionEvent::PiExtensionUiResolved(_)
+            | SessionEvent::PiExtensionCommandsUpdated(_)
     )
 }
 
@@ -2041,6 +2110,9 @@ fn event_name(event: &SessionEvent) -> &'static str {
         SessionEvent::AgentError(_) => "agent.error",
         SessionEvent::ApprovalRequested(_) => "approval.requested",
         SessionEvent::ApprovalResolved(_) => "approval.resolved",
+        SessionEvent::PiExtensionUiRequested(_) => "pi_ui.requested",
+        SessionEvent::PiExtensionUiResolved(_) => "pi_ui.resolved",
+        SessionEvent::PiExtensionCommandsUpdated(_) => "pi_commands.updated",
     }
 }
 
@@ -2543,8 +2615,8 @@ mod tests {
         domain_session_state, encode_session_event, get_acp_agent_diagnostic, global_session_event,
         hydrate_domain_sse_event_or_reset, list_completion_items, list_domain_sessions,
         mark_domain_session_read, normalize_completion_prefix, paginate_messages,
-        preferred_language, resolve_approval, resolve_path_within_root, sanitize_upload_file_name,
-        sanitize_upload_lookup_id, session_events, uploads_dir,
+        preferred_language, resolve_approval, resolve_path_within_root, resolve_pi_extension_ui,
+        sanitize_upload_file_name, sanitize_upload_lookup_id, session_events, uploads_dir,
     };
     use crate::{
         app_state::AppState,
@@ -2553,8 +2625,8 @@ mod tests {
             AcpProfile, AcpServerConfig, AgentKind, AgentReadiness, ApprovalChoice,
             ApprovalDecisionInput, ApprovalKind, ApprovalRequest, ChatMessage,
             ClientAuthRequestInput, CreateProjectInput, CreateSessionInput, FileCompletionQuery,
-            HeaderKeyValue, InputMode, MessageListQuery, MessageRole, SessionEvent,
-            TriggerClientMessageInput,
+            HeaderKeyValue, InputMode, MessageListQuery, MessageRole, PiExtensionUiRequest,
+            PiExtensionUiResponseInput, SessionEvent, TriggerClientMessageInput,
         },
         session_domain::{Attachment, CreateTurnCommand},
     };
@@ -3211,6 +3283,62 @@ mod tests {
             crate::models::SessionStatus::Running
         ));
         assert!(resolved.session.pending_approval.is_none());
+    }
+
+    #[tokio::test]
+    async fn pi_extension_ui_handler_routes_response_by_session_and_request_id() {
+        let state = test_state("pi-ui-handler").await;
+        let session_id = create_api_test_session(&state, "pi-ui").await;
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let receiver = state
+            .request_pi_extension_ui(
+                &session_id,
+                PiExtensionUiRequest {
+                    request_id: request_id.clone(),
+                    method: "confirm".to_string(),
+                    payload: serde_json::json!({"title": "Allow access?"}),
+                    extension_id: Some("test-extension".to_string()),
+                    timeout_ms: Some(30_000),
+                },
+            )
+            .await
+            .expect("request should be registered");
+        let duplicate = state
+            .request_pi_extension_ui(
+                &session_id,
+                PiExtensionUiRequest {
+                    request_id: request_id.clone(),
+                    method: "confirm".to_string(),
+                    payload: serde_json::json!({}),
+                    extension_id: None,
+                    timeout_ms: Some(30_000),
+                },
+            )
+            .await;
+        assert_eq!(
+            duplicate.expect_err("duplicate request should fail"),
+            "duplicate Pi extension UI request id"
+        );
+
+        let response = resolve_pi_extension_ui(
+            axum::extract::Path((session_id, request_id)),
+            authorized_headers(&state).await,
+            State(Arc::clone(&state)),
+            Json(PiExtensionUiResponseInput {
+                value: Some(serde_json::json!({"allow": true, "persist": false})),
+                cancelled: false,
+            }),
+        )
+        .await
+        .expect("response should be routed")
+        .into_response();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let resolved = receiver.await.expect("handler should receive response");
+        assert_eq!(
+            resolved.value,
+            Some(serde_json::json!({"allow": true, "persist": false}))
+        );
+        assert!(!resolved.cancelled);
     }
 
     #[tokio::test]

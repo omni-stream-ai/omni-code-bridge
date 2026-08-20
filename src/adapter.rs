@@ -652,6 +652,70 @@ struct StubProvider {
 /// In-process provider backed by pi_agent_rust's stable SDK surface.
 struct PiAgentProvider;
 
+struct BridgePiExtensionUiHandler {
+    state: Arc<AppState>,
+    session_id: String,
+}
+
+struct PendingPiUiCleanup {
+    state: Arc<AppState>,
+    session_id: String,
+    request_id: String,
+    armed: bool,
+}
+
+impl Drop for PendingPiUiCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            self.state
+                .cancel_pi_extension_ui_sync(&self.session_id, &self.request_id);
+        }
+    }
+}
+
+#[async_trait]
+impl pi_agent_rust::sdk::ExtensionUiHandler for BridgePiExtensionUiHandler {
+    async fn request_ui(
+        &self,
+        request: pi_agent_rust::extensions::ExtensionUiRequest,
+    ) -> pi_agent_rust::PiResult<Option<pi_agent_rust::extensions::ExtensionUiResponse>> {
+        let request_id = request.id.clone();
+        let timeout_ms = request.timeout_ms.unwrap_or(120_000).clamp(1_000, 600_000);
+        let receiver = self
+            .state
+            .request_pi_extension_ui(
+                &self.session_id,
+                crate::models::PiExtensionUiRequest {
+                    request_id: request.id.clone(),
+                    method: request.method,
+                    payload: request.payload,
+                    extension_id: request.extension_id,
+                    timeout_ms: Some(timeout_ms),
+                },
+            )
+            .await
+            .map_err(pi_agent_rust::Error::session)?;
+        let mut cleanup = PendingPiUiCleanup {
+            state: Arc::clone(&self.state),
+            session_id: self.session_id.clone(),
+            request_id: request_id.clone(),
+            armed: true,
+        };
+        let response = receiver.await;
+        cleanup.armed = false;
+        match response {
+            Ok(response) if !response.cancelled => {
+                Ok(Some(pi_agent_rust::extensions::ExtensionUiResponse {
+                    id: request_id,
+                    value: response.value,
+                    cancelled: false,
+                }))
+            }
+            Ok(_) | Err(_) => Ok(None),
+        }
+    }
+}
+
 fn pi_activity_from_event(event: pi_agent_rust::sdk::AgentEvent) -> Option<ProviderActivity> {
     use pi_agent_rust::sdk::AgentEvent;
 
@@ -1005,11 +1069,42 @@ impl AgentProvider for PiAgentProvider {
             working_directory: Some(cwd),
             no_session: true,
             extension_paths,
+            extension_ui_handler: Some(Arc::new(BridgePiExtensionUiHandler {
+                state: Arc::clone(&state),
+                session_id: session.id.clone(),
+            })),
             ..Default::default()
         };
         let mut handle = pi_agent_rust::sdk::create_agent_session(options)
             .await
             .context("create pi_agent_rust SDK session")?;
+        let extension_commands = handle
+            .session()
+            .extensions
+            .as_ref()
+            .map(|region| region.manager().list_commands())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|command| {
+                let name = command.get("name")?.as_str()?.trim();
+                if name.is_empty() {
+                    return None;
+                }
+                Some(crate::models::PiExtensionCommand {
+                    name: format!("/{}", name.trim_start_matches('/')),
+                    description: command
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    source: command
+                        .get("extension_id")
+                        .or_else(|| command.get("source"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                })
+            })
+            .collect();
+        state.publish_pi_extension_commands(&session.id, extension_commands);
         if let Some(expected_provider) = expected_pi_provider {
             let (actual_provider, actual_model) = handle.model();
             let unexpected_model = expected_pi_model
@@ -1351,6 +1446,129 @@ mod tests {
         .expect("failed tool activity");
         assert_eq!(activity.state, EntityState::Failed);
         assert_eq!(activity.kind, ActivityKind::ToolResult);
+    }
+
+    #[tokio::test]
+    async fn pi_extension_tools_commands_events_and_ui_complete_end_to_end() {
+        let state = Arc::new(test_state("pi-extension-e2e").await);
+        let root = std::env::temp_dir().join(format!(
+            "omni-code-pi-extension-e2e-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("extension directory should be created");
+        let extension_path = root.join("bridge-probe.js");
+        std::fs::write(
+            &extension_path,
+            r#"
+export default function init(pi) {
+  let eventSeen = false;
+  pi.registerTool({
+    name: "bridge_probe_tool",
+    description: "Bridge probe tool",
+    parameters: { type: "object", properties: {} },
+    execute: async () => ({ content: [{ type: "text", text: "tool-ok" }] }),
+  });
+  pi.on("agent_start", async () => { eventSeen = true; });
+  pi.registerCommand("bridge-probe", {
+    description: "Exercise the Bridge UI protocol",
+    handler: async () => {
+      const allowed = await pi.ui("confirm", {
+        title: "Bridge probe",
+        message: "Allow the test command?"
+      });
+      return JSON.stringify({ eventSeen, allowed });
+    },
+  });
+}
+"#,
+        )
+        .expect("extension source should be written");
+
+        let project = state
+            .create_project(crate::models::CreateProjectInput {
+                name: "Pi Extension E2E".to_string(),
+                root_path: root.to_string_lossy().to_string(),
+            })
+            .await;
+        let session = state
+            .create_session(crate::models::CreateSessionInput {
+                client_session_id: uuid::Uuid::new_v4().to_string(),
+                project_id: project.id,
+                title: Some("Pi Extension E2E".to_string()),
+                agent: AgentKind::Pi,
+                brief_reply_mode: false,
+                provider_id: Some(AUTO_PROVIDER_ID.to_string()),
+                reasoning_effort: None,
+                model: None,
+            })
+            .await
+            .expect("Pi session should be created");
+
+        let mut handle =
+            pi_agent_rust::sdk::create_agent_session(pi_agent_rust::sdk::SessionOptions {
+                working_directory: Some(root),
+                no_session: true,
+                extension_paths: vec![extension_path],
+                extension_ui_handler: Some(Arc::new(BridgePiExtensionUiHandler {
+                    state: Arc::clone(&state),
+                    session_id: session.id.clone(),
+                })),
+                ..Default::default()
+            })
+            .await
+            .expect("Pi extension session should load");
+        let region = handle
+            .session_mut()
+            .extensions
+            .as_ref()
+            .expect("extension region should be present");
+        let manager = region.manager().clone();
+        assert!(manager.list_commands().iter().any(|command| {
+            command.get("name").and_then(Value::as_str) == Some("bridge-probe")
+        }));
+        manager
+            .dispatch_event(
+                pi_agent_rust::extensions::ExtensionEventName::AgentStart,
+                Some(serde_json::json!({})),
+            )
+            .await
+            .expect("extension event should be dispatched");
+
+        let response_state = Arc::clone(&state);
+        let response_session_id = session.id.clone();
+        let responder = tokio::spawn(async move {
+            for _ in 0..200 {
+                if let Some(request) = response_state
+                    .pending_pi_extension_ui(&response_session_id)
+                    .await
+                    .into_iter()
+                    .next()
+                {
+                    assert_eq!(request.method, "confirm");
+                    response_state
+                        .resolve_pi_extension_ui(
+                            &response_session_id,
+                            &request.request_id,
+                            crate::models::PiExtensionUiResponseInput {
+                                value: Some(Value::Bool(true)),
+                                cancelled: false,
+                            },
+                        )
+                        .await
+                        .expect("UI response should resolve");
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("Pi UI request was not published");
+        });
+        let result = manager
+            .execute_command("bridge-probe", "", 30_000)
+            .await
+            .expect("extension command should complete");
+        responder.await.expect("UI responder should complete");
+        assert!(result.to_string().contains(r#"\"eventSeen\":true"#));
+        assert!(result.to_string().contains(r#"\"allowed\":true"#));
     }
 
     #[test]

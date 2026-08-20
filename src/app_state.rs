@@ -12,7 +12,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::{
-    sync::{Mutex, RwLock, broadcast, mpsc},
+    sync::{Mutex, RwLock, broadcast, mpsc, oneshot},
     task::AbortHandle,
 };
 use uuid::Uuid;
@@ -37,6 +37,8 @@ use crate::{
         ApprovalRequestEvent, ApprovalResolvedEvent, ChatMessage, ClientAuthRecord,
         ClientAuthRequestInput, ClientAuthStatus, CreateProjectInput, CreateSessionInput,
         GitStatusDetail, InputMode, MessageRole, MessageSnapshotEvent, ModelProviderConfig,
+        PiExtensionCommand, PiExtensionCommandsEvent, PiExtensionUiRequest,
+        PiExtensionUiRequestEvent, PiExtensionUiResolvedEvent, PiExtensionUiResponseInput,
         ProjectGitStatus, ProjectSummary, PushDeviceRegistration, RegisterPushDeviceInput,
         ResolvedProviderConfig, SendMessageInput, SessionDetail, SessionDiffEvent, SessionEvent,
         SessionStatus, SessionStatusEvent, SessionSummary, TriggerClientMessageInput,
@@ -74,6 +76,11 @@ struct SessionRuntimeState {
     turn_abort: Option<AbortHandle>,
     turn_in_flight: bool,
     interrupted: bool,
+}
+
+struct PendingPiExtensionUi {
+    request: PiExtensionUiRequest,
+    sender: oneshot::Sender<PiExtensionUiResponseInput>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -221,6 +228,8 @@ pub struct AppState {
     devices: RwLock<HashMap<String, PushDeviceRegistration>>,
     list_cache: Mutex<Option<AggregatedListCache>>,
     runtime: Mutex<HashMap<String, SessionRuntimeState>>,
+    pending_pi_ui: StdMutex<HashMap<(String, String), PendingPiExtensionUi>>,
+    pi_extension_commands: StdMutex<HashMap<String, Vec<PiExtensionCommand>>>,
     event_tx: broadcast::Sender<SequencedSessionEvent>,
     event_stream: StdMutex<EventStreamState>,
     providers: ProviderRegistry,
@@ -372,6 +381,8 @@ impl AppState {
                     })
                     .collect(),
             ),
+            pending_pi_ui: StdMutex::new(HashMap::new()),
+            pi_extension_commands: StdMutex::new(HashMap::new()),
             event_tx,
             event_stream: StdMutex::new(EventStreamState {
                 next_event_id: 1,
@@ -478,6 +489,8 @@ impl AppState {
                     })
                     .collect(),
             ),
+            pending_pi_ui: StdMutex::new(HashMap::new()),
+            pi_extension_commands: StdMutex::new(HashMap::new()),
             event_tx,
             event_stream: StdMutex::new(EventStreamState {
                 next_event_id: 1,
@@ -582,6 +595,8 @@ impl AppState {
                     })
                     .collect(),
             ),
+            pending_pi_ui: StdMutex::new(HashMap::new()),
+            pi_extension_commands: StdMutex::new(HashMap::new()),
             event_tx,
             event_stream: StdMutex::new(EventStreamState {
                 next_event_id: 1,
@@ -3202,6 +3217,112 @@ impl AppState {
                 error: None,
             },
         );
+    }
+
+    pub async fn request_pi_extension_ui(
+        &self,
+        session_id: &str,
+        request: PiExtensionUiRequest,
+    ) -> Result<oneshot::Receiver<PiExtensionUiResponseInput>, String> {
+        if self.find_session(session_id).await.is_none() {
+            return Err("session not found".to_string());
+        }
+        let key = (session_id.to_string(), request.request_id.clone());
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut pending = self
+                .pending_pi_ui
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if pending.contains_key(&key) {
+                return Err("duplicate Pi extension UI request id".to_string());
+            }
+            pending.insert(
+                key,
+                PendingPiExtensionUi {
+                    request: request.clone(),
+                    sender: tx,
+                },
+            );
+        }
+        self.publish_event(SessionEvent::PiExtensionUiRequested(
+            PiExtensionUiRequestEvent {
+                session_id: session_id.to_string(),
+                request,
+            },
+        ));
+        Ok(rx)
+    }
+
+    pub fn publish_pi_extension_commands(
+        &self,
+        session_id: &str,
+        commands: Vec<PiExtensionCommand>,
+    ) {
+        self.pi_extension_commands
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session_id.to_string(), commands.clone());
+        self.publish_event(SessionEvent::PiExtensionCommandsUpdated(
+            PiExtensionCommandsEvent {
+                session_id: session_id.to_string(),
+                commands,
+            },
+        ));
+    }
+
+    pub fn pi_extension_commands(&self, session_id: &str) -> Vec<PiExtensionCommand> {
+        self.pi_extension_commands
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub async fn pending_pi_extension_ui(&self, session_id: &str) -> Vec<PiExtensionUiRequest> {
+        self.pending_pi_ui
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|((pending_session_id, _), _)| pending_session_id == session_id)
+            .map(|(_, pending)| pending.request.clone())
+            .collect()
+    }
+
+    pub async fn resolve_pi_extension_ui(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        response: PiExtensionUiResponseInput,
+    ) -> Result<(), String> {
+        let key = (session_id.to_string(), request_id.to_string());
+        let pending = self
+            .pending_pi_ui
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&key)
+            .ok_or_else(|| "Pi extension UI request not found or already resolved".to_string())?;
+        let cancelled = response.cancelled;
+        pending
+            .sender
+            .send(response)
+            .map_err(|_| "Pi extension UI request is no longer active".to_string())?;
+        self.publish_event(SessionEvent::PiExtensionUiResolved(
+            PiExtensionUiResolvedEvent {
+                session_id: session_id.to_string(),
+                request_id: request_id.to_string(),
+                cancelled,
+            },
+        ));
+        Ok(())
+    }
+
+    pub(crate) fn cancel_pi_extension_ui_sync(&self, session_id: &str, request_id: &str) {
+        self.pending_pi_ui
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&(session_id.to_string(), request_id.to_string()));
     }
 
     pub async fn resolve_approval(
