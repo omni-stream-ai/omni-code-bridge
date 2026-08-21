@@ -1291,6 +1291,82 @@ impl AgentProvider for PiAgentProvider {
                     .await
                     .context("resume pi_agent_rust prompt after network unreachable")?
             }
+            Err(error) if pi_rate_limit_error(&error) => {
+                let mut last_error = error;
+                let mut assistant = None;
+                for attempt in 1..=PI_RATE_LIMIT_MAX_RETRIES {
+                    let delay = pi_rate_limit_retry_delay(attempt)
+                        .expect("rate limit retry delay exists within retry budget");
+                    state
+                        .emit_provider_activity(
+                            &session.id,
+                            ProviderActivity {
+                                correlation_key: Some("pi:rate-limit-retry".to_string()),
+                                kind: ActivityKind::Progress,
+                                state: EntityState::Running,
+                                title: format!(
+                                    "[pi:retry] rate limited; retrying in {}s ({}/{})",
+                                    delay.as_secs(),
+                                    attempt,
+                                    PI_RATE_LIMIT_MAX_RETRIES
+                                ),
+                                payload: serde_json::json!({
+                                    "source": "pi",
+                                    "reason": "rate_limit",
+                                    "attempt": attempt,
+                                    "max_attempts": PI_RATE_LIMIT_MAX_RETRIES,
+                                    "delay_ms": delay.as_millis()
+                                }),
+                            },
+                        )
+                        .await;
+                    sleep(delay).await;
+                    let event_handler = Arc::clone(&pi_event_handler);
+                    match handle
+                        .continue_turn(move |event| event_handler(event))
+                        .await
+                    {
+                        Ok(value) => {
+                            state
+                                .emit_provider_activity(
+                                    &session.id,
+                                    ProviderActivity {
+                                        correlation_key: Some("pi:rate-limit-retry".to_string()),
+                                        kind: ActivityKind::Progress,
+                                        state: EntityState::Completed,
+                                        title: format!(
+                                            "[pi:retry] rate limit cleared after {} attempt{}",
+                                            attempt,
+                                            if attempt == 1 { "" } else { "s" }
+                                        ),
+                                        payload: serde_json::json!({
+                                            "source": "pi",
+                                            "reason": "rate_limit",
+                                            "attempt": attempt,
+                                            "recovered": true
+                                        }),
+                                    },
+                                )
+                                .await;
+                            assistant = Some(value);
+                            break;
+                        }
+                        Err(next_error) if pi_rate_limit_error(&next_error) => {
+                            last_error = next_error;
+                        }
+                        Err(next_error) => {
+                            return Err(next_error)
+                                .context("resume pi_agent_rust prompt after rate limit");
+                        }
+                    }
+                }
+                assistant.ok_or_else(|| {
+                    anyhow::Error::new(last_error).context(format!(
+                        "resume pi_agent_rust prompt after rate limit ({} retries exhausted)",
+                        PI_RATE_LIMIT_MAX_RETRIES
+                    ))
+                })?
+            }
             Err(error) => return Err(error).context("run pi_agent_rust prompt"),
         };
         drop(pi_event_handler);
@@ -1327,6 +1403,26 @@ impl AgentProvider for PiAgentProvider {
 fn pi_network_unreachable(error: &pi_agent_rust::sdk::Error) -> bool {
     let message = error.to_string().to_ascii_lowercase();
     message.contains("network is unreachable") || message.contains("os error 101")
+}
+
+const PI_RATE_LIMIT_MAX_RETRIES: usize = 3;
+
+fn pi_rate_limit_error(error: &pi_agent_rust::sdk::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("429")
+        || message.contains("rate_limit")
+        || message.contains("rate limit")
+        || message.contains("requests-per-minute")
+        || message.contains("too many requests")
+}
+
+fn pi_rate_limit_retry_delay(attempt: usize) -> Option<Duration> {
+    match attempt {
+        1 => Some(Duration::from_secs(5)),
+        2 => Some(Duration::from_secs(15)),
+        3 => Some(Duration::from_secs(30)),
+        _ => None,
+    }
 }
 
 impl StubProvider {
@@ -1396,6 +1492,26 @@ mod tests {
     };
     use crate::session_domain::{CreateTurnCommand, TurnStatus};
     use std::time::Duration;
+
+    #[test]
+    fn pi_rate_limit_retry_policy_is_bounded() {
+        assert_eq!(pi_rate_limit_retry_delay(1), Some(Duration::from_secs(5)));
+        assert_eq!(pi_rate_limit_retry_delay(2), Some(Duration::from_secs(15)));
+        assert_eq!(pi_rate_limit_retry_delay(3), Some(Duration::from_secs(30)));
+        assert_eq!(pi_rate_limit_retry_delay(4), None);
+    }
+
+    #[test]
+    fn pi_rate_limit_error_matches_provider_limit_only() {
+        let error = |message: &str| pi_agent_rust::sdk::Error::provider("test", message);
+        assert!(pi_rate_limit_error(&error("HTTP 429: rate_limit_exceeded")));
+        assert!(pi_rate_limit_error(&error(
+            "user requests-per-minute limit exceeded"
+        )));
+        assert!(pi_rate_limit_error(&error("too many requests")));
+        assert!(!pi_rate_limit_error(&error("HTTP 401: invalid api key")));
+        assert!(!pi_rate_limit_error(&error("network is unreachable")));
+    }
 
     #[test]
     fn provider_registry_has_provider_for_every_agent_kind() {
