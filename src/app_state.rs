@@ -276,6 +276,19 @@ impl AppState {
     const MAX_PERSISTED_DIFF_CHARS: usize = 200_000;
     const STALE_RUNNING_SESSION_DAYS: i64 = 7;
 
+    /// Stable on-disk Pi transcript location for a bridge session.
+    ///
+    /// Pi owns the JSONL format; the bridge only allocates one isolated file
+    /// per Omni session so subsequent prompts can reuse the same context.
+    pub(crate) fn pi_session_path(&self, session_id: &str) -> PathBuf {
+        let root = self
+            .session_metadata_store_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("pi-sessions");
+        root.join(format!("{session_id}.jsonl"))
+    }
+
     #[allow(dead_code)]
     pub async fn new() -> Self {
         let settings_path = crate::bridge_settings::settings_path();

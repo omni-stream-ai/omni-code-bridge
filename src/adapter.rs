@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use base64::Engine as _;
 use futures_util::StreamExt;
 use serde_json::Value;
 use tokio::{
@@ -1098,7 +1099,8 @@ impl AgentProvider for PiAgentProvider {
                 .map(|config| config.api_key.clone()),
             system_prompt,
             working_directory: Some(cwd),
-            no_session: true,
+            no_session: false,
+            session_path: Some(state.pi_session_path(&session.id)),
             extension_paths,
             extension_ui_handler: Some(Arc::new(BridgePiExtensionUiHandler {
                 state: Arc::clone(&state),
@@ -1261,9 +1263,10 @@ impl AgentProvider for PiAgentProvider {
             }
             let _ = pi_event_tx.send(event);
         });
+        let prompt_content = pi_prompt_content(&input.content).await?;
         let event_handler = Arc::clone(&pi_event_handler);
         let assistant = match handle
-            .prompt(input.content, move |event| event_handler(event))
+            .prompt_with_content(prompt_content, move |event| event_handler(event))
             .await
         {
             Ok(assistant) => assistant,
@@ -1413,6 +1416,97 @@ fn pi_network_unreachable(error: &pi_agent_rust::sdk::Error) -> bool {
     message.contains("network is unreachable") || message.contains("os error 101")
 }
 
+/// Convert bridge attachment markdown into the structured content Pi expects.
+/// The API currently carries attachments alongside text as `![name](path)`;
+/// keeping this conversion at the Pi boundary preserves the existing API
+/// contract while ensuring vision-capable providers receive actual image data.
+async fn pi_prompt_content(input: &str) -> Result<Vec<pi_agent_rust::model::ContentBlock>> {
+    use pi_agent_rust::model::{ContentBlock, TextContent};
+
+    let mut blocks = Vec::new();
+    let mut text_start = 0;
+    let mut cursor = 0;
+    while let Some(relative_start) = input[cursor..].find("![") {
+        let start = cursor + relative_start;
+        let Some(label_end) = input[start + 2..].find("](") else {
+            break;
+        };
+        let url_start = start + 2 + label_end + 2;
+        let Some(end_rel) = input[url_start..].find(')') else {
+            break;
+        };
+        let end = url_start + end_rel;
+        let raw_source = input[url_start..end].trim();
+        let source = raw_source
+            .strip_prefix('<')
+            .and_then(|value| value.strip_suffix('>'))
+            .unwrap_or(raw_source);
+        let image = match pi_image_content(source).await {
+            Ok(image) => image,
+            Err(_) => {
+                cursor = end + 1;
+                continue;
+            }
+        };
+        let preceding = input[text_start..start].trim();
+        if !preceding.is_empty() {
+            blocks.push(ContentBlock::Text(TextContent::new(preceding)));
+        }
+        blocks.push(ContentBlock::Image(image));
+        cursor = end + 1;
+        text_start = cursor;
+    }
+    let trailing = input[text_start..].trim();
+    if !trailing.is_empty() {
+        blocks.push(ContentBlock::Text(TextContent::new(trailing)));
+    }
+    if blocks.is_empty() {
+        blocks.push(ContentBlock::Text(TextContent::new(input)));
+    }
+    Ok(blocks)
+}
+
+async fn pi_image_content(source: &str) -> Result<pi_agent_rust::model::ImageContent> {
+    let (mime_type, data) = if let Some((header, encoded)) = source.split_once(",")
+        && let Some(mime_type) = header
+            .strip_prefix("data:")
+            .and_then(|value| value.strip_suffix(";base64"))
+    {
+        (
+            mime_type.to_string(),
+            base64::engine::general_purpose::STANDARD.decode(encoded)?,
+        )
+    } else {
+        let path = std::path::Path::new(source);
+        let data = tokio::fs::read(path)
+            .await
+            .with_context(|| format!("read Pi image attachment {}", path.display()))?;
+        (pi_image_mime_type(path), data)
+    };
+    Ok(pi_agent_rust::model::ImageContent {
+        data: base64::engine::general_purpose::STANDARD.encode(data),
+        mime_type,
+    })
+}
+
+fn pi_image_mime_type(path: &Path) -> String {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("avif") => "image/avif",
+        Some("bmp") => "image/bmp",
+        Some("svg") => "image/svg+xml",
+        _ => "image/png",
+    }
+    .to_string()
+}
+
 const PI_RATE_LIMIT_MAX_RETRIES: usize = 3;
 
 fn pi_rate_limit_error(error: &pi_agent_rust::sdk::Error) -> bool {
@@ -1499,6 +1593,7 @@ mod tests {
         SendMessageInput, SessionStatus,
     };
     use crate::session_domain::{CreateTurnCommand, TurnStatus};
+    use pi_agent_rust::model::TextContent;
     use std::time::Duration;
 
     #[test]
@@ -1519,6 +1614,37 @@ mod tests {
         assert!(pi_rate_limit_error(&error("too many requests")));
         assert!(!pi_rate_limit_error(&error("HTTP 401: invalid api key")));
         assert!(!pi_rate_limit_error(&error("network is unreachable")));
+    }
+
+    #[tokio::test]
+    async fn pi_prompt_content_preserves_text_and_decodes_inline_image() {
+        let blocks =
+            pi_prompt_content("请分析这张图：\n\n![截图](<data:image/png;base64,SGVsbG8=>)")
+                .await
+                .expect("structured Pi prompt");
+        assert!(matches!(
+            blocks.first(),
+            Some(pi_agent_rust::model::ContentBlock::Text(TextContent { text, .. }))
+                if text.contains("请分析这张图")
+        ));
+        assert!(matches!(
+            blocks.get(1),
+            Some(pi_agent_rust::model::ContentBlock::Image(image))
+                if image.mime_type == "image/png" && image.data == "SGVsbG8="
+        ));
+    }
+
+    #[tokio::test]
+    async fn pi_prompt_content_keeps_plain_text_without_images() {
+        let blocks = pi_prompt_content("继续刚才的分析")
+            .await
+            .expect("text prompt");
+        assert_eq!(blocks.len(), 1);
+        assert!(matches!(
+            &blocks[0],
+            pi_agent_rust::model::ContentBlock::Text(TextContent { text, .. })
+                if text == "继续刚才的分析"
+        ));
     }
 
     #[test]
