@@ -1089,6 +1089,13 @@ impl AgentProvider for PiAgentProvider {
             .as_ref()
             .map(|config| configure_pi_provider(config, &session.id, selected_model.as_deref()))
             .transpose()?;
+        let pi_session_path = state.pi_session_path(&session.id);
+        ensure_pi_session_file(
+            &pi_session_path,
+            &cwd,
+            pi_provider.as_deref(),
+            selected_model.as_deref(),
+        )?;
         let expected_pi_provider = pi_provider.clone();
         let expected_pi_model = selected_model.clone();
         let options = pi_agent_rust::sdk::SessionOptions {
@@ -1100,7 +1107,7 @@ impl AgentProvider for PiAgentProvider {
             system_prompt,
             working_directory: Some(cwd),
             no_session: false,
-            session_path: Some(state.pi_session_path(&session.id)),
+            session_path: Some(pi_session_path),
             extension_paths,
             extension_ui_handler: Some(Arc::new(BridgePiExtensionUiHandler {
                 state: Arc::clone(&state),
@@ -1416,6 +1423,46 @@ fn pi_network_unreachable(error: &pi_agent_rust::sdk::Error) -> bool {
     message.contains("network is unreachable") || message.contains("os error 101")
 }
 
+fn ensure_pi_session_file(
+    path: &Path,
+    cwd: &Path,
+    provider: Option<&str>,
+    model: Option<&str>,
+) -> Result<()> {
+    let Some(parent) = path.parent() else {
+        bail!("Pi session path has no parent: {}", path.display());
+    };
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("create Pi session directory {}", parent.display()))?;
+    if path.exists() {
+        return Ok(());
+    }
+
+    let mut header = pi_agent_rust::session::SessionHeader::new();
+    header.cwd = cwd.display().to_string();
+    header.provider = provider.map(str::to_string);
+    header.model_id = model.map(str::to_string);
+    let contents = format!("{}\n", serde_json::to_string(&header)?);
+    use std::io::ErrorKind;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(mut file) => {
+            use std::io::Write;
+            file.write_all(contents.as_bytes())
+                .with_context(|| format!("initialize Pi session {}", path.display()))?;
+        }
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("create Pi session file {}", path.display()));
+        }
+    }
+    Ok(())
+}
+
 /// Convert bridge attachment markdown into the structured content Pi expects.
 /// The API currently carries attachments alongside text as `![name](path)`;
 /// keeping this conversion at the Pi boundary preserves the existing API
@@ -1614,6 +1661,33 @@ mod tests {
         assert!(pi_rate_limit_error(&error("too many requests")));
         assert!(!pi_rate_limit_error(&error("HTTP 401: invalid api key")));
         assert!(!pi_rate_limit_error(&error("network is unreachable")));
+    }
+
+    #[test]
+    fn ensure_pi_session_file_initializes_missing_jsonl() {
+        let root = std::env::temp_dir().join(format!("omni-pi-session-{}", uuid::Uuid::new_v4()));
+        let path = root.join("session.jsonl");
+        ensure_pi_session_file(
+            &path,
+            Path::new("/tmp/project"),
+            Some("provider"),
+            Some("model"),
+        )
+        .expect("initialize session file");
+        let contents = std::fs::read_to_string(&path).expect("read session file");
+        let header: serde_json::Value = serde_json::from_str(contents.trim()).expect("header json");
+        assert_eq!(header["type"], "session");
+        assert_eq!(header["cwd"], "/tmp/project");
+        assert_eq!(header["provider"], "provider");
+        assert_eq!(header["modelId"], "model");
+        ensure_pi_session_file(&path, Path::new("/tmp/other"), None, None)
+            .expect("existing session file is retained");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read retained file"),
+            contents
+        );
+        std::fs::remove_file(&path).expect("remove test session file");
+        std::fs::remove_dir(&root).expect("remove test session directory");
     }
 
     #[tokio::test]
