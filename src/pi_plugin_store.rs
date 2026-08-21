@@ -818,14 +818,20 @@ fn literal_registered_commands(source: &str) -> Vec<String> {
             }
         }
     }
-    let needle = "registerCommand";
     let mut commands = Vec::new();
-    let mut offset = 0;
-    while let Some(relative) = source[offset..].find(needle) {
-        let start = offset + relative + needle.len();
+    let mut matches = Vec::new();
+    for needle in ["registerCommand", "registerMcpCommand"] {
+        let mut offset = 0;
+        while let Some(relative) = source[offset..].find(needle) {
+            let start = offset + relative + needle.len();
+            matches.push(start);
+            offset = start;
+        }
+    }
+    matches.sort_unstable();
+    for start in matches {
         let rest = source[start..].trim_start();
         let Some(rest) = rest.strip_prefix('(') else {
-            offset = start;
             continue;
         };
         let rest = rest.trim_start();
@@ -849,7 +855,6 @@ fn literal_registered_commands(source: &str) -> Vec<String> {
         {
             commands.push(format!("/{}", name.trim_start_matches('/')));
         }
-        offset = start + needle.len();
     }
     commands
 }
@@ -948,6 +953,19 @@ mod tests {
         assert_eq!(
             literal_registered_commands(source),
             vec!["/mcp".to_string(), "/figma-remote-auth".to_string()]
+        );
+    }
+
+    #[test]
+    fn scans_plugin_command_aliases() {
+        let source = r#"
+            const registerMcpCommand = (name) => pi.registerCommand(name, {});
+            registerMcpCommand("mcp");
+            pi.registerCommand("mcp-auth", {});
+        "#;
+        assert_eq!(
+            literal_registered_commands(source),
+            vec!["/mcp", "/mcp-auth"]
         );
     }
 
