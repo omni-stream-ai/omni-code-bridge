@@ -1287,6 +1287,10 @@ impl AgentProvider for PiAgentProvider {
                     .await;
                 let event_handler = Arc::clone(&pi_event_handler);
                 handle
+                    .revert_incomplete_response()
+                    .await
+                    .context("prepare Pi turn after network unreachable")?;
+                handle
                     .continue_turn(move |event| event_handler(event))
                     .await
                     .context("resume pi_agent_rust prompt after network unreachable")?
@@ -1321,6 +1325,10 @@ impl AgentProvider for PiAgentProvider {
                         )
                         .await;
                     sleep(delay).await;
+                    handle
+                        .revert_incomplete_response()
+                        .await
+                        .context("prepare Pi turn after rate limit")?;
                     let event_handler = Arc::clone(&pi_event_handler);
                     match handle
                         .continue_turn(move |event| event_handler(event))
