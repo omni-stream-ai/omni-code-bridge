@@ -705,7 +705,9 @@ impl SessionDomainStore {
             sequence: 1,
             revision: 1,
             purpose: MessagePurpose::User,
-            state: EntityState::Completed,
+            // Creating a turn only durably accepts the request. The user message
+            // must not look sent until the provider actually starts processing it.
+            state: EntityState::Pending,
             content: content.to_string(),
             attachments: command.attachments.clone(),
             created_at: now,
@@ -1020,6 +1022,19 @@ impl SessionDomainStore {
                 ("artifact.updated", Some(artifact_id), Some(revision))
             }
             AgentProjection::TurnStatus { status, error } => {
+                let user_message_state = match status {
+                    TurnStatus::Accepted => EntityState::Pending,
+                    TurnStatus::Running => EntityState::Running,
+                    TurnStatus::AwaitingApproval => EntityState::AwaitingApproval,
+                    TurnStatus::Completed => EntityState::Completed,
+                    TurnStatus::Cancelled => EntityState::Cancelled,
+                    TurnStatus::Failed => EntityState::Failed,
+                };
+                if turn.user_message.state != user_message_state {
+                    turn.user_message.state = user_message_state;
+                    turn.user_message.revision += 1;
+                    turn.user_message.updated_at = now;
+                }
                 if turn.status.is_terminal() {
                     return Ok(());
                 }
@@ -1591,7 +1606,21 @@ mod tests {
         assert_eq!(first.cursor, duplicate.cursor);
         let state = store.session_state("session-1").unwrap().unwrap();
         assert_eq!(state.turns.len(), 1);
+        assert_eq!(state.turns[0].user_message.state, EntityState::Pending);
         assert_eq!(state.cursor, 2);
+
+        store
+            .project_agent_event(
+                "session-1",
+                "turn-1",
+                AgentProjection::TurnStatus {
+                    status: TurnStatus::Failed,
+                    error: Some("provider unavailable".to_string()),
+                },
+            )
+            .unwrap();
+        let failed = store.session_state("session-1").unwrap().unwrap();
+        assert_eq!(failed.turns[0].user_message.state, EntityState::Failed);
 
         let mut conflicting = command.clone();
         conflicting.content = "different".to_string();

@@ -1080,7 +1080,11 @@ impl AgentProvider for PiAgentProvider {
         );
         extension_paths.sort();
         extension_paths.dedup();
-        let cwd = std::env::current_dir().context("resolve pi agent working directory")?;
+        let project_root = state
+            .project_root_path_for_session(&session.id)
+            .await
+            .map_err(anyhow::Error::msg)?;
+        let cwd = resolve_pi_working_directory(Path::new(&project_root))?;
         let selected_model = session
             .model
             .clone()
@@ -1187,10 +1191,7 @@ impl AgentProvider for PiAgentProvider {
                 "name" => {
                     let name = parts.collect::<Vec<_>>().join(" ");
                     if !name.is_empty() {
-                        handle
-                            .set_session_name(name)
-                            .await
-                            .context("set pi session name")?;
+                        set_pi_session_title(&state, &session.id, &mut handle, name).await?;
                         state
                             .emit_assistant_message_snapshot(
                                 &session.id,
@@ -1421,6 +1422,33 @@ impl AgentProvider for PiAgentProvider {
 fn pi_network_unreachable(error: &pi_agent_rust::sdk::Error) -> bool {
     let message = error.to_string().to_ascii_lowercase();
     message.contains("network is unreachable") || message.contains("os error 101")
+}
+
+fn resolve_pi_working_directory(project_root: &Path) -> Result<PathBuf> {
+    let cwd = project_root
+        .canonicalize()
+        .with_context(|| format!("resolve Pi project directory {}", project_root.display()))?;
+    if !cwd.is_dir() {
+        bail!("Pi project path is not a directory: {}", cwd.display());
+    }
+    Ok(cwd)
+}
+
+async fn set_pi_session_title(
+    state: &AppState,
+    session_id: &str,
+    handle: &mut pi_agent_rust::sdk::AgentSessionHandle,
+    title: String,
+) -> Result<()> {
+    handle
+        .set_session_name(title.clone())
+        .await
+        .context("set Pi session name")?;
+    state
+        .update_session_title(session_id, title)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    Ok(())
 }
 
 fn ensure_pi_session_file(
@@ -1690,6 +1718,25 @@ mod tests {
         std::fs::remove_dir(&root).expect("remove test session directory");
     }
 
+    #[test]
+    fn pi_working_directory_uses_the_project_root() {
+        let root = std::env::temp_dir().join(format!("omni-pi-project-{}", uuid::Uuid::new_v4()));
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested).expect("create project directory");
+
+        let resolved = resolve_pi_working_directory(&nested).expect("resolve project directory");
+        assert_eq!(
+            resolved,
+            nested.canonicalize().expect("canonical project path")
+        );
+
+        let file = root.join("not-a-directory");
+        std::fs::write(&file, b"test").expect("create project file");
+        assert!(resolve_pi_working_directory(&file).is_err());
+
+        std::fs::remove_dir_all(&root).expect("remove project directory");
+    }
+
     #[tokio::test]
     async fn pi_prompt_content_preserves_text_and_decodes_inline_image() {
         let blocks =
@@ -1847,6 +1894,23 @@ export default function init(pi) {
             })
             .await
             .expect("Pi extension session should load");
+        set_pi_session_title(
+            &state,
+            &session.id,
+            &mut handle,
+            "Renamed Pi Session".to_string(),
+        )
+        .await
+        .expect("Pi session title should synchronize");
+        assert_eq!(
+            state
+                .get_session(&session.id)
+                .await
+                .expect("renamed Bridge session should exist")
+                .session
+                .title,
+            "Renamed Pi Session"
+        );
         let region = handle
             .session_mut()
             .extensions
@@ -4671,6 +4735,7 @@ for line in sys.stdin:
             .unwrap()
             .unwrap();
         assert_eq!(domain.turns[0].status, TurnStatus::Failed);
+        assert_eq!(domain.turns[0].user_message.state, EntityState::Failed);
         assert!(domain.session.active_turn_id.is_none());
     }
 

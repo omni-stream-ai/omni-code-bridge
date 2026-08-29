@@ -76,6 +76,7 @@ struct SessionRuntimeState {
     turn_abort: Option<AbortHandle>,
     turn_in_flight: bool,
     interrupted: bool,
+    interruption_reason: Option<String>,
 }
 
 struct PendingPiExtensionUi {
@@ -99,6 +100,8 @@ struct PersistedSessionRuntimeState {
     pending_approval: Option<ApprovalRequest>,
     #[serde(default, skip_serializing_if = "is_false")]
     interrupted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    interruption_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -156,6 +159,7 @@ impl SessionRuntimeState {
             turn_abort: None,
             turn_in_flight: false,
             interrupted: value.interrupted,
+            interruption_reason: value.interruption_reason,
         }
     }
 
@@ -168,6 +172,7 @@ impl SessionRuntimeState {
             claude_model: self.claude_model.clone(),
             pending_approval: self.pending_approval.clone(),
             interrupted: self.interrupted,
+            interruption_reason: self.interruption_reason.clone(),
         }
     }
 }
@@ -710,6 +715,8 @@ impl AppState {
             };
             self.update_runtime_state(&session_id, |runtime| {
                 runtime.interrupted = was_interrupted;
+                runtime.interruption_reason =
+                    was_interrupted.then(|| "bridge_restart_recovery".to_string());
                 runtime.turn_in_flight = false;
                 runtime.turn_abort = None;
                 runtime.cancel_tx = None;
@@ -717,8 +724,22 @@ impl AppState {
                 runtime.pending_approval = None;
             })
             .await;
+            if was_interrupted {
+                debug_log!(
+                    "[domain] recovered interrupted turn session={session_id} reason=bridge_restart_recovery"
+                );
+            }
             self.persist_canonical_session(&summary).await?;
             self.publish_event(SessionEvent::SessionSnapshot(summary));
+            if was_interrupted {
+                self.publish_event(SessionEvent::SessionStatus(SessionStatusEvent {
+                    session_id: session_id.clone(),
+                    status: SessionStatus::Interrupted,
+                    error_message: Some(
+                        "bridge_restart_recovery: bridge 在本轮完成前重启或连接中断".to_string(),
+                    ),
+                }));
+            }
         }
         self.invalidate_list_cache().await;
         Ok(())
@@ -1101,7 +1122,30 @@ impl AppState {
             }
             (None, None) => Vec::new(),
         };
+        let failed_user_message_ids = self.failed_domain_user_message_ids(session_id);
+        let messages = messages
+            .into_iter()
+            .filter(|message| {
+                message.role != MessageRole::User || !failed_user_message_ids.contains(&message.id)
+            })
+            .collect();
         Some(sort_messages(messages))
+    }
+
+    fn failed_domain_user_message_ids(&self, session_id: &str) -> HashSet<String> {
+        self.session_domain
+            .session_state(session_id)
+            .ok()
+            .flatten()
+            .map(|state| {
+                state
+                    .turns
+                    .into_iter()
+                    .filter(|turn| turn.status == TurnStatus::Failed)
+                    .map(|turn| turn.user_message.id)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     pub async fn codex_turn_can_retry(&self, session_id: &str, message_id: &str) -> bool {
@@ -1245,6 +1289,7 @@ impl AppState {
                 turn_abort: None,
                 turn_in_flight: false,
                 interrupted: false,
+                interruption_reason: None,
             },
         );
         self.invalidate_list_cache().await;
@@ -1996,6 +2041,7 @@ impl AppState {
             }
             entry.turn_in_flight = true;
             entry.interrupted = false;
+            entry.interruption_reason = None;
             entry.current_turn_id = domain_turn_id.clone();
         })
         .await;
@@ -2036,7 +2082,13 @@ impl AppState {
 
         if matches!(session_snapshot.agent, AgentKind::Custom) {
             let user_message = ChatMessage {
-                id: Uuid::new_v4().to_string(),
+                id: if domain_turn_id.is_some() {
+                    client_message_id
+                        .clone()
+                        .unwrap_or_else(|| Uuid::new_v4().to_string())
+                } else {
+                    Uuid::new_v4().to_string()
+                },
                 session_id: session_id.to_string(),
                 role: MessageRole::User,
                 content: decorate_user_content(&input),
@@ -2075,7 +2127,13 @@ impl AppState {
         }
 
         let user_message = ChatMessage {
-            id: Uuid::new_v4().to_string(),
+            id: if domain_turn_id.is_some() {
+                client_message_id
+                    .clone()
+                    .unwrap_or_else(|| Uuid::new_v4().to_string())
+            } else {
+                Uuid::new_v4().to_string()
+            },
             session_id: session_id.to_string(),
             role: MessageRole::User,
             content: decorate_user_content(&input),
@@ -2291,6 +2349,7 @@ impl AppState {
             entry.pending_approval = None;
             if should_interrupt {
                 entry.interrupted = true;
+                entry.interruption_reason = Some("client_cancel".to_string());
             }
             let snapshot = runtime
                 .iter()
@@ -2331,6 +2390,13 @@ impl AppState {
         } else {
             false
         };
+
+        debug_log!(
+            "[cancel] session={canonical_session_id} interrupted={} provider_cancel={} result={}",
+            should_interrupt,
+            provider_cancelled,
+            should_interrupt || provider_cancelled,
+        );
 
         if should_interrupt || provider_cancelled {
             let preview = self
@@ -2862,6 +2928,14 @@ impl AppState {
         if !self.bound_domain_turn_is_active(session_id) {
             return;
         }
+        // A client message is cached optimistically before the provider starts. A
+        // failed turn must not make a retry with the same id look successful. There
+        // can only be one in-flight message per session, so remove all cached
+        // results for this session when that turn fails.
+        self.client_message_results
+            .write()
+            .await
+            .retain(|(cached_session_id, _), _| cached_session_id != session_id);
         self.patch_session(session_id, SessionStatus::Failed, Some(message.clone()))
             .await;
         self.clear_interrupted(session_id).await;
@@ -2893,6 +2967,7 @@ impl AppState {
         }
         self.update_runtime_state(session_id, |entry| {
             entry.interrupted = true;
+            entry.interruption_reason = Some("worker_abort".to_string());
             entry.approval_tx = None;
             entry.pending_approval = None;
         })
@@ -3398,6 +3473,7 @@ impl AppState {
     async fn clear_interrupted(&self, session_id: &str) {
         self.update_runtime_state(session_id, |entry| {
             entry.interrupted = false;
+            entry.interruption_reason = None;
         })
         .await;
     }
@@ -7258,6 +7334,16 @@ mod tests {
         assert_eq!(snapshot.session.status, DomainSessionStatus::Failed);
         assert_eq!(snapshot.session.active_turn_id, None);
         assert_eq!(snapshot.turns[0].status, TurnStatus::Failed);
+
+        let messages = state
+            .list_messages(&session.id)
+            .await
+            .expect("failed session messages should load");
+        assert!(
+            messages
+                .iter()
+                .all(|message| message.id != command.user_message_id)
+        );
 
         let retry_error = state
             .send_message(
