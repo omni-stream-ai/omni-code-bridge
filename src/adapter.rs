@@ -2027,6 +2027,60 @@ export default function init(pi) {
     }
 
     #[test]
+    fn codex_skill_response_and_explicit_input_use_app_server_metadata() {
+        let skills = parse_codex_skills_response(&serde_json::json!({
+            "data": [{
+                "cwd": "/repo",
+                "skills": [
+                    {"name": "review", "description": "Review changes", "path": "/repo/.agents/skills/review/SKILL.md", "enabled": true},
+                    {"name": "disabled", "description": "Disabled", "path": "/tmp/disabled/SKILL.md", "enabled": false}
+                ],
+                "errors": []
+            }]
+        }));
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "review");
+
+        assert_eq!(
+            codex_user_input("$review focus on tests", &skills),
+            vec![
+                serde_json::json!({"type": "skill", "name": "review", "path": "/repo/.agents/skills/review/SKILL.md"}),
+                serde_json::json!({"type": "text", "text": "focus on tests", "text_elements": []}),
+            ]
+        );
+        assert_eq!(
+            codex_user_input("$missing keep literal", &skills),
+            vec![
+                serde_json::json!({"type": "text", "text": "$missing keep literal", "text_elements": []})
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_skill_disk_fallback_discovers_repository_frontmatter() {
+        let root = std::env::temp_dir().join(format!(
+            "omni-code-skill-discovery-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let skill_dir = root.join(".agents/skills/repo-review");
+        std::fs::create_dir_all(&skill_dir).expect("create skill fixture");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: \"repo-review\"\ndescription: Review this repository\n---\n",
+        )
+        .expect("write skill fixture");
+
+        let skills = discover_codex_skills_from_disk(&root);
+        let skill = skills
+            .iter()
+            .find(|skill| skill.name == "repo-review")
+            .expect("repository skill should be discovered");
+        assert_eq!(skill.description, "Review this repository");
+        assert!(skill.path.ends_with("repo-review/SKILL.md"));
+        std::fs::remove_dir_all(root).expect("remove skill fixture");
+    }
+
+    #[test]
     fn codex_streaming_state_exposes_reasoning_and_unknown_event_context() {
         let mut state = CodexAppServerStreamingState::default();
 
@@ -2651,8 +2705,7 @@ export default function init(pi) {
     #[test]
     fn codex_command_status_snapshot_recovers_missed_terminal_event() {
         let response = serde_json::json!({
-            "thread": {
-                "turns": [{
+            "data": [{
                     "id": "turn-1",
                     "status": "completed",
                     "items": [{
@@ -2664,7 +2717,6 @@ export default function init(pi) {
                         "exitCode": 0
                     }]
                 }]
-            }
         });
 
         let snapshot = command_status_snapshot(&response, "cmd-1");
@@ -2685,6 +2737,63 @@ export default function init(pi) {
         assert_eq!(
             approval_result_json(&ApprovalChoice::AcceptForSession, &ApprovalKind::ApplyPatch),
             serde_json::json!({ "decision": "approved_for_session" })
+        );
+    }
+
+    #[test]
+    fn codex_permission_approval_grants_only_requested_permissions() {
+        let pending = PendingApproval {
+            request: ApprovalRequest {
+                request_id: "permission-1".to_string(),
+                kind: ApprovalKind::Permissions,
+                command: None,
+                reason: None,
+                auto_approval_reason: None,
+                auto_approval_reason_kind: None,
+                allow_accept_for_session: false,
+                allow_cancel: true,
+                resolvable: true,
+            },
+            last_choice: None,
+            protocol_payload: Some(serde_json::json!({
+                "network": null,
+                "fileSystem": {
+                    "read": null,
+                    "write": ["/repo/generated"],
+                    "entries": null
+                }
+            })),
+        };
+
+        assert_eq!(
+            approval_result_for_pending(&ApprovalChoice::Accept, &pending),
+            serde_json::json!({
+                "permissions": {
+                    "network": null,
+                    "fileSystem": {
+                        "read": null,
+                        "write": ["/repo/generated"],
+                        "entries": null
+                    }
+                },
+                "scope": "turn"
+            })
+        );
+    }
+
+    #[test]
+    fn codex_user_input_result_normalizes_client_answers() {
+        assert_eq!(
+            codex_user_input_result(Some(serde_json::json!({
+                "choice": "fast",
+                "targets": ["api", "tests"]
+            }))),
+            serde_json::json!({
+                "answers": {
+                    "choice": {"answers": ["fast"]},
+                    "targets": {"answers": ["api", "tests"]}
+                }
+            })
         );
     }
 
@@ -4171,6 +4280,7 @@ for line in sys.stdin:
         previous_binary: Option<std::ffi::OsString>,
         previous_scenario: Option<std::ffi::OsString>,
         previous_log: Option<std::ffi::OsString>,
+        previous_codex_home: Option<std::ffi::OsString>,
         pub log_path: PathBuf,
     }
 
@@ -4186,6 +4296,8 @@ for line in sys.stdin:
             );
             let script_path = std::env::temp_dir().join(format!("mock-codex-{unique}.py"));
             let log_path = std::env::temp_dir().join(format!("mock-codex-{unique}.log"));
+            let codex_home = std::env::temp_dir().join(format!("mock-codex-home-{unique}"));
+            std::fs::create_dir_all(&codex_home).expect("mock Codex home should be created");
             std::fs::write(&script_path, MOCK_CODEX_APP_SERVER)
                 .expect("mock Codex app-server should be written");
             let mut permissions = std::fs::metadata(&script_path)
@@ -4198,16 +4310,19 @@ for line in sys.stdin:
             let previous_binary = std::env::var_os("OMNI_CODE_CODEX_BIN");
             let previous_scenario = std::env::var_os("OMNI_CODE_MOCK_CODEX_SCENARIO");
             let previous_log = std::env::var_os("OMNI_CODE_MOCK_CODEX_LOG");
+            let previous_codex_home = std::env::var_os("CODEX_HOME");
             // SAFETY: Codex subprocess tests are serialized by `codex_test_lock`.
             unsafe {
                 std::env::set_var("OMNI_CODE_CODEX_BIN", &script_path);
                 std::env::set_var("OMNI_CODE_MOCK_CODEX_SCENARIO", scenario);
                 std::env::set_var("OMNI_CODE_MOCK_CODEX_LOG", &log_path);
+                std::env::set_var("CODEX_HOME", codex_home);
             }
             Self {
                 previous_binary,
                 previous_scenario,
                 previous_log,
+                previous_codex_home,
                 log_path,
             }
         }
@@ -4232,6 +4347,7 @@ for line in sys.stdin:
                 self.previous_scenario.as_ref(),
             );
             restore("OMNI_CODE_MOCK_CODEX_LOG", self.previous_log.as_ref());
+            restore("CODEX_HOME", self.previous_codex_home.as_ref());
         }
     }
 
@@ -4290,6 +4406,9 @@ for line in sys.stdin:
             write({"jsonrpc":"2.0","method":"item/completed","params":{"item":{"id":"cmd-1","type":"commandExecution","command":"cargo test","status":"completed","exitCode":0}}})
             write({"jsonrpc":"2.0","method":"turn/diff/updated","params":{"turnId":"mock-turn","diff":"diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1 +1 @@\n-old\n+new"}})
             complete()
+    elif method == "turn/interrupt":
+        write({"jsonrpc":"2.0","id":request_id,"result":{}})
+        write({"jsonrpc":"2.0","method":"turn/completed","params":{"turn":{"id":"mock-turn","status":"interrupted"}}})
     elif request_id == 77:
         if value.get("result", {}).get("decision") != "accept":
             sys.stderr.write("unexpected approval response: " + json.dumps(value) + "\n")
@@ -4676,7 +4795,7 @@ for line in sys.stdin:
     #[tokio::test]
     async fn codex_provider_cancel_interrupts_live_domain_turn() {
         let _lock = codex_test_lock().await;
-        let _mock = MockCodexEnvironment::new("cancel");
+        let mock = MockCodexEnvironment::new("cancel");
         let state = Arc::new(test_state("codex-full-chain-cancel").await);
         let session = create_mock_codex_session(&state, "cancel").await;
 
@@ -4703,6 +4822,9 @@ for line in sys.stdin:
             .unwrap();
         assert_eq!(domain.turns[0].status, TurnStatus::Cancelled);
         assert!(domain.session.active_turn_id.is_none());
+        let methods =
+            std::fs::read_to_string(&mock.log_path).expect("mock Codex request log should exist");
+        assert_eq!(methods.matches("turn/interrupt\n").count(), 1);
     }
 
     #[cfg(unix)]
@@ -5209,6 +5331,221 @@ struct CachedCodexArchive {
 
 struct CodexProvider {
     cache: Mutex<Option<CachedCodexArchive>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexSkill {
+    pub name: String,
+    pub description: String,
+    pub path: String,
+}
+
+fn parse_codex_skills_response(result: &Value) -> Vec<CodexSkill> {
+    let mut skills = result
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .flat_map(|entry| {
+            entry
+                .get("skills")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .filter(|skill| {
+            skill
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(true)
+        })
+        .filter_map(|skill| {
+            Some(CodexSkill {
+                name: skill.get("name")?.as_str()?.to_string(),
+                description: skill.get("description")?.as_str()?.to_string(),
+                path: skill.get("path")?.as_str()?.to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+    skills.sort_by(|left, right| left.name.cmp(&right.name).then(left.path.cmp(&right.path)));
+    skills.dedup_by(|left, right| left.name == right.name && left.path == right.path);
+    skills
+}
+
+fn codex_user_input(content: &str, skills: &[CodexSkill]) -> Vec<Value> {
+    let trimmed = content.trim_start();
+    let token_end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
+    let token = &trimmed[..token_end];
+    let Some(skill_name) = token.strip_prefix('$').filter(|name| !name.is_empty()) else {
+        return vec![serde_json::json!({
+            "type": "text",
+            "text": content,
+            "text_elements": [],
+        })];
+    };
+    let Some(skill) = skills.iter().find(|skill| skill.name == skill_name) else {
+        return vec![serde_json::json!({
+            "type": "text",
+            "text": content,
+            "text_elements": [],
+        })];
+    };
+
+    let mut input = vec![serde_json::json!({
+        "type": "skill",
+        "name": skill.name,
+        "path": skill.path,
+    })];
+    let prompt = trimmed[token_end..].trim_start();
+    if !prompt.is_empty() {
+        input.push(serde_json::json!({
+            "type": "text",
+            "text": prompt,
+            "text_elements": [],
+        }));
+    }
+    input
+}
+
+async fn list_codex_skills_from_app_server(cwd: &Path) -> Result<Vec<CodexSkill>> {
+    let mut child = spawn_codex_app_server(cwd).context("failed to spawn Codex skill discovery")?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("codex process did not expose stdin")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("codex process did not expose stdout")?;
+    let mut lines = BufReader::new(stdout).lines();
+    let (stdout_tx, mut stdout_rx) =
+        mpsc::unbounded_channel::<std::result::Result<String, String>>();
+    tokio::spawn(async move {
+        while let Ok(Some(line)) = lines.next_line().await {
+            let _ = stdout_tx.send(Ok(line));
+        }
+    });
+    let mut next_request_id = 1_u64;
+    let mut raw_stdout = String::new();
+    let initialize_id = send_json_rpc_request(
+        &mut stdin,
+        &mut next_request_id,
+        "initialize",
+        serde_json::json!({
+            "clientInfo": {"name": "omni-code-bridge", "version": env!("CARGO_PKG_VERSION")},
+            "capabilities": {"experimentalApi": true},
+        }),
+    )
+    .await?;
+    wait_for_json_rpc_response(&mut stdout_rx, &mut raw_stdout, initialize_id).await?;
+    send_json_rpc_notification(&mut stdin, "initialized", None).await?;
+    let request_id = send_json_rpc_request(
+        &mut stdin,
+        &mut next_request_id,
+        "skills/list",
+        serde_json::json!({"cwds": [cwd.to_string_lossy()], "forceReload": false}),
+    )
+    .await?;
+    let result = wait_for_json_rpc_response(&mut stdout_rx, &mut raw_stdout, request_id).await?;
+    let _ = child.kill().await;
+    Ok(parse_codex_skills_response(&result))
+}
+
+fn unquote_skill_value(value: &str) -> String {
+    let value = value.trim();
+    if value.len() >= 2
+        && ((value.starts_with('"') && value.ends_with('"'))
+            || (value.starts_with('\'') && value.ends_with('\'')))
+    {
+        value[1..value.len() - 1].to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn read_skill_metadata(path: &Path) -> Option<CodexSkill> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let mut lines = content.lines();
+    if lines.next()?.trim() != "---" {
+        return None;
+    }
+    let mut name = None;
+    let mut description = None;
+    for line in lines {
+        let line = line.trim();
+        if line == "---" {
+            break;
+        }
+        if let Some(value) = line.strip_prefix("name:") {
+            name = Some(unquote_skill_value(value));
+        } else if let Some(value) = line.strip_prefix("description:") {
+            description = Some(unquote_skill_value(value));
+        }
+    }
+    let name = name.filter(|value| !value.is_empty())?;
+    Some(CodexSkill {
+        name,
+        description: description.unwrap_or_default(),
+        path: path
+            .canonicalize()
+            .unwrap_or_else(|_| path.to_path_buf())
+            .to_string_lossy()
+            .to_string(),
+    })
+}
+
+fn collect_skill_files(root: &Path, skills: &mut Vec<CodexSkill>) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_skill_files(&path, skills);
+        } else if path.file_name().and_then(|name| name.to_str()) == Some("SKILL.md")
+            && let Some(skill) = read_skill_metadata(&path)
+        {
+            skills.push(skill);
+        }
+    }
+}
+
+fn discover_codex_skills_from_disk(cwd: &Path) -> Vec<CodexSkill> {
+    let mut roots = Vec::new();
+    for ancestor in cwd.ancestors() {
+        roots.push(ancestor.join(".agents/skills"));
+        if ancestor.join(".git").exists() {
+            break;
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        roots.push(home.join(".agents/skills"));
+    }
+    roots.push(PathBuf::from("/etc/codex/skills"));
+    roots.push(codex_home_dir().join("skills"));
+
+    let mut skills = Vec::new();
+    for root in roots {
+        collect_skill_files(&root, &mut skills);
+    }
+    skills.sort_by(|left, right| left.name.cmp(&right.name).then(left.path.cmp(&right.path)));
+    skills.dedup_by(|left, right| left.name == right.name && left.path == right.path);
+    skills
+}
+
+pub async fn list_codex_skills(cwd: &Path) -> Result<Vec<CodexSkill>> {
+    match list_codex_skills_from_app_server(cwd).await {
+        Ok(skills) => Ok(skills),
+        Err(error)
+            if error
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("method not found") =>
+        {
+            Ok(discover_codex_skills_from_disk(cwd))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 impl CodexProvider {
@@ -6009,7 +6346,7 @@ fn spawn_codex_app_server_with_config(
     cwd: &Path,
     provider_config: Option<&ResolvedProviderConfig>,
     codex_provider_name: Option<&str>,
-    reasoning_effort: Option<ReasoningEffort>,
+    _reasoning_effort: Option<ReasoningEffort>,
 ) -> Result<Child> {
     let binary = codex_binary_path();
     let mut command = Command::new(&binary);
@@ -6040,17 +6377,6 @@ fn spawn_codex_app_server_with_config(
         &mut c_overrides,
         "approvals_reviewer=\"user\"".to_string(),
     );
-    if let Some(reasoning_effort) = reasoning_effort {
-        push_arg(
-            &mut command,
-            &mut c_overrides,
-            format!(
-                "model_reasoning_effort={}",
-                toml_string(reasoning_effort.as_str())
-            ),
-        );
-    }
-
     // Apply provider configuration via -c config overrides while preserving the
     // user's CODEX_HOME for MCP, trust, and other Codex settings.
     if let Some(config) = provider_config {
@@ -6980,6 +7306,9 @@ async fn run_codex(
 
     let (approval_tx, mut approval_rx) = mpsc::unbounded_channel();
     state.set_approval_sender(&session.id, approval_tx).await;
+    let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
+    state.set_cancel_sender(&session.id, cancel_tx).await;
+    let (user_input_tx, mut user_input_rx) = mpsc::unbounded_channel();
 
     let mut next_request_id = 1_u64;
     let mut raw_stdout = String::new();
@@ -7002,6 +7331,7 @@ async fn run_codex(
     )
     .await?;
     wait_for_json_rpc_response(&mut stdout_rx, &mut raw_stdout, next_request_id - 1).await?;
+    send_json_rpc_notification(&mut stdin, "initialized", None).await?;
 
     let current_model = provider_config.as_ref().and_then(|c| c.model.clone());
     let stored_model = state.codex_model(&session.id).await;
@@ -7287,23 +7617,52 @@ async fn run_codex(
         | Some(CodexSlashAction::GoalClear)
         | Some(CodexSlashAction::ModelSet { .. })
         | Some(CodexSlashAction::Unsupported { .. }) => unreachable!("handled above"),
-        None => (
-            send_json_rpc_request(
-                &mut stdin,
-                &mut next_request_id,
-                "turn/start",
-                serde_json::json!({
-                    "threadId": thread_id,
-                    "input": [{
-                        "type": "text",
-                        "text": input.content,
-                        "text_elements": [],
-                    }],
-                }),
+        None => {
+            let skills = if input.content.trim_start().starts_with('$') {
+                let skills_request_id = send_json_rpc_request(
+                    &mut stdin,
+                    &mut next_request_id,
+                    "skills/list",
+                    serde_json::json!({
+                        "cwds": [project_root.to_string_lossy()],
+                        "forceReload": false,
+                    }),
+                )
+                .await?;
+                match wait_for_json_rpc_response(&mut stdout_rx, &mut raw_stdout, skills_request_id)
+                    .await
+                {
+                    Ok(result) => parse_codex_skills_response(&result),
+                    Err(error)
+                        if error
+                            .to_string()
+                            .to_ascii_lowercase()
+                            .contains("method not found") =>
+                    {
+                        discover_codex_skills_from_disk(&project_root)
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else {
+                Vec::new()
+            };
+            let user_input = codex_user_input(&input.content, &skills);
+            (
+                send_json_rpc_request(
+                    &mut stdin,
+                    &mut next_request_id,
+                    "turn/start",
+                    serde_json::json!({
+                        "threadId": thread_id,
+                        "clientUserMessageId": input.id,
+                        "input": user_input,
+                        "effort": reasoning_effort.map(ReasoningEffort::as_str),
+                    }),
+                )
+                .await?,
+                None,
             )
-            .await?,
-            None,
-        ),
+        }
     };
     if let Some(status_message) = slash_status_message {
         state.emit_progress(&session.id, status_message).await;
@@ -7317,6 +7676,8 @@ async fn run_codex(
     let mut command_status_probe: Option<CommandStatusProbe> = None;
     let mut response_idle_ticks = 0_u32;
     let mut turn_finished = false;
+    let mut active_turn_id: Option<String> = None;
+    let mut interrupt_requested = false;
     let mut last_rendered = String::new();
     let background_deadline =
         tokio::time::sleep(Duration::from_secs(CODEX_BACKGROUND_TASK_MAX_SECONDS));
@@ -7350,6 +7711,11 @@ async fn run_codex(
                 let previous_status = parsed.current_status().map(ToString::to_string);
                 if value.get("method").and_then(Value::as_str) == Some("turn/started") {
                     turn_finished = false;
+                    active_turn_id = value
+                        .pointer("/params/turn/id")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string)
+                        .or(active_turn_id);
                 }
                 let probe_response = command_status_probe.as_ref().is_some_and(|probe| {
                     value.get("id").and_then(jsonrpc_id_to_string).as_deref()
@@ -7460,6 +7826,11 @@ async fn run_codex(
                             .unwrap_or("codex request failed");
                         bail!("{message}");
                     }
+                    active_turn_id = value
+                        .pointer("/result/turn/id")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string)
+                        .or(active_turn_id);
                     continue;
                 }
 
@@ -7487,7 +7858,7 @@ async fn run_codex(
                             send_json_rpc_response(
                                 &mut stdin,
                                 &pending.request.request_id,
-                                approval_result_json(&choice, &pending.request.kind),
+                                approval_result_for_pending(&choice, &pending),
                             )
                             .await?;
                         } else {
@@ -7498,6 +7869,30 @@ async fn run_codex(
                                 pending_approval = Some(pending);
                             }
                         }
+                    }
+                    CodexAppServerEvent::UserInputRequested { request_id, params } => {
+                        let request = codex_user_input_ui_request(&request_id, &params);
+                        match state.request_pi_extension_ui(&session.id, request).await {
+                            Ok(receiver) => {
+                                let user_input_tx = user_input_tx.clone();
+                                tokio::spawn(async move {
+                                    let response = receiver.await.ok();
+                                    let _ = user_input_tx.send((request_id, response));
+                                });
+                            }
+                            Err(error) => {
+                                send_json_rpc_error(&mut stdin, &request_id, -32603, &error).await?;
+                            }
+                        }
+                    }
+                    CodexAppServerEvent::UnsupportedServerRequest { request_id, method } => {
+                        send_json_rpc_error(
+                            &mut stdin,
+                            &request_id,
+                            -32601,
+                            &format!("omni-code-bridge does not support app-server request `{method}`"),
+                        )
+                        .await?;
                     }
                     CodexAppServerEvent::ApprovalResolved { request_id } => {
                         let resolved_current = pending_approval
@@ -7572,9 +7967,44 @@ async fn run_codex(
                 send_json_rpc_response(
                     &mut stdin,
                     &request.request.request_id,
-                    approval_result_json(&choice, &request.request.kind),
+                    approval_result_for_pending(&choice, request),
                 )
                 .await?;
+            }
+            Some((request_id, response)) = user_input_rx.recv() => {
+                match response {
+                    Some(response) if !response.cancelled => {
+                        send_json_rpc_response(
+                            &mut stdin,
+                            &request_id,
+                            codex_user_input_result(response.value),
+                        )
+                        .await?;
+                    }
+                    _ => {
+                        send_json_rpc_response(
+                            &mut stdin,
+                            &request_id,
+                            serde_json::json!({ "answers": {} }),
+                        )
+                        .await?;
+                    }
+                }
+            }
+            Some(()) = cancel_rx.recv(), if !interrupt_requested => {
+                interrupt_requested = true;
+                if let Some(turn_id) = active_turn_id.as_deref() {
+                    send_json_rpc_request(
+                        &mut stdin,
+                        &mut next_request_id,
+                        "turn/interrupt",
+                        serde_json::json!({
+                            "threadId": thread_id,
+                            "turnId": turn_id,
+                        }),
+                    )
+                    .await?;
+                }
             }
             _ = &mut idle_sleep => {
                 let previous_status = parsed.current_status().map(ToString::to_string);
@@ -7620,10 +8050,13 @@ async fn run_codex(
                             let request_id = send_json_rpc_request(
                                 &mut stdin,
                                 &mut next_request_id,
-                                "thread/read",
+                                "thread/turns/list",
                                 serde_json::json!({
                                     "threadId": thread_id,
-                                    "includeTurns": true,
+                                    "cursor": null,
+                                    "limit": 1,
+                                    "sortDirection": "desc",
+                                    "itemsView": "full",
                                 }),
                             )
                             .await?;
@@ -8197,6 +8630,7 @@ async fn run_opencode(
                             pending_approval = Some(PendingApproval {
                                 request: request.clone(),
                                 last_choice: None,
+                                protocol_payload: None,
                             });
                             state.raise_approval(&session.id, request).await;
                         }
@@ -8462,6 +8896,7 @@ async fn run_acp_http(
                                 pending_approval = Some(PendingApproval {
                                     request: request.clone(),
                                     last_choice: None,
+                                    protocol_payload: None,
                                 });
                                 state.raise_approval(&session.id, request).await;
                             }
@@ -8912,6 +9347,7 @@ async fn run_stdio_acp(
                         pending_approval = Some(PendingApproval {
                             request: request.clone(),
                             last_choice: None,
+                            protocol_payload: None,
                         });
                         state.raise_approval(&session.id, request).await;
                     }
@@ -8943,7 +9379,7 @@ async fn run_stdio_acp(
                 send_json_rpc_notification(
                     &mut stdin,
                     "session/cancel",
-                    cancel_params,
+                    Some(cancel_params),
                 )
                 .await?;
                 cancelled = true;
@@ -9066,6 +9502,7 @@ async fn summarize_with_codex(
     )
     .await?;
     wait_for_json_rpc_response(&mut stdout_rx, &mut raw_stdout, next_request_id - 1).await?;
+    send_json_rpc_notification(&mut stdin, "initialized", None).await?;
 
     let thread_request_id = send_json_rpc_request(
         &mut stdin,
@@ -9572,6 +10009,8 @@ enum CodexAppServerEvent {
     Status(String),
     Diff(CodexDiff),
     ApprovalRequested(PendingApproval),
+    UserInputRequested { request_id: String, params: Value },
+    UnsupportedServerRequest { request_id: String, method: String },
     ApprovalResolved { request_id: String },
     TurnCompleted,
     TurnFailed(String),
@@ -9614,6 +10053,7 @@ struct CommandStatusSnapshot {
 struct PendingApproval {
     request: ApprovalRequest,
     last_choice: Option<ApprovalChoice>,
+    protocol_payload: Option<Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9916,6 +10356,7 @@ impl CodexAppServerStreamingState {
                     resolvable: true,
                 },
                 last_choice: None,
+                protocol_payload: None,
             }),
             "item/fileChange/requestApproval" => Some(PendingApproval {
                 request: ApprovalRequest {
@@ -9940,6 +10381,7 @@ impl CodexAppServerStreamingState {
                     resolvable: true,
                 },
                 last_choice: None,
+                protocol_payload: None,
             }),
             "execCommandApproval" => Some(PendingApproval {
                 request: ApprovalRequest {
@@ -9967,6 +10409,7 @@ impl CodexAppServerStreamingState {
                     resolvable: true,
                 },
                 last_choice: None,
+                protocol_payload: None,
             }),
             "applyPatchApproval" => Some(PendingApproval {
                 request: ApprovalRequest {
@@ -9985,6 +10428,7 @@ impl CodexAppServerStreamingState {
                     resolvable: true,
                 },
                 last_choice: None,
+                protocol_payload: None,
             }),
             "item/permissions/requestApproval" => Some(PendingApproval {
                 request: ApprovalRequest {
@@ -10002,7 +10446,14 @@ impl CodexAppServerStreamingState {
                     resolvable: true,
                 },
                 last_choice: None,
+                protocol_payload: params.get("permissions").cloned(),
             }),
+            "item/tool/requestUserInput" => {
+                return CodexAppServerEvent::UserInputRequested {
+                    request_id,
+                    params: params.clone(),
+                };
+            }
             _ => None,
         };
 
@@ -10010,9 +10461,10 @@ impl CodexAppServerStreamingState {
             self.latest_status = Some(render_approval_summary(&request.request));
             CodexAppServerEvent::ApprovalRequested(request)
         } else {
-            CodexAppServerEvent::Status(format!(
-                "[debug:codex:request] unhandled request method={method}"
-            ))
+            CodexAppServerEvent::UnsupportedServerRequest {
+                request_id,
+                method: method.to_string(),
+            }
         }
     }
 
@@ -10280,9 +10732,9 @@ enum CommandWatchdogAction {
 }
 
 fn command_status_snapshot(value: &Value, item_id: &str) -> CommandStatusSnapshot {
-    let thread = value.get("thread").unwrap_or(value);
-    let turns = thread
-        .get("turns")
+    let turns = value
+        .get("data")
+        .or_else(|| value.pointer("/thread/turns"))
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or_default();
@@ -10397,17 +10849,16 @@ async fn send_json_rpc_error(
 async fn send_json_rpc_notification(
     writer: &mut (impl AsyncWrite + Unpin),
     method: &str,
-    params: Value,
+    params: Option<Value>,
 ) -> Result<()> {
-    write_json_line(
-        writer,
-        &serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": method,
-            "params": params,
-        }),
-    )
-    .await
+    let mut message = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": method,
+    });
+    if let Some(params) = params {
+        message["params"] = params;
+    }
+    write_json_line(writer, &message).await
 }
 
 async fn handle_acp_client_method_request(
@@ -13419,6 +13870,74 @@ fn approval_result_json(choice: &ApprovalChoice, kind: &ApprovalKind) -> Value {
             }),
         },
     }
+}
+
+fn approval_result_for_pending(choice: &ApprovalChoice, pending: &PendingApproval) -> Value {
+    if !matches!(pending.request.kind, ApprovalKind::Permissions) {
+        return approval_result_json(choice, &pending.request.kind);
+    }
+
+    match choice {
+        ApprovalChoice::Accept | ApprovalChoice::AlwaysAllow | ApprovalChoice::AcceptForSession => {
+            serde_json::json!({
+                "permissions": pending.protocol_payload.clone().unwrap_or_else(|| serde_json::json!({})),
+                "scope": if matches!(choice, ApprovalChoice::AcceptForSession) {
+                    "session"
+                } else {
+                    "turn"
+                },
+            })
+        }
+        ApprovalChoice::Decline | ApprovalChoice::Cancel => serde_json::json!({
+            "permissions": {},
+            "scope": "turn",
+        }),
+    }
+}
+
+fn codex_user_input_ui_request(
+    request_id: &str,
+    params: &Value,
+) -> crate::models::PiExtensionUiRequest {
+    crate::models::PiExtensionUiRequest {
+        request_id: request_id.to_string(),
+        method: "custom".to_string(),
+        payload: serde_json::json!({
+            "type": "codex_request_user_input",
+            "questions": params.get("questions").cloned().unwrap_or_else(|| serde_json::json!([])),
+            "isBlocking": params.get("isBlocking").and_then(Value::as_bool).unwrap_or(true),
+            "threadId": params.get("threadId").cloned().unwrap_or(Value::Null),
+            "turnId": params.get("turnId").cloned().unwrap_or(Value::Null),
+            "itemId": params.get("itemId").cloned().unwrap_or(Value::Null),
+        }),
+        extension_id: Some("codex-app-server".to_string()),
+        timeout_ms: params.get("autoResolutionMs").and_then(Value::as_u64),
+    }
+}
+
+fn codex_user_input_result(value: Option<Value>) -> Value {
+    let Some(value) = value else {
+        return serde_json::json!({ "answers": {} });
+    };
+    if value.get("answers").is_some() {
+        return value;
+    }
+    let answers = value
+        .as_object()
+        .map(|values| {
+            values
+                .iter()
+                .map(|(id, answer)| {
+                    let answers = answer
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_else(|| vec![answer.clone()]);
+                    (id.clone(), serde_json::json!({ "answers": answers }))
+                })
+                .collect::<serde_json::Map<_, _>>()
+        })
+        .unwrap_or_default();
+    serde_json::json!({ "answers": answers })
 }
 
 fn is_macos() -> bool {
