@@ -29,13 +29,13 @@ use crate::{
     bridge_settings::{AiApprovalPromptInput, BridgeSettingsInput, ProjectAiApprovalInput},
     models::{
         AcpAgentDiagnosticResponse, AcpHandshakeProbe, AgentCommandForwarding, AgentCommandSummary,
-        AgentCommandsSummary, AgentInstallInput, AgentKind, AgentReadiness, AgentSummary, ApiError,
-        ApiResponse, AppUpdateManifest, ApprovalDecisionInput, CancelSessionReplyResult,
-        ClientAuthRequestInput, CreateProjectInput, CreateSessionInput, FileCompletionItem,
-        FileCompletionQuery, MarkSessionReadInput, MessageListPage, MessageListQuery,
-        PiExtensionCommand, PiExtensionUiResponseInput, RegisterPushDeviceInput, ReplySummary,
-        SendMessageInput, SessionEvent, SummarizeReplyInput, TriggerClientMessageInput,
-        UpdateSessionInput, UploadedFileResponse,
+        AgentCommandsQuery, AgentCommandsSummary, AgentInstallInput, AgentKind, AgentReadiness,
+        AgentSummary, ApiError, ApiResponse, AppUpdateManifest, ApprovalDecisionInput,
+        CancelSessionReplyResult, ClientAuthRequestInput, CreateProjectInput, CreateSessionInput,
+        FileCompletionItem, FileCompletionQuery, MarkSessionReadInput, MessageListPage,
+        MessageListQuery, PiExtensionCommand, PiExtensionUiResponseInput, RegisterPushDeviceInput,
+        ReplySummary, SendMessageInput, SessionEvent, SummarizeReplyInput,
+        TriggerClientMessageInput, UpdateSessionInput, UploadedFileResponse,
     },
     pi_plugin_store::{InstallPiPluginInput, PiPlugin, UpdatePiPluginInput},
     session_domain::CreateTurnCommand,
@@ -965,13 +965,28 @@ async fn list_agents(headers: HeaderMap, State(state): State<Arc<AppState>>) -> 
 
 async fn list_agent_commands(
     headers: HeaderMap,
+    Query(query): Query<AgentCommandsQuery>,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
     if let Err(error) = authorize_request(&headers, &state).await {
         return error.into_response();
     }
+    let mut codex = agent_commands_summary(AgentKind::Codex);
+    if let Some(session_id) = query.session_id.as_deref()
+        && let Ok(project_root) = state.project_root_path_for_session(session_id).await
+        && let Ok(skills) = adapter::list_codex_skills(StdPath::new(&project_root)).await
+    {
+        codex
+            .commands
+            .extend(skills.into_iter().map(|skill| AgentCommandSummary {
+                name: format!("${}", skill.name),
+                args_hint: None,
+                description: skill.description,
+                forwarding: AgentCommandForwarding::Native,
+            }));
+    }
     let commands = vec![
-        agent_commands_summary(AgentKind::Codex),
+        codex,
         agent_commands_summary(AgentKind::ClaudeCode),
         agent_commands_summary(AgentKind::OpenCode),
         agent_commands_summary(AgentKind::Acp),

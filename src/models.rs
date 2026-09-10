@@ -900,3 +900,9 @@ pub struct AgentCommandsSummary {
     pub kind: AgentKind,
     pub commands: Vec<AgentCommandSummary>,
 }
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentCommandsQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+}
