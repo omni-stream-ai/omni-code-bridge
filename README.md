@@ -26,6 +26,7 @@ Rust bridge for [Omni Code](https://github.com/omni-stream-ai/omni-code). Expose
 | --- | --- |
 | **Homebrew** (macOS / Linux) | `brew install omni-stream-ai/omni-code-bridge/omni-code-bridge` |
 | **Arch Linux** (AUR) | `yay -S omni-code-bridge-bin` |
+| **Nix profile** (Linux) | `nix profile install github:omni-stream-ai/omni-code-bridge` |
 | **cargo** | `cargo install omni-code-bridge` |
 | **curl** (macOS / Linux) | `curl -fsSL https://raw.githubusercontent.com/omni-stream-ai/omni-code-bridge/main/scripts/install.sh \| bash` |
 | **PowerShell** (Windows) | `powershell -ExecutionPolicy Bypass -Command "iwr https://raw.githubusercontent.com/omni-stream-ai/omni-code-bridge/main/scripts/install.ps1 -UseBasicParsing \| iex"` |
@@ -36,6 +37,34 @@ Rust bridge for [Omni Code](https://github.com/omni-stream-ai/omni-code). Expose
 > ```
 > The bundled user service now runs `omni-code-bridge settings-validate` as `ExecStartPre`, so
 > invalid bridge settings fail before the server starts.
+
+### NixOS and Home Manager
+
+`nix profile install` installs the `omni-code-bridge` command only. It does not create or enable a
+systemd service. To run the bridge as a managed service, import one of the flake modules.
+
+For a system-wide NixOS service:
+
+```nix
+{
+  imports = [ inputs.omni-code-bridge.nixosModules.default ];
+  services.omni-code-bridge.enable = true;
+}
+```
+
+This creates `omni-code-bridge.service` and a dedicated `omni-code-bridge` system user. Check it
+with `systemctl status omni-code-bridge`.
+
+For a per-user Home Manager service:
+
+```nix
+{
+  imports = [ inputs.omni-code-bridge.homeManagerModules.default ];
+  services.omni-code-bridge.enable = true;
+}
+```
+
+Check the user service with `systemctl --user status omni-code-bridge`.
 
 ## Quick Start
 

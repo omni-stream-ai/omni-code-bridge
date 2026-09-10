@@ -26,6 +26,7 @@ Omni Code 的 Rust 桥接服务。对外提供 HTTP 和 SSE API，供移动端�
 | --- | --- |
 | **Homebrew** (macOS / Linux) | `brew install omni-stream-ai/omni-code-bridge/omni-code-bridge` |
 | **Arch Linux** (AUR) | `yay -S omni-code-bridge-bin` |
+| **Nix profile** (Linux) | `nix profile install github:omni-stream-ai/omni-code-bridge` |
 | **cargo** | `cargo install omni-code-bridge` |
 | **curl** (macOS / Linux) | `curl -fsSL https://raw.githubusercontent.com/omni-stream-ai/omni-code-bridge/main/scripts/install.sh \| bash` |
 | **PowerShell** (Windows) | `powershell -ExecutionPolicy Bypass -Command "iwr https://raw.githubusercontent.com/omni-stream-ai/omni-code-bridge/main/scripts/install.ps1 -UseBasicParsing \| iex"` |
@@ -36,6 +37,34 @@ Omni Code 的 Rust 桥接服务。对外提供 HTTP 和 SSE API，供移动端�
 > ```
 > 现在随附的 user service 会先通过 `ExecStartPre` 执行
 > `omni-code-bridge settings-validate`，所以一旦 bridge settings 非法，会在服务启动前直接失败。
+
+### NixOS 与 Home Manager
+
+`nix profile install` 只安装 `omni-code-bridge` 命令，不会创建或启用 systemd 服务。要将
+bridge 作为受管理的服务运行，请导入 flake 提供的 module。
+
+启用 NixOS 系统服务：
+
+```nix
+{
+  imports = [ inputs.omni-code-bridge.nixosModules.default ];
+  services.omni-code-bridge.enable = true;
+}
+```
+
+该配置会创建 `omni-code-bridge.service` 以及专用的 `omni-code-bridge` 系统用户。可以通过
+`systemctl status omni-code-bridge` 检查服务状态。
+
+启用 Home Manager 用户服务：
+
+```nix
+{
+  imports = [ inputs.omni-code-bridge.homeManagerModules.default ];
+  services.omni-code-bridge.enable = true;
+}
+```
+
+可以通过 `systemctl --user status omni-code-bridge` 检查用户服务状态。
 
 ## 快速开始
 
