@@ -42,7 +42,10 @@ use crate::{
         SessionDiffEvent, SessionSummary,
     },
     session_domain::{ActivityKind, EntityState},
-    session_store::{load_session_archive_summary, load_session_messages},
+    session_store::{
+        SessionArchiveSummary, load_session_archive_summary, load_session_messages,
+        project_id_for_path, truncate_preview,
+    },
 };
 use pi as pi_agent_rust;
 
@@ -2053,6 +2056,55 @@ export default function init(pi) {
             vec![
                 serde_json::json!({"type": "text", "text": "$missing keep literal", "text_elements": []})
             ]
+        );
+    }
+
+    #[test]
+    fn codex_thread_list_prefers_name_and_groups_projects() {
+        let mut archive = SessionArchiveSummary {
+            fingerprint: 0,
+            projects: HashMap::new(),
+            sessions: HashMap::new(),
+            session_files: HashMap::new(),
+        };
+        merge_codex_thread_list_page(
+            &mut archive,
+            &serde_json::json!({
+                "data": [
+                    {
+                        "id": "thread-named",
+                        "cwd": "/tmp/example-app",
+                        "name": "Generated title",
+                        "preview": "Original user prompt",
+                        "updatedAt": 1767036065,
+                        "status": {"type": "active"},
+                        "path": "/tmp/thread-named.jsonl"
+                    },
+                    {
+                        "id": "thread-preview",
+                        "cwd": "/tmp/example-app",
+                        "name": null,
+                        "preview": "Fallback preview",
+                        "updatedAt": 1767036064,
+                        "status": {"type": "notLoaded"}
+                    }
+                ],
+                "nextCursor": null
+            }),
+        )
+        .expect("thread list page should parse");
+
+        assert_eq!(archive.sessions["thread-named"].title, "Generated title");
+        assert_eq!(archive.sessions["thread-preview"].title, "Fallback preview");
+        assert!(matches!(
+            archive.sessions["thread-named"].status,
+            SessionStatus::Running
+        ));
+        assert_eq!(archive.projects.len(), 1);
+        assert_eq!(archive.projects.values().next().unwrap().session_count, 2);
+        assert_eq!(
+            archive.session_files["thread-named"],
+            PathBuf::from("/tmp/thread-named.jsonl")
         );
     }
 
@@ -4384,6 +4436,11 @@ for line in sys.stdin:
 
     if method == "initialize":
         write({"jsonrpc":"2.0","id":request_id,"result":{"serverInfo":{"name":"mock-codex","version":"test"}}})
+    elif method == "thread/list":
+        if value.get("params", {}).get("cursor") == "page-2":
+            write({"jsonrpc":"2.0","id":request_id,"result":{"data":[{"id":"mock-preview-thread","sessionId":"mock-preview-thread","cwd":"/tmp/mock-project","name":None,"preview":"Fallback title","createdAt":1767036063,"updatedAt":1767036064,"status":{"type":"notLoaded"},"source":"cli","modelProvider":"openai","cliVersion":"test","ephemeral":False,"projectId":None,"turns":[]}],"nextCursor":None}})
+        else:
+            write({"jsonrpc":"2.0","id":request_id,"result":{"data":[{"id":"mock-listed-thread","sessionId":"mock-listed-thread","cwd":"/tmp/mock-project","name":"Generated Codex title","preview":"Original user prompt","createdAt":1767036064,"updatedAt":1767036065,"status":{"type":"idle"},"source":"cli","modelProvider":"openai","cliVersion":"test","ephemeral":False,"projectId":None,"turns":[]}],"nextCursor":"page-2"}})
     elif method == "thread/resume" and scenario == "resume-failure":
         write({"jsonrpc":"2.0","id":request_id,"error":{"code":-32001,"message":"mock thread no longer exists"}})
     elif method in ("thread/start", "thread/resume", "thread/fork"):
@@ -4705,6 +4762,35 @@ for line in sys.stdin:
         assert_eq!(methods.matches("thread/start\n").count(), 1);
         assert_eq!(methods.matches("thread/resume\n").count(), 1);
         assert_eq!(methods.matches("turn/start\n").count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_provider_lists_paginated_threads_with_generated_titles() {
+        let _lock = codex_test_lock().await;
+        let mock = MockCodexEnvironment::new("success");
+        // SAFETY: Codex subprocess tests are serialized by `codex_test_lock`.
+        unsafe {
+            std::env::set_var("OMNI_CODE_TEST_THREAD_LIST", "1");
+        }
+        let provider = CodexProvider::new();
+
+        let sessions = provider.list_sessions().await;
+
+        // SAFETY: Codex subprocess tests are serialized by `codex_test_lock`.
+        unsafe {
+            std::env::remove_var("OMNI_CODE_TEST_THREAD_LIST");
+        }
+
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(
+            sessions["mock-listed-thread"].title,
+            "Generated Codex title"
+        );
+        assert_eq!(sessions["mock-preview-thread"].title, "Fallback title");
+        let methods =
+            std::fs::read_to_string(&mock.log_path).expect("mock Codex request log should exist");
+        assert_eq!(methods.matches("thread/list\n").count(), 2);
     }
 
     #[cfg(unix)]
@@ -5548,6 +5634,179 @@ pub async fn list_codex_skills(cwd: &Path) -> Result<Vec<CodexSkill>> {
     }
 }
 
+async fn list_codex_threads_from_app_server() -> Result<SessionArchiveSummary> {
+    #[cfg(test)]
+    if std::env::var_os("OMNI_CODE_CODEX_BIN").is_some()
+        && std::env::var_os("OMNI_CODE_TEST_THREAD_LIST").is_none()
+    {
+        bail!("Codex thread/list is disabled for unrelated mock app-server tests");
+    }
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut child = spawn_codex_app_server(&cwd).context("failed to spawn Codex thread listing")?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("codex process did not expose stdin")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("codex process did not expose stdout")?;
+    let mut lines = BufReader::new(stdout).lines();
+    let (stdout_tx, mut stdout_rx) =
+        mpsc::unbounded_channel::<std::result::Result<String, String>>();
+    tokio::spawn(async move {
+        while let Ok(Some(line)) = lines.next_line().await {
+            let _ = stdout_tx.send(Ok(line));
+        }
+    });
+
+    let mut next_request_id = 1_u64;
+    let mut raw_stdout = String::new();
+    let initialize_id = send_json_rpc_request(
+        &mut stdin,
+        &mut next_request_id,
+        "initialize",
+        serde_json::json!({
+            "clientInfo": {"name": CODEX_APP_SERVER_CLIENT_NAME, "version": env!("CARGO_PKG_VERSION")},
+            "capabilities": {"experimentalApi": true},
+        }),
+    )
+    .await?;
+    wait_for_json_rpc_response(&mut stdout_rx, &mut raw_stdout, initialize_id).await?;
+    send_json_rpc_notification(&mut stdin, "initialized", None).await?;
+
+    let mut archive = SessionArchiveSummary {
+        fingerprint: 0,
+        projects: HashMap::new(),
+        sessions: HashMap::new(),
+        session_files: HashMap::new(),
+    };
+    let mut cursor: Option<String> = None;
+    loop {
+        let request_id = send_json_rpc_request(
+            &mut stdin,
+            &mut next_request_id,
+            "thread/list",
+            serde_json::json!({
+                "cursor": cursor,
+                "limit": 100,
+                "sortKey": "updated_at",
+                "sortDirection": "desc"
+            }),
+        )
+        .await?;
+        let result =
+            wait_for_json_rpc_response(&mut stdout_rx, &mut raw_stdout, request_id).await?;
+        merge_codex_thread_list_page(&mut archive, &result)?;
+        cursor = result
+            .get("nextCursor")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        if cursor.is_none() {
+            break;
+        }
+    }
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    raw_stdout.hash(&mut hasher);
+    archive.fingerprint = hasher.finish();
+    let _ = child.kill().await;
+    Ok(archive)
+}
+
+fn merge_codex_thread_list_page(archive: &mut SessionArchiveSummary, result: &Value) -> Result<()> {
+    let threads = result
+        .get("data")
+        .and_then(Value::as_array)
+        .context("Codex thread/list response missing data")?;
+    for thread in threads {
+        let id = thread
+            .get("id")
+            .and_then(Value::as_str)
+            .context("Codex thread/list item missing id")?
+            .to_string();
+        let cwd = thread
+            .get("cwd")
+            .and_then(Value::as_str)
+            .context("Codex thread/list item missing cwd")?
+            .to_string();
+        let preview = thread
+            .get("preview")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string);
+        let title = thread
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .or_else(|| preview.as_deref().map(|value| truncate_preview(value, 32)))
+            .unwrap_or_else(|| id.clone());
+        let updated_at = thread
+            .get("updatedAt")
+            .and_then(Value::as_i64)
+            .and_then(|seconds| chrono::DateTime::<chrono::Utc>::from_timestamp(seconds, 0))
+            .unwrap_or_else(chrono::Utc::now);
+        let status = match thread.pointer("/status/type").and_then(Value::as_str) {
+            Some("active") => crate::models::SessionStatus::Running,
+            Some("systemError") => crate::models::SessionStatus::Failed,
+            _ => crate::models::SessionStatus::Idle,
+        };
+        let project_id = project_id_for_path(&cwd);
+
+        let session = SessionSummary {
+            id: id.clone(),
+            project_id: project_id.clone(),
+            title,
+            agent: AgentKind::Codex,
+            brief_reply_mode: false,
+            status,
+            updated_at,
+            unread_count: 0,
+            last_message_preview: preview.clone(),
+            pending_approval: None,
+            runtime_session_ref: Some(id.clone()),
+            provider_id: None,
+            reasoning_effort: None,
+            model: None,
+        };
+        archive.sessions.insert(id.clone(), session);
+        if let Some(path) = thread.get("path").and_then(Value::as_str) {
+            archive.session_files.insert(id, PathBuf::from(path));
+        }
+
+        archive
+            .projects
+            .entry(project_id.clone())
+            .and_modify(|project| {
+                project.session_count += 1;
+                if updated_at > project.updated_at {
+                    project.updated_at = updated_at;
+                    project.last_session_preview = preview.clone();
+                }
+            })
+            .or_insert_with(|| ProjectSummary {
+                id: project_id,
+                name: Path::new(&cwd)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or(&cwd)
+                    .to_string(),
+                root_path: cwd,
+                updated_at,
+                session_count: 1,
+                last_session_preview: preview,
+                git_branch: None,
+                git_status: None,
+            });
+    }
+    Ok(())
+}
+
 impl CodexProvider {
     const ARCHIVE_CACHE_TTL: Duration = Duration::from_secs(2);
 
@@ -5557,17 +5816,35 @@ impl CodexProvider {
         }
     }
 
-    fn ensure_archive(&self) -> CachedCodexArchive {
+    fn cached_archive(&self) -> Option<CachedCodexArchive> {
         {
             let cache = self.cache.lock().expect("codex cache poisoned");
             if let Some(existing) = cache.as_ref()
                 && existing.checked_at.elapsed() < Self::ARCHIVE_CACHE_TTL
             {
-                return existing.clone();
+                return Some(existing.clone());
             }
         }
 
-        let summary = load_session_archive_summary();
+        None
+    }
+
+    async fn ensure_archive(&self) -> CachedCodexArchive {
+        if let Some(existing) = self.cached_archive() {
+            return existing;
+        }
+
+        let catalog = list_codex_threads_from_app_server().await;
+        let summary = match catalog {
+            Ok(summary) => summary,
+            Err(error) => {
+                debug_log!(
+                    "[codex] thread/list failed; falling back to JSONL session index: {error}"
+                );
+                load_session_archive_summary()
+            }
+        };
+
         let mut cache = self.cache.lock().expect("codex cache poisoned");
         if let Some(existing) = cache.as_mut()
             && existing.fingerprint == summary.fingerprint
@@ -5593,7 +5870,26 @@ impl CodexProvider {
     }
 
     fn load_messages_for_session(&self, session_id: &str) -> Option<Vec<ChatMessage>> {
-        let mut archive = self.ensure_archive();
+        let mut archive = self
+            .cache
+            .lock()
+            .expect("codex cache poisoned")
+            .clone()
+            .unwrap_or_else(|| {
+                let summary = load_session_archive_summary();
+                CachedCodexArchive {
+                    checked_at: Instant::now(),
+                    fingerprint: summary.fingerprint,
+                    projects: summary.projects,
+                    sessions: summary.sessions,
+                    session_files: summary.session_files,
+                    messages: HashMap::new(),
+                }
+            });
+        if !archive.session_files.contains_key(session_id) {
+            let summary = load_session_archive_summary();
+            archive.session_files = summary.session_files;
+        }
         let path = archive.session_files.get(session_id)?.clone();
         let loaded = load_session_messages(&path)?;
         if let Some(existing) = archive.messages.get(session_id)
@@ -5618,11 +5914,11 @@ impl CodexProvider {
 #[async_trait]
 impl AgentProvider for CodexProvider {
     async fn list_projects(&self) -> HashMap<String, ProjectSummary> {
-        self.ensure_archive().projects
+        self.ensure_archive().await.projects
     }
 
     async fn list_sessions(&self) -> HashMap<String, SessionSummary> {
-        self.ensure_archive().sessions
+        self.ensure_archive().await.sessions
     }
 
     async fn list_messages(&self, session_id: &str) -> Option<Vec<ChatMessage>> {
@@ -5635,6 +5931,7 @@ impl AgentProvider for CodexProvider {
 
     async fn default_runtime_ref(&self, session_id: &str) -> Option<String> {
         self.ensure_archive()
+            .await
             .sessions
             .contains_key(session_id)
             .then(|| session_id.to_string())
