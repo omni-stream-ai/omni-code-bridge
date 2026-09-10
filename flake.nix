@@ -8,7 +8,7 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
     pi-agent-rust = {
-      url = "github:omni-stream-ai/pi_agent_rust";
+      url = "github:omni-stream-ai/pi_agent_rust/95b233f27ff2b8b62cf9642b90a60d11632a1560";
       flake = false;
     };
   };

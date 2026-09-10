@@ -4456,7 +4456,6 @@ dependencies = [
 [[package]]
 name = "pi_agent_rust"
 version = "0.2.0"
-source = "git+https://github.com/omni-stream-ai/pi_agent_rust?rev=95b233f27ff2b8b62cf9642b90a60d11632a1560#95b233f27ff2b8b62cf9642b90a60d11632a1560"
 dependencies = [
  "anyhow",
  "ast-grep-core",

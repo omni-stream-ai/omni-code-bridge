@@ -7,6 +7,7 @@ license = "MIT"
 homepage = "https://github.com/omni-stream-ai/omni-code-bridge"
 repository = "https://github.com/omni-stream-ai/omni-code-bridge"
 readme = "README.md"
+publish = false
 
 [dependencies]
 anyhow = "1.0.104"
@@ -30,4 +31,4 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 tower-http = { version = "0.6", features = ["cors"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 agent-client-protocol = "1.2.0"
-pi_agent_rust = { path = "../pi_agent_rust", default-features = false, features = ["sqlite-sessions"] }
+pi_agent_rust = { git = "https://github.com/omni-stream-ai/pi_agent_rust", rev = "95b233f27ff2b8b62cf9642b90a60d11632a1560", default-features = false, features = ["sqlite-sessions"] }

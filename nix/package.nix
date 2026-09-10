@@ -11,63 +11,18 @@ let
     cargo = toolchain;
     rustc = toolchain;
   };
+
   projectSrc = pkgs.lib.cleanSource ../.;
-
-  piAgentSdkPatch = pkgs.writeText "pi-agent-sdk.patch" ''
-    diff --git a/src/sdk.rs b/src/sdk.rs
-    --- a/src/sdk.rs
-    +++ b/src/sdk.rs
-    @@ -1278,6 +1278,16 @@ impl AgentSessionHandle {
-             self.session.run_text(input.into(), combined).await
-         }
-
-    +    /// Send a structured prompt containing text and/or inline images.
-    +    pub async fn prompt_with_content(
-    +        &mut self,
-    +        content: Vec<ContentBlock>,
-    +        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
-    +    ) -> Result<AssistantMessage> {
-    +        let combined = self.make_combined_callback(on_event);
-    +        self.session.run_with_content(content, combined).await
-    +    }
-    +
-         /// Send one user prompt through the agent loop with an explicit abort signal.
-         pub async fn prompt_with_abort(
-             &mut self,
-    @@ -1311,6 +1321,16 @@ impl AgentSessionHandle {
-                 .await
-         }
-
-    +    /// Remove the incomplete assistant response left by a failed provider
-    +    /// request, while preserving the prompt and completed tool cycles.
-    +    ///
-    +    /// Hosts should call this before [`Self::continue_turn`] when retrying a
-    +    /// transient provider failure. The operation is idempotent and returns
-    +    /// whether a trailing incomplete response was removed.
-    +    pub async fn revert_incomplete_response(&mut self) -> Result<bool> {
-    +        self.session.revert_incomplete_response().await
-    +    }
-    +
-         /// Continue the current agent loop with an explicit abort signal.
-         pub async fn continue_turn_with_abort(
-             &mut self,
-  '';
-
-  patchedPiAgentRust = pkgs.applyPatches {
-    name = "pi-agent-rust-source";
-    src = pi-agent-rust;
-    patches = [ piAgentSdkPatch ];
-  };
-
-  # The bridge currently consumes pi_agent_rust through ../pi_agent_rust.  Keep
-  # both checkouts adjacent in the Nix build source so Cargo resolves that path
-  # exactly as it does in the development checkout.
   src = pkgs.runCommand "${pname}-source" { } ''
     mkdir -p "$out/${pname}"
     cp -a ${projectSrc}/. "$out/${pname}/"
     chmod -R u+w "$out/${pname}"
-    ln -s ${patchedPiAgentRust} "$out/pi_agent_rust"
+    substituteInPlace "$out/${pname}/Cargo.toml" \
+      --replace-fail 'git = "https://github.com/omni-stream-ai/pi_agent_rust", rev = "95b233f27ff2b8b62cf9642b90a60d11632a1560"' 'path = "../pi_agent_rust"'
+    sed -i '\|^source = "git+https://github.com/omni-stream-ai/pi_agent_rust?rev=95b233f27ff2b8b62cf9642b90a60d11632a1560#95b233f27ff2b8b62cf9642b90a60d11632a1560"$|d' "$out/${pname}/Cargo.lock"
+    ln -s ${pi-agent-rust} "$out/pi_agent_rust"
   '';
+
 in
 rustPlatform.buildRustPackage {
   inherit pname version src;
@@ -86,7 +41,7 @@ rustPlatform.buildRustPackage {
   sourceRoot = "${pname}-source";
   cargoRoot = pname;
   preBuild = "cd ${pname}";
-  cargoLock.lockFile = ../Cargo.lock;
+  cargoLock.lockFile = ./Cargo.lock;
 
   meta = with pkgs.lib; {
     description = "HTTP and SSE bridge between Omni Code and local coding agents";
