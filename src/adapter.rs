@@ -5432,7 +5432,7 @@ async fn list_codex_skills_from_app_server(cwd: &Path) -> Result<Vec<CodexSkill>
         &mut next_request_id,
         "initialize",
         serde_json::json!({
-            "clientInfo": {"name": "omni-code-bridge", "version": env!("CARGO_PKG_VERSION")},
+            "clientInfo": {"name": CODEX_APP_SERVER_CLIENT_NAME, "version": env!("CARGO_PKG_VERSION")},
             "capabilities": {"experimentalApi": true},
         }),
     )
@@ -6341,6 +6341,10 @@ impl AgentProvider for AcpProvider {
 fn spawn_codex_app_server(cwd: &Path) -> Result<Child> {
     spawn_codex_app_server_with_config(cwd, None, None, None)
 }
+
+// Some Codex-compatible providers accept app-server traffic only when Codex
+// reports one of its official client originators.
+const CODEX_APP_SERVER_CLIENT_NAME: &str = "codex-tui";
 
 fn spawn_codex_app_server_with_config(
     cwd: &Path,
@@ -7320,7 +7324,7 @@ async fn run_codex(
         "initialize",
         serde_json::json!({
             "clientInfo": {
-                "name": "omni-code-bridge",
+                "name": CODEX_APP_SERVER_CLIENT_NAME,
                 "title": "omni-code-bridge",
                 "version": env!("CARGO_PKG_VERSION"),
             },
@@ -9491,7 +9495,7 @@ async fn summarize_with_codex(
         "initialize",
         serde_json::json!({
             "clientInfo": {
-                "name": "omni-code-bridge",
+                "name": CODEX_APP_SERVER_CLIENT_NAME,
                 "title": "omni-code-bridge",
                 "version": env!("CARGO_PKG_VERSION"),
             },
