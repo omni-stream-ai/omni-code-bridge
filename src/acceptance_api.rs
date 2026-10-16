@@ -312,3 +312,93 @@ async fn uninstall_plugin(
         .map_err(operation_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn runtime_routes_reject_unauthorized_requests_before_side_effects() {
+        let root = std::env::temp_dir().join(format!("acceptance-auth-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let state = Arc::new(
+            AppState::new_with_paths(
+                root.join("settings.json"),
+                root.join("runtime.json"),
+                root.join("metadata.json"),
+            )
+            .await,
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = router()
+            .merge(crate::desktop_gateway::router())
+            .with_state(Arc::clone(&state));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = reqwest::Client::new();
+        let id = uuid::Uuid::new_v4();
+        for (method, path, body) in [
+            (
+                reqwest::Method::GET,
+                "/v2/runtime-plugins/x11box-acceptance".into(),
+                None,
+            ),
+            (
+                reqwest::Method::POST,
+                "/v2/runtime-plugins/x11box-acceptance".into(),
+                None,
+            ),
+            (
+                reqwest::Method::DELETE,
+                "/v2/runtime-plugins/x11box-acceptance".into(),
+                None,
+            ),
+            (reqwest::Method::GET, "/v2/acceptance".into(), None),
+            (
+                reqwest::Method::GET,
+                format!("/v2/acceptance/{id}/preview"),
+                None,
+            ),
+            (
+                reqwest::Method::POST,
+                format!("/v2/acceptance/{id}/control"),
+                Some(json!({"acquire":true})),
+            ),
+            (
+                reqwest::Method::POST,
+                format!("/v2/acceptance/{id}/desktop-ticket"),
+                None,
+            ),
+            (
+                reqwest::Method::GET,
+                format!("/v2/acceptance/{id}/desktop/"),
+                None,
+            ),
+            (
+                reqwest::Method::GET,
+                format!("/v2/acceptance/{id}/artifacts/report.json"),
+                None,
+            ),
+        ] {
+            let mut request = client.request(method, format!("http://{address}{path}"));
+            if let Some(body) = body {
+                request = request.json(&body);
+            }
+            let response = request.send().await.unwrap();
+            assert!(
+                matches!(
+                    response.status(),
+                    StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+                ),
+                "{path}: {}",
+                response.status()
+            );
+        }
+        assert!(!state.runtime_plugins.root.exists());
+        server.abort();
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}

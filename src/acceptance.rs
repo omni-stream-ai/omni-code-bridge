@@ -511,6 +511,12 @@ impl AcceptanceStore {
         self.runtime
             .docker(&["cp", &format!("{name}:{path}"), path_str(&target)?], 30)
             .await?;
+        if !target.symlink_metadata()?.file_type().is_file() {
+            bail!("screenshot must be a regular file");
+        }
+        self.runtime
+            .docker(&["exec", &name, "rm", "--", path], 10)
+            .await?;
         let artifact = Artifact {
             name: artifact_name,
             content_type: "image/png".into(),
@@ -551,6 +557,12 @@ impl AcceptanceStore {
         let target = self.run_dir(id)?.join("preview.png");
         self.runtime
             .docker(&["cp", &format!("{name}:{path}"), path_str(&target)?], 20)
+            .await?;
+        if !target.symlink_metadata()?.file_type().is_file() {
+            bail!("preview must be a regular file");
+        }
+        self.runtime
+            .docker(&["exec", &name, "rm", "--", path], 10)
             .await?;
         if target.metadata()?.len() > 20 * 1024 * 1024 {
             bail!("preview exceeds size limit");

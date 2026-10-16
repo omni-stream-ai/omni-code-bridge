@@ -135,7 +135,7 @@ impl RuntimePluginStore {
             *state = Some(self.read_installation()?);
         }
         let current = state.as_ref().unwrap();
-        if current.phase.in_progress() {
+        if current.phase.in_progress() || current.phase == InstallPhase::Ready {
             return Ok(current.clone());
         }
         let value = PluginInstallation {
@@ -258,6 +258,7 @@ impl RuntimePluginStore {
                 &[
                     "run",
                     "--detach",
+                    "--rm",
                     "--name",
                     &name,
                     "--label",
@@ -270,6 +271,14 @@ impl RuntimePluginStore {
                     "--shm-size=256m",
                     "--network=none",
                     image,
+                    "timeout",
+                    "--kill-after=5s",
+                    "240s",
+                    "x11box",
+                    "agent",
+                    "serve",
+                    "--listen",
+                    "127.0.0.1:27811",
                 ],
                 60,
             )

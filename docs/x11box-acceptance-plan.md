@@ -110,3 +110,30 @@ Required follow-up before production readiness:
   resource/expiry configuration and complete release validation remain pending.
 
 Do not shrink the original goal to this checkpoint or mark it complete.
+
+### Verification update after the checkpoint
+
+- Docker build session 70179 completed successfully. The local image is
+  omni-x11box:acceptance-dev, immutable ID
+  sha256:fa83645fff2a79998228fc6577127384044a52e5511354fbc8a3f4a85afa8678.
+- The real_container_acceptance_lifecycle test PASSED in 19.77 seconds against
+  that image. It actually installed/checked the environment, started Chromium,
+  clicked a DOM button through x11box, checked control exclusion, captured PNG,
+  reloaded the persisted run, saved MP4 and report, and removed the container.
+  Docker inspection also showed no remaining acceptance containers or networks.
+  Evidence: /tmp/omni-acceptance-container-e2e.log (tool session 63963 finished).
+- The HTTP unauthorized-route integration test PASSED in 2.51 seconds and
+  confirmed no runtime installation directory was created by rejected requests.
+  Evidence: /tmp/omni-acceptance-auth-tests.log.
+- Installation health-check containers now use --rm and an internal 240-second
+  lifetime, so a Bridge crash does not keep them running indefinitely. Repeated
+  installation of a Ready plugin now returns the existing installation.
+- Screenshots/previews now reject copied symlinks and remove guest temporary
+  screenshot files after copying them.
+- Flutter full-suite failure names were compared, not just counts: exactly 58
+  on baseline and feature, zero new or resolved failures.
+
+The remaining release gates above still apply, especially real HTML5 gateway and
+mobile testing, scoped video playback/download, client uninstall and project/session
+entry, automation tooling/report integration, robust recovery/limits and release
+documentation. The lifecycle test alone does not establish production readiness.
