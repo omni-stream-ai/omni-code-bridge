@@ -175,7 +175,6 @@ async fn desktop_root(
             .await
             .insert(cookie.clone(), grant);
         let base = format!("/v2/acceptance/{id}/desktop/");
-        let session_cookie = format!("omni_desktop={cookie}");
         let secure = headers
             .get("x-forwarded-proto")
             .is_some_and(|v| v == "https");
@@ -183,26 +182,19 @@ async fn desktop_root(
             "omni_desktop={cookie}; Path={base}; HttpOnly; SameSite=Strict; Max-Age=3600{}",
             if secure { "; Secure" } else { "" }
         );
-        // Serve the bootstrap page in the same response as the ticket exchange.
-        // This avoids WebView implementations that drop Set-Cookie across a 303.
-        let mut upstream_headers = headers;
-        upstream_headers.insert(
-            header::COOKIE,
-            HeaderValue::from_str(&session_cookie).unwrap(),
+        let location = format!(
+            "{base}index.html?path=%2Fv2%2Facceptance%2F{id}%2Fdesktop%2F&autoconnect=true"
         );
-        let mut response = proxy(state, id, "index.html".into(), upstream_headers, ws.ok()).await?;
-        response.headers_mut().insert(
-            header::SET_COOKIE,
-            HeaderValue::from_str(&set_cookie).unwrap(),
-        );
-        response
-            .headers_mut()
-            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-        response.headers_mut().insert(
-            header::REFERRER_POLICY,
-            HeaderValue::from_static("no-referrer"),
-        );
-        return Ok(response);
+        return Ok((
+            StatusCode::SEE_OTHER,
+            [
+                (header::LOCATION, location),
+                (header::SET_COOKIE, set_cookie),
+                (header::CACHE_CONTROL, "no-store".into()),
+                (header::REFERRER_POLICY, "no-referrer".into()),
+            ],
+        )
+            .into_response());
     }
     proxy(state, id, "index.html".into(), headers, ws.ok()).await
 }
