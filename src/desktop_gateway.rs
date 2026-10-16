@@ -136,6 +136,20 @@ async fn desktop_root(
     ws: Result<WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
 ) -> Result<Response, ApiError> {
     if let Some(token) = query.ticket {
+        // A WebView may retain the original ticket URL after the bootstrap
+        // response. Once the session cookie exists, treat that URL as a normal
+        // desktop request so the ticket is not consumed a second time.
+        if headers
+            .get(header::COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(';')
+                    .any(|part| part.trim().starts_with("omni_desktop="))
+            })
+        {
+            return proxy(state, id, "index.html".into(), headers, ws.ok()).await;
+        }
         let mut grant = state
             .desktop_gateway
             .grants
@@ -161,26 +175,34 @@ async fn desktop_root(
             .await
             .insert(cookie.clone(), grant);
         let base = format!("/v2/acceptance/{id}/desktop/");
-        let location = format!(
-            "{base}index.html?path=%2Fv2%2Facceptance%2F{id}%2Fdesktop%2F&autoconnect=true"
-        );
+        let session_cookie = format!("omni_desktop={cookie}");
         let secure = headers
             .get("x-forwarded-proto")
             .is_some_and(|v| v == "https");
-        let cookie = format!(
+        let set_cookie = format!(
             "omni_desktop={cookie}; Path={base}; HttpOnly; SameSite=Strict; Max-Age=3600{}",
             if secure { "; Secure" } else { "" }
         );
-        return Ok((
-            StatusCode::SEE_OTHER,
-            [
-                (header::LOCATION, location),
-                (header::SET_COOKIE, cookie),
-                (header::CACHE_CONTROL, "no-store".into()),
-                (header::REFERRER_POLICY, "no-referrer".into()),
-            ],
-        )
-            .into_response());
+        // Serve the bootstrap page in the same response as the ticket exchange.
+        // This avoids WebView implementations that drop Set-Cookie across a 303.
+        let mut upstream_headers = headers;
+        upstream_headers.insert(
+            header::COOKIE,
+            HeaderValue::from_str(&session_cookie).unwrap(),
+        );
+        let mut response = proxy(state, id, "index.html".into(), upstream_headers, ws.ok()).await?;
+        response.headers_mut().insert(
+            header::SET_COOKIE,
+            HeaderValue::from_str(&set_cookie).unwrap(),
+        );
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        response.headers_mut().insert(
+            header::REFERRER_POLICY,
+            HeaderValue::from_static("no-referrer"),
+        );
+        return Ok(response);
     }
     proxy(state, id, "index.html".into(), headers, ws.ok()).await
 }
