@@ -523,6 +523,45 @@ impl AcceptanceStore {
         Ok(artifact)
     }
 
+    pub async fn preview(&self, id: &str) -> Result<Vec<u8>> {
+        let shared = self.get(id).await?;
+        let run = shared.lock().await;
+        require_running(&run)?;
+        let name = container_name(id);
+        let output = self
+            .runtime
+            .docker(
+                &[
+                    "exec",
+                    &name,
+                    "timeout",
+                    "--kill-after=2s",
+                    "15s",
+                    "x11box",
+                    "do",
+                    "screenshot",
+                ],
+                20,
+            )
+            .await?;
+        let value: Value = serde_json::from_str(&output)?;
+        let path = value["screenshot"]["path"]
+            .as_str()
+            .context("screenshot response has no path")?;
+        let target = self.run_dir(id)?.join("preview.png");
+        self.runtime
+            .docker(&["cp", &format!("{name}:{path}"), path_str(&target)?], 20)
+            .await?;
+        if target.metadata()?.len() > 20 * 1024 * 1024 {
+            bail!("preview exceeds size limit");
+        }
+        let bytes = std::fs::read(target)?;
+        if !bytes.starts_with(b"\x89PNG") {
+            bail!("preview is not a PNG image");
+        }
+        Ok(bytes)
+    }
+
     pub async fn stop(&self, id: &str, result: Option<AcceptanceResult>) -> Result<AcceptanceRun> {
         let shared = self.get(id).await?;
         let mut run = shared.lock().await;

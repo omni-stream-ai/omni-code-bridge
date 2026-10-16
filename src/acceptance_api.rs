@@ -29,6 +29,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/v2/acceptance/{id}/control", post(control))
         .route("/v2/acceptance/{id}/instructions", post(instruction))
         .route("/v2/acceptance/{id}/screenshots", post(screenshot))
+        .route("/v2/acceptance/{id}/preview", get(preview))
         .route("/v2/acceptance/{id}/stop", post(stop))
         .route("/v2/acceptance/{id}/artifacts/{name}", get(artifact))
 }
@@ -144,6 +145,28 @@ async fn screenshot(
             .await
             .map_err(operation_error)?,
     }))
+}
+
+async fn preview(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<axum::response::Response, ApiError> {
+    use axum::response::IntoResponse;
+    crate::api::authorize_request(&headers, &state).await?;
+    let bytes = state
+        .acceptance
+        .preview(&id)
+        .await
+        .map_err(operation_error)?;
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, "image/png"),
+            (axum::http::header::CACHE_CONTROL, "private, no-store"),
+        ],
+        bytes,
+    )
+        .into_response())
 }
 
 #[derive(Deserialize)]
