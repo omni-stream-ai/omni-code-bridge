@@ -34,6 +34,7 @@ struct Grant {
     generation: u64,
     expires: DateTime<Utc>,
     ticket: bool,
+    artifact: Option<String>,
 }
 
 #[derive(Default)]
@@ -46,6 +47,11 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/v2/acceptance/{id}/desktop-ticket", post(issue_ticket))
         .route("/v2/acceptance/{id}/desktop/", get(desktop_root))
         .route("/v2/acceptance/{id}/desktop/{*path}", get(desktop_asset))
+        .route(
+            "/v2/acceptance/{id}/evidence-ticket/{name}",
+            post(issue_evidence_ticket),
+        )
+        .route("/v2/acceptance/{id}/evidence/{name}", get(evidence))
 }
 
 fn error(status: StatusCode, message: impl Into<String>) -> ApiError {
@@ -100,6 +106,7 @@ async fn issue_ticket(
         generation: run.control_generation,
         expires: Utc::now() + chrono::Duration::seconds(30),
         ticket: true,
+        artifact: None,
     };
     let token = secret();
     let mut grants = state.desktop_gateway.grants.lock().await;
@@ -136,7 +143,11 @@ async fn desktop_root(
             .await
             .remove(&token)
             .ok_or_else(|| error(StatusCode::UNAUTHORIZED, "Invalid or used desktop ticket"))?;
-        if !grant.ticket || grant.run_id != id || grant.expires <= Utc::now() {
+        if !grant.ticket
+            || grant.artifact.is_some()
+            || grant.run_id != id
+            || grant.expires <= Utc::now()
+        {
             return Err(error(StatusCode::UNAUTHORIZED, "Expired desktop ticket"));
         }
         validate_grant(&state, &grant).await?;
@@ -150,8 +161,9 @@ async fn desktop_root(
             .await
             .insert(cookie.clone(), grant);
         let base = format!("/v2/acceptance/{id}/desktop/");
-        let location =
-            format!("{base}index.html?path=v2%2Facceptance%2F{id}%2Fdesktop%2F&autoconnect=true");
+        let location = format!(
+            "{base}index.html?path=%2Fv2%2Facceptance%2F{id}%2Fdesktop%2F&autoconnect=true"
+        );
         let secure = headers
             .get("x-forwarded-proto")
             .is_some_and(|v| v == "https");
@@ -204,7 +216,8 @@ async fn browser_grant(state: &AppState, id: &str, headers: &HeaderMap) -> Resul
                 "Desktop session expired; reopen it from Omni Code",
             )
         })?;
-    if grant.ticket || grant.run_id != id || grant.expires <= Utc::now() {
+    if grant.ticket || grant.artifact.is_some() || grant.run_id != id || grant.expires <= Utc::now()
+    {
         return Err(error(StatusCode::UNAUTHORIZED, "Desktop session expired"));
     }
     // Reject cross-origin WebSocket use even when a browser supplies cookies.
@@ -224,6 +237,140 @@ async fn browser_grant(state: &AppState, id: &str, headers: &HeaderMap) -> Resul
         }
     }
     Ok(grant)
+}
+
+async fn issue_evidence_ticket(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((id, name)): Path<(String, String)>,
+) -> Result<Json<ApiResponse<Value>>, ApiError> {
+    crate::api::authorize_request(&headers, &state).await?;
+    state
+        .acceptance
+        .artifact(&id, &name)
+        .await
+        .map_err(|e| error(StatusCode::NOT_FOUND, e.to_string()))?;
+    let mut auth = HeaderMap::new();
+    for key in [header::AUTHORIZATION.as_str(), "x-omni-code-client-id"] {
+        if let Some(value) = headers.get(key) {
+            auth.insert(
+                axum::http::HeaderName::from_bytes(key.as_bytes()).unwrap(),
+                value.clone(),
+            );
+        }
+    }
+    let token = secret();
+    let mut grants = state.desktop_gateway.grants.lock().await;
+    grants.retain(|_, grant| grant.expires > Utc::now());
+    if grants.len() >= 1024 {
+        return Err(error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many browser sessions",
+        ));
+    }
+    grants.insert(
+        token.clone(),
+        Grant {
+            run_id: id.clone(),
+            client_id: String::new(),
+            auth,
+            generation: 0,
+            expires: Utc::now() + chrono::Duration::seconds(30),
+            ticket: true,
+            artifact: Some(name.clone()),
+        },
+    );
+    let name: String = url::form_urlencoded::byte_serialize(name.as_bytes()).collect();
+    Ok(Json(ApiResponse {
+        data: json!({"url":format!("/v2/acceptance/{id}/evidence/{name}?ticket={token}"),"expires_in":30}),
+    }))
+}
+
+#[derive(Deserialize, Default)]
+struct EvidenceQuery {
+    ticket: Option<String>,
+    #[serde(default)]
+    download: bool,
+}
+
+async fn evidence(
+    State(state): State<Arc<AppState>>,
+    Path((id, name)): Path<(String, String)>,
+    Query(query): Query<EvidenceQuery>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    if let Some(ticket) = query.ticket {
+        let mut grant = state
+            .desktop_gateway
+            .grants
+            .lock()
+            .await
+            .remove(&ticket)
+            .ok_or_else(|| error(StatusCode::UNAUTHORIZED, "Invalid or used evidence ticket"))?;
+        if !grant.ticket
+            || grant.run_id != id
+            || grant.artifact.as_deref() != Some(&name)
+            || grant.expires <= Utc::now()
+        {
+            return Err(error(StatusCode::UNAUTHORIZED, "Invalid evidence ticket"));
+        }
+        crate::api::authorize_request(&grant.auth, &state).await?;
+        grant.ticket = false;
+        grant.expires = Utc::now() + chrono::Duration::hours(1);
+        let cookie = secret();
+        state
+            .desktop_gateway
+            .grants
+            .lock()
+            .await
+            .insert(cookie.clone(), grant);
+        let base = format!("/v2/acceptance/{id}/evidence/");
+        let name: String = url::form_urlencoded::byte_serialize(name.as_bytes()).collect();
+        let location = format!("{base}{name}?download={}", query.download);
+        let secure = headers
+            .get("x-forwarded-proto")
+            .is_some_and(|v| v == "https");
+        // A per-file cookie allows concurrent playback/download of different artifacts.
+        let cookie = format!(
+            "omni_evidence={cookie}; Path={base}{name}; HttpOnly; SameSite=Strict; Max-Age=3600{}",
+            if secure { "; Secure" } else { "" }
+        );
+        return Ok((
+            StatusCode::SEE_OTHER,
+            [
+                (header::LOCATION, location),
+                (header::SET_COOKIE, cookie),
+                (header::CACHE_CONTROL, "no-store".into()),
+                (header::REFERRER_POLICY, "no-referrer".into()),
+            ],
+        )
+            .into_response());
+    }
+    let cookie = headers
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| {
+            v.split(';')
+                .find_map(|v| v.trim().strip_prefix("omni_evidence="))
+        })
+        .ok_or_else(|| error(StatusCode::UNAUTHORIZED, "Evidence cookie is required"))?;
+    let grant = state
+        .desktop_gateway
+        .grants
+        .lock()
+        .await
+        .get(cookie)
+        .cloned()
+        .ok_or_else(|| error(StatusCode::UNAUTHORIZED, "Evidence session expired"))?;
+    if grant.ticket
+        || grant.run_id != id
+        || grant.artifact.as_deref() != Some(&name)
+        || grant.expires <= Utc::now()
+    {
+        return Err(error(StatusCode::UNAUTHORIZED, "Evidence session expired"));
+    }
+    crate::api::authorize_request(&grant.auth, &state).await?;
+    crate::acceptance_api::artifact_response(&state, &id, &name, &headers, query.download).await
 }
 
 async fn validate_grant(state: &AppState, grant: &Grant) -> Result<u16, ApiError> {
@@ -382,6 +529,241 @@ async fn relay(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires X11BOX_TEST_IMAGE, Playwright and a Chromium executable"]
+    async fn real_mobile_gateway_touch_input_and_revocation() {
+        use crate::{
+            acceptance::{AcceptanceStore, CreateAcceptance},
+            runtime_plugin::{
+                InstallPhase, RuntimeConfig, RuntimePluginStore, atomic_json, run_bounded,
+            },
+        };
+        use std::path::Path as FsPath;
+        let mut fixture = crate::acceptance_test_support::Fixture::new().await;
+        let runtime = Arc::new(RuntimePluginStore::new(
+            fixture.root.join("browser-runtime"),
+            RuntimeConfig {
+                image: Some(std::env::var("X11BOX_TEST_IMAGE").expect("set X11BOX_TEST_IMAGE")),
+                source_dir: None,
+                docker: "docker".into(),
+            },
+        ));
+        let state = Arc::get_mut(&mut fixture.state).unwrap();
+        state.runtime_plugins = Arc::clone(&runtime);
+        state.acceptance = Arc::new(AcceptanceStore::new(Arc::clone(&runtime)));
+        runtime.install().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(180), async {
+            loop {
+                let status = runtime.status().await.unwrap();
+                if status.phase == InstallPhase::Ready {
+                    break;
+                }
+                assert_ne!(status.phase, InstallPhase::Failed, "{:?}", status.error);
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let project = fixture.root.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("index.html"),r#"<!doctype html><meta charset="utf-8"><title>Mobile fixture</title><style>body{margin:0}input{box-sizing:border-box;width:100%;height:80vh;font-size:24px;background:#e4f7ff}</style><input autofocus placeholder="点击并输入中文" onclick="document.title='Touched'" oninput="document.title='Input:'+this.value">"#).unwrap();
+        for args in [
+            vec!["init", "--quiet"],
+            vec!["add", "index.html"],
+            vec![
+                "-c",
+                "user.name=Acceptance Test",
+                "-c",
+                "user.email=acceptance@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "fixture",
+            ],
+        ] {
+            let output = tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(&project)
+                .args(args)
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let id = Uuid::new_v4().to_string();
+        fixture
+            .state
+            .acceptance
+            .create(
+                CreateAcceptance {
+                    id: id.clone(),
+                    project_id: "browser-fixture".into(),
+                    session_id: None,
+                    command: "chromium --no-sandbox --new-window file:///workspace/index.html"
+                        .into(),
+                    size: "mobile".into(),
+                },
+                &project,
+                "acceptance-test",
+            )
+            .await
+            .unwrap();
+        let shared = fixture.state.acceptance.get(&id).await.unwrap();
+        let running = tokio::time::timeout(Duration::from_secs(150), async {
+            loop {
+                let run = shared.lock().await.clone();
+                if run.phase != RunPhase::Starting {
+                    break run;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(running.phase, RunPhase::Running, "{:?}", running.error);
+        let (origin, server) = fixture.server().await;
+        let config = fixture.root.join("browser.json");
+        let headers: HashMap<String, String> = fixture
+            .headers
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_str().unwrap().to_owned()))
+            .collect();
+        atomic_json(
+            &config,
+            &json!({"origin":origin,"base":format!("{origin}/v2/acceptance/{id}"),
+            "headers":headers,"screenshot":"/tmp/omni-acceptance-mobile-proof.png"}),
+        )
+        .unwrap();
+        let result = run_bounded(
+            FsPath::new("node"),
+            &["tests/browser/mobile-gateway.cjs", config.to_str().unwrap()],
+            Duration::from_secs(90),
+        )
+        .await;
+        let stopped = fixture.state.acceptance.stop(&id, None).await;
+        server.abort();
+        assert!(result.is_ok(), "{result:?}");
+        assert!(stopped.unwrap().error.is_none());
+    }
+
+    #[tokio::test]
+    async fn evidence_tickets_are_single_use_scoped_expiring_and_revocable() {
+        let fixture = crate::acceptance_test_support::Fixture::new().await;
+        let (url, server) = fixture.server().await;
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let issued: Value = client
+            .post(format!(
+                "{url}/v2/acceptance/{}/evidence-ticket/recording.mp4",
+                fixture.id
+            ))
+            .headers(fixture.headers.clone())
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let ticket_url = format!("{url}{}", issued["data"]["url"].as_str().unwrap());
+        let exchange = client.get(&ticket_url).send().await.unwrap();
+        assert_eq!(exchange.status(), StatusCode::SEE_OTHER);
+        let cookie = exchange.headers()["set-cookie"]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let evidence_url = format!("{url}{}", exchange.headers()["location"].to_str().unwrap());
+        assert_eq!(
+            client.get(&ticket_url).send().await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let response = client
+            .get(&evidence_url)
+            .header("cookie", &cookie)
+            .header("range", "bytes=-3")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.bytes().await.unwrap().as_ref(), b"789");
+        let other = evidence_url.replace("recording.mp4", "report.json");
+        assert_eq!(
+            client
+                .get(other)
+                .header("cookie", &cookie)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let other_run = evidence_url.replace(&fixture.id, &Uuid::new_v4().to_string());
+        assert_eq!(
+            client
+                .get(other_run)
+                .header("cookie", &cookie)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let desktop = format!("{url}/v2/acceptance/{}/desktop/", fixture.id);
+        assert_eq!(
+            client
+                .get(desktop)
+                .header("cookie", cookie.replace("omni_evidence", "omni_desktop"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let token = cookie.strip_prefix("omni_evidence=").unwrap();
+        {
+            let mut grants = fixture.state.desktop_gateway.grants.lock().await;
+            grants.get_mut(token).unwrap().expires = Utc::now() - chrono::Duration::seconds(1);
+        }
+        assert_eq!(
+            client
+                .get(&evidence_url)
+                .header("cookie", &cookie)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        {
+            let mut grants = fixture.state.desktop_gateway.grants.lock().await;
+            let grant = grants.get_mut(token).unwrap();
+            grant.expires = Utc::now() + chrono::Duration::hours(1);
+            grant.auth.insert(
+                header::AUTHORIZATION,
+                HeaderValue::from_static("Bearer revoked"),
+            );
+        }
+        assert_eq!(
+            client
+                .get(evidence_url)
+                .header("cookie", &cookie)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        server.abort();
+    }
     #[test]
     fn gateway_paths_cannot_escape_the_upstream_root() {
         for path in [

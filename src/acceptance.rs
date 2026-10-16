@@ -298,6 +298,10 @@ impl AcceptanceStore {
                         .runtime
                         .docker(&["rm", "--force", &container_name(&run.id)], 30)
                         .await;
+                    let _ = store
+                        .runtime
+                        .docker(&["network", "rm", &container_name(&run.id)], 30)
+                        .await;
                 }
             }
             run.updated_at = Utc::now();
@@ -307,6 +311,10 @@ impl AcceptanceStore {
                 let _ = store
                     .runtime
                     .docker(&["rm", "--force", &container_name(&run.id)], 30)
+                    .await;
+                let _ = store
+                    .runtime
+                    .docker(&["network", "rm", &container_name(&run.id)], 30)
                     .await;
             }
         });

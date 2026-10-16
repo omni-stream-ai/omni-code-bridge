@@ -14,7 +14,10 @@ pub struct ClientAuthStore {
 
 impl ClientAuthStore {
     pub async fn load() -> Self {
-        let path = storage_path();
+        Self::load_from_path(storage_path()).await
+    }
+
+    pub(crate) async fn load_from_path(path: PathBuf) -> Self {
         let records = read_records(&path).await;
         Self {
             path,

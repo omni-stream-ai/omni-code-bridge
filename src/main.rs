@@ -1,5 +1,7 @@
 mod acceptance;
 mod acceptance_api;
+#[cfg(test)]
+mod acceptance_test_support;
 mod acp_client;
 mod adapter;
 mod ai_approval;

@@ -816,6 +816,11 @@ impl AppState {
     }
 
     #[cfg(test)]
+    pub(crate) async fn set_client_auth_path_for_test(&mut self, path: PathBuf) {
+        self.client_auth = ClientAuthStore::load_from_path(path).await;
+    }
+
+    #[cfg(test)]
     pub async fn approve_client_auth_for_test(
         &self,
         request_id: &str,
