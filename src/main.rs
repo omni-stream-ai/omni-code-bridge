@@ -1,3 +1,5 @@
+mod acceptance;
+mod acceptance_api;
 mod acp_client;
 mod adapter;
 mod ai_approval;
@@ -8,12 +10,14 @@ mod bridge_settings;
 mod claude_hook;
 mod claude_store;
 mod client_auth_store;
+mod desktop_gateway;
 mod device_store;
 mod logging;
 mod message_projection;
 mod models;
 mod pi_plugin_store;
 mod push;
+mod runtime_plugin;
 mod secret_store;
 mod session_domain;
 mod session_domain_store;
@@ -144,6 +148,7 @@ async fn serve(port: u16, debug: bool, pi_request_timeout: u64) -> Result<()> {
     pi::http::client::set_request_timeout_override(pi_request_timeout);
     logging::init(debug);
     let state = Arc::new(AppState::new_strict().await?);
+    state.acceptance.start_maintenance();
     let app = router(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));

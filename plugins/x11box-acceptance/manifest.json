@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "id": "x11box-acceptance",
+  "name": "x11box Acceptance",
+  "version": "1.0.0",
+  "description": "Isolated application acceptance with remote desktop control and recorded evidence.",
+  "localized": {
+    "zh": {
+      "name": "x11box 验收",
+      "description": "隔离环境验收应用，支持手机远程操作和截图录像。"
+    }
+  },
+  "capabilities": ["acceptance", "remote_desktop", "screenshot", "recording"],
+  "runtime": {
+    "provider": "docker",
+    "platform": "linux",
+    "lifecycle": "per_acceptance",
+    "image_setting": "OMNI_CODE_X11BOX_IMAGE",
+    "source_setting": "OMNI_CODE_X11BOX_SOURCE"
+  }
+}

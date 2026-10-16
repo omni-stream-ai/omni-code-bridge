@@ -4230,7 +4230,9 @@ dependencies = [
  "tar",
  "tokio",
  "tokio-stream",
+ "tokio-tungstenite",
  "tower-http",
+ "url",
  "uuid",
 ]
 

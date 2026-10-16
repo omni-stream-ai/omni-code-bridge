@@ -244,6 +244,9 @@ pub struct AppState {
     push: PushService,
     session_domain: Arc<SessionDomainStore>,
     pub(crate) pi_plugins: crate::pi_plugin_store::PiPluginStore,
+    pub(crate) runtime_plugins: Arc<crate::runtime_plugin::RuntimePluginStore>,
+    pub(crate) acceptance: Arc<crate::acceptance::AcceptanceStore>,
+    pub(crate) desktop_gateway: crate::desktop_gateway::DesktopGateway,
     runtime_store_path: PathBuf,
     session_metadata_store_path: PathBuf,
 }
@@ -333,6 +336,10 @@ impl AppState {
             SessionDomainStore::open(&domain_store_path(&session_metadata_store_path))
                 .expect("session domain store should open"),
         );
+        let runtime_plugins = Arc::new(crate::runtime_plugin::RuntimePluginStore::new(
+            session_metadata_store_path.with_extension("acceptance"),
+            crate::runtime_plugin::RuntimeConfig::from_env(),
+        ));
         let state = Self {
             projects: RwLock::new(persisted_metadata.projects.clone()),
             sessions: RwLock::new(
@@ -412,6 +419,11 @@ impl AppState {
             secret_store: SecretStore::load().await,
             push: PushService::new(),
             session_domain,
+            acceptance: Arc::new(crate::acceptance::AcceptanceStore::new(Arc::clone(
+                &runtime_plugins,
+            ))),
+            runtime_plugins,
+            desktop_gateway: crate::desktop_gateway::DesktopGateway::default(),
             pi_plugins: crate::pi_plugin_store::PiPluginStore::new(pi_plugin_store_path(
                 &session_metadata_store_path,
             )),
@@ -441,6 +453,10 @@ impl AppState {
             SessionDomainStore::open(&domain_store_path(&session_metadata_store_path))
                 .expect("session domain store should open"),
         );
+        let runtime_plugins = Arc::new(crate::runtime_plugin::RuntimePluginStore::new(
+            session_metadata_store_path.with_extension("acceptance"),
+            crate::runtime_plugin::RuntimeConfig::from_env(),
+        ));
         let state = Self {
             projects: RwLock::new(persisted_metadata.projects.clone()),
             sessions: RwLock::new(
@@ -520,6 +536,11 @@ impl AppState {
             secret_store: SecretStore::load().await,
             push: PushService::new(),
             session_domain,
+            acceptance: Arc::new(crate::acceptance::AcceptanceStore::new(Arc::clone(
+                &runtime_plugins,
+            ))),
+            runtime_plugins,
+            desktop_gateway: crate::desktop_gateway::DesktopGateway::default(),
             pi_plugins: crate::pi_plugin_store::PiPluginStore::new(pi_plugin_store_path(
                 &session_metadata_store_path,
             )),
@@ -547,6 +568,10 @@ impl AppState {
             SessionDomainStore::open(&domain_store_path(&session_metadata_store_path))
                 .map_err(anyhow::Error::msg)?,
         );
+        let runtime_plugins = Arc::new(crate::runtime_plugin::RuntimePluginStore::new(
+            session_metadata_store_path.with_extension("acceptance"),
+            crate::runtime_plugin::RuntimeConfig::from_env(),
+        ));
         let state = Self {
             projects: RwLock::new(persisted_metadata.projects.clone()),
             sessions: RwLock::new(
@@ -626,6 +651,11 @@ impl AppState {
             secret_store: SecretStore::load().await,
             push: PushService::new(),
             session_domain,
+            acceptance: Arc::new(crate::acceptance::AcceptanceStore::new(Arc::clone(
+                &runtime_plugins,
+            ))),
+            runtime_plugins,
+            desktop_gateway: crate::desktop_gateway::DesktopGateway::default(),
             pi_plugins: crate::pi_plugin_store::PiPluginStore::new(pi_plugin_store_path(
                 &session_metadata_store_path,
             )),

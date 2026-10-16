@@ -44,6 +44,8 @@ use crate::{
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
+        .merge(crate::acceptance_api::router())
+        .merge(crate::desktop_gateway::router())
         .route("/health", get(health))
         .route("/files", get(get_file_by_path))
         .route("/files/completions", get(list_file_completions))
@@ -2046,7 +2048,10 @@ async fn get_client_auth_request(
     Ok(Json(ApiResponse { data: record }))
 }
 
-async fn authorize_request(headers: &HeaderMap, state: &AppState) -> Result<(), ApiError> {
+pub(crate) async fn authorize_request(
+    headers: &HeaderMap,
+    state: &AppState,
+) -> Result<(), ApiError> {
     let client_id = read_client_id(headers)?;
     let runtime_allowed = state.is_runtime_client_id_allowed(client_id).await;
     if !runtime_allowed {
