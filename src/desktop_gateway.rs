@@ -169,9 +169,7 @@ async fn desktop_root(
             "omni_desktop={cookie}; Path={base}; HttpOnly; SameSite=Strict; Max-Age=3600{}",
             if secure { "; Secure" } else { "" }
         );
-        let location = format!(
-            "{base}index.html?path=%2Fv2%2Facceptance%2F{id}%2Fdesktop%2F&autoconnect=true"
-        );
+        let location = format!("{base}viewer.html");
         return Ok((
             StatusCode::SEE_OTHER,
             [
@@ -443,6 +441,33 @@ async fn proxy(
             .on_upgrade(move |socket| relay(state, grant, socket, upstream))
             .into_response());
     }
+    if path == "viewer.html" {
+        let shared = state
+            .acceptance
+            .get(&id)
+            .await
+            .map_err(|e| error(StatusCode::NOT_FOUND, e.to_string()))?;
+        let run = shared.lock().await;
+        let (width, height) = match run.size.as_str() {
+            "mobile" => (390, 844),
+            "tablet" => (834, 1112),
+            "laptop" => (1366, 768),
+            _ => (1440, 900),
+        };
+        let html = include_str!("../plugins/x11box-acceptance/desktop-viewer.html")
+            .replace("__DESKTOP_WIDTH__", &width.to_string())
+            .replace("__DESKTOP_HEIGHT__", &height.to_string());
+        return Ok((
+            [
+                (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                (header::CACHE_CONTROL, "private, no-store"),
+                (header::REFERRER_POLICY, "no-referrer"),
+                (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            ],
+            html,
+        )
+            .into_response());
+    }
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(30))
@@ -577,12 +602,32 @@ mod tests {
                 exchange.headers()[header::LOCATION]
                     .to_str()
                     .unwrap()
-                    .contains("index.html?path=")
+                    .ends_with("/desktop/viewer.html")
             );
             let next_cookie = exchange.headers()[header::SET_COOKIE].to_str().unwrap();
             assert!(next_cookie.contains("HttpOnly; SameSite=Strict"));
             let next_cookie = next_cookie.split(';').next().unwrap().to_string();
             assert_ne!(next_cookie, cookie);
+            let viewer = format!("{base}/desktop/viewer.html");
+            assert_eq!(
+                client.get(&viewer).send().await.unwrap().status(),
+                StatusCode::UNAUTHORIZED
+            );
+            let response = client
+                .get(&viewer)
+                .header(header::COOKIE, &next_cookie)
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap();
+            assert_eq!(
+                response.headers()[header::CONTENT_TYPE],
+                "text/html; charset=utf-8"
+            );
+            let html = response.text().await.unwrap();
+            assert!(html.contains("const width = 390;"));
+            assert!(!html.contains("__DESKTOP_"));
             assert_eq!(
                 client
                     .get(&url)
@@ -603,7 +648,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 client
-                    .get(format!("{base}/desktop/"))
+                    .get(&viewer)
                     .header(header::COOKIE, &next_cookie)
                     .send()
                     .await
@@ -698,7 +743,7 @@ mod tests {
                     session_id: None,
                     command: "chromium --no-sandbox --new-window file:///workspace/index.html"
                         .into(),
-                    size: "mobile".into(),
+                    size: "pc".into(),
                 },
                 &project,
                 "acceptance-test",
