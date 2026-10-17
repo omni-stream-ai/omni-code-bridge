@@ -29,3 +29,15 @@
 	X11BOX_TEST_IMAGE='sha256:<完整摘要>' cargo test real_container_acceptance_lifecycle -- --ignored --nocapture
 
 移动浏览器测试还需 Node、Playwright 和 Chromium，并设置 NODE_PATH。测试必须验证连接、触摸、中文输入和控制撤销。Android/iOS 真机软键盘与网络切换仍需独立验收。
+
+## Android 模拟器内的桌面连接
+
+客户端以 --dart-define=OMNI_CODE_BRIDGE_URL=http://10.0.2.2:8787 连接宿主机。
+在项目页进入“应用验收”，创建或打开运行，再点击“打开远程桌面”，桌面会在 App 内的 WebView 显示。
+
+WebView 会使用 Android 系统代理。若模拟器设置了 10.0.2.2:7890 等代理，代理进程可能无法访问模拟器专用的 10.0.2.2 地址，导致桌面请求返回 HTTP 502，而 Flutter 的 Bridge API 仍正常工作。先记录模拟器原有代理配置，再在本机调试时停用该代理：
+
+    adb shell settings get global http_proxy
+    adb shell settings put global http_proxy :0
+
+返回 App 点击“重试”会取得新的单次票据；不要刷新已消费的票据 URL。故障排查应检查 WebView 的实际 HTTP 状态、页面画面和远程输入，桌面浏览器的移动视口测试不能代替 Android WebView 验证。

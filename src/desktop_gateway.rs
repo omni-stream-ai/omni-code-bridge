@@ -136,20 +136,7 @@ async fn desktop_root(
     ws: Result<WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
 ) -> Result<Response, ApiError> {
     if let Some(token) = query.ticket {
-        // A WebView may retain the original ticket URL after the bootstrap
-        // response. Once the session cookie exists, treat that URL as a normal
-        // desktop request so the ticket is not consumed a second time.
-        if headers
-            .get(header::COOKIE)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| {
-                value
-                    .split(';')
-                    .any(|part| part.trim().starts_with("omni_desktop="))
-            })
-        {
-            return proxy(state, id, "index.html".into(), headers, ws.ok()).await;
-        }
+        // A fresh ticket replaces any cookie from an earlier desktop session.
         let mut grant = state
             .desktop_gateway
             .grants
@@ -543,6 +530,97 @@ async fn relay(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn fresh_desktop_ticket_replaces_stale_cookie_and_stays_single_use() {
+        let fixture = crate::acceptance_test_support::Fixture::new().await;
+        let shared = fixture.state.acceptance.get(&fixture.id).await.unwrap();
+        {
+            let mut run = shared.lock().await;
+            run.phase = RunPhase::Running;
+            run.desktop_port = Some(1);
+        }
+        fixture
+            .state
+            .acceptance
+            .control(&fixture.id, "acceptance-test", true)
+            .await
+            .unwrap();
+        let (origin, server) = fixture.server().await;
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let base = format!("{origin}/v2/acceptance/{}", fixture.id);
+        let mut cookie = "omni_desktop=stale".to_string();
+        for _ in 0..2 {
+            let issued: Value = client
+                .post(format!("{base}/desktop-ticket"))
+                .headers(fixture.headers.clone())
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let url = format!("{origin}{}", issued["data"]["url"].as_str().unwrap());
+            let exchange = client
+                .get(&url)
+                .header(header::COOKIE, &cookie)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(exchange.status(), StatusCode::SEE_OTHER);
+            assert!(
+                exchange.headers()[header::LOCATION]
+                    .to_str()
+                    .unwrap()
+                    .contains("index.html?path=")
+            );
+            let next_cookie = exchange.headers()[header::SET_COOKIE].to_str().unwrap();
+            assert!(next_cookie.contains("HttpOnly; SameSite=Strict"));
+            let next_cookie = next_cookie.split(';').next().unwrap().to_string();
+            assert_ne!(next_cookie, cookie);
+            assert_eq!(
+                client
+                    .get(&url)
+                    .header(header::COOKIE, &next_cookie)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::UNAUTHORIZED
+            );
+            // Closing and reopening must exchange the new ticket, even when
+            // the WebView still holds the previous session's cookie.
+            fixture
+                .state
+                .acceptance
+                .control(&fixture.id, "acceptance-test", false)
+                .await
+                .unwrap();
+            assert_eq!(
+                client
+                    .get(format!("{base}/desktop/"))
+                    .header(header::COOKIE, &next_cookie)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::CONFLICT
+            );
+            fixture
+                .state
+                .acceptance
+                .control(&fixture.id, "acceptance-test", true)
+                .await
+                .unwrap();
+            cookie = next_cookie;
+        }
+        server.abort();
+    }
 
     #[tokio::test]
     #[ignore = "requires X11BOX_TEST_IMAGE, Playwright and a Chromium executable"]
