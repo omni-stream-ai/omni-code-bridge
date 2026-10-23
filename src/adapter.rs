@@ -43,7 +43,7 @@ use crate::{
     },
     session_domain::{ActivityKind, EntityState},
     session_store::{
-        SessionArchiveSummary, load_session_archive_summary, load_session_messages,
+        SessionArchiveSummary, codex_profile_for_session_file, load_session_messages,
         project_id_for_path, truncate_preview,
     },
 };
@@ -276,6 +276,11 @@ static ACP_JSON_RPC_HANDSHAKE_TIMEOUT_TEST_MS: AtomicU64 = AtomicU64::new(0);
 
 #[async_trait]
 pub trait AgentProvider: Send + Sync {
+    /// A cheap source revision for invalidating session lists before their TTL.
+    async fn catalog_revision(&self) -> Option<u64> {
+        None
+    }
+
     async fn list_projects(&self) -> HashMap<String, ProjectSummary> {
         HashMap::new()
     }
@@ -432,6 +437,8 @@ async fn list_acp_sessions(
                     provider_id: config.id.clone().into(),
                     reasoning_effort: None,
                     model: None,
+                    profile_id: None,
+                    profile_name: None,
                 },
             );
         }
@@ -646,6 +653,14 @@ impl ProviderRegistry {
 
     pub fn all(&self) -> Vec<Arc<dyn AgentProvider>> {
         self.providers.values().cloned().collect()
+    }
+
+    pub async fn catalog_revisions(&self) -> HashMap<AgentKind, Option<u64>> {
+        let mut revisions = HashMap::new();
+        for (kind, provider) in &self.providers {
+            revisions.insert(*kind, provider.catalog_revision().await);
+        }
+        revisions
     }
 }
 
@@ -3226,6 +3241,8 @@ export default function init(pi) {
             provider_id: None,
             reasoning_effort: None,
             model: None,
+            profile_id: None,
+            profile_name: None,
         };
         let input = ChatMessage {
             id: "input".to_string(),
@@ -4769,18 +4786,10 @@ for line in sys.stdin:
     async fn codex_provider_lists_paginated_threads_with_generated_titles() {
         let _lock = codex_test_lock().await;
         let mock = MockCodexEnvironment::new("success");
-        // SAFETY: Codex subprocess tests are serialized by `codex_test_lock`.
-        unsafe {
-            std::env::set_var("OMNI_CODE_TEST_THREAD_LIST", "1");
-        }
-        let provider = CodexProvider::new();
+        let mut provider = CodexProvider::new();
+        provider.allow_mock_thread_listing = true;
 
         let sessions = provider.list_sessions().await;
-
-        // SAFETY: Codex subprocess tests are serialized by `codex_test_lock`.
-        unsafe {
-            std::env::remove_var("OMNI_CODE_TEST_THREAD_LIST");
-        }
 
         assert_eq!(sessions.len(), 2);
         assert_eq!(
@@ -4791,6 +4800,58 @@ for line in sys.stdin:
         let methods =
             std::fs::read_to_string(&mock.log_path).expect("mock Codex request log should exist");
         assert_eq!(methods.matches("thread/list\n").count(), 2);
+    }
+
+    #[test]
+    fn codex_message_cache_refreshes_appends_and_same_size_rewrites() {
+        let root = std::env::temp_dir().join(format!("omni-codex-cache-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("session.jsonl");
+        let content = concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"cached\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"first\"}}\n"
+        );
+        std::fs::write(&path, content).unwrap();
+        let provider = CodexProvider::new();
+        *provider.cache.lock().unwrap() = Some(CachedCodexArchive {
+            checked_at: Instant::now(),
+            fingerprint: 0,
+            projects: HashMap::new(),
+            sessions: HashMap::new(),
+            session_files: HashMap::from([("cached".to_string(), path.clone())]),
+            messages: HashMap::new(),
+        });
+        assert_eq!(
+            provider.load_messages_for_session("cached").unwrap()[0].content,
+            "first"
+        );
+        let original = provider.cache.lock().unwrap().as_ref().unwrap().messages["cached"]
+            .messages
+            .clone();
+        provider.load_messages_for_session("cached").unwrap();
+        assert!(Arc::ptr_eq(
+            &original,
+            &provider.cache.lock().unwrap().as_ref().unwrap().messages["cached"].messages
+        ));
+
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::write(&path, content.replace("first", "other")).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified + Duration::from_nanos(100)))
+            .unwrap();
+        assert_eq!(
+            provider.load_messages_for_session("cached").unwrap()[0].content,
+            "other"
+        );
+
+        std::fs::write(&path, format!("{content}{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"agent_message\",\"message\":\"latest\"}}}}\n")).unwrap();
+        let messages = provider.load_messages_for_session("cached").unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].content, "latest");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
@@ -5186,6 +5247,56 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn opencode_revision_tracks_persisted_writes_without_reader_lock_changes() {
+        let root =
+            std::env::temp_dir().join(format!("omni-opencode-revision-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("opencode.db");
+        std::fs::write(&path, "database").unwrap();
+        let initial = file_fingerprint_for_opencode_db(&path).unwrap();
+        std::fs::write(root.join("opencode.db-shm"), "reader lock").unwrap();
+        assert_eq!(file_fingerprint_for_opencode_db(&path), Some(initial));
+        let wal = root.join("opencode.db-wal");
+        std::fs::write(&wal, "persisted write").unwrap();
+        assert_ne!(file_fingerprint_for_opencode_db(&path), Some(initial));
+        let written = file_fingerprint_for_opencode_db(&path).unwrap();
+        let modified = std::fs::metadata(&wal).unwrap().modified().unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&wal)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified + Duration::from_nanos(100)))
+            .unwrap();
+        assert_ne!(file_fingerprint_for_opencode_db(&path), Some(written));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn opencode_v2_catalog_reads_empty_and_populated_databases() {
+        let root = std::env::temp_dir().join(format!("omni-opencode-v2-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("opencode.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT NOT NULL, title TEXT, time_updated INTEGER NOT NULL, time_archived INTEGER);").unwrap();
+        let empty = load_opencode_archive_from_db(&path).unwrap();
+        assert!(empty.sessions.is_empty());
+        assert!(empty.projects.is_empty());
+        conn.execute_batch(
+            "INSERT INTO session_v2 VALUES ('named', '/tmp/project', 'New schema session', 2000, NULL);
+             INSERT INTO session_v2 VALUES ('untitled', '/tmp/project', NULL, 1000, NULL);
+             INSERT INTO session_v2 VALUES ('archived', '/tmp/project', 'Archived', 3000, 4000);"
+        ).unwrap();
+        let loaded = load_opencode_archive_from_db(&path).unwrap();
+        assert_eq!(loaded.sessions.len(), 2);
+        assert_eq!(loaded.sessions["named"].title, "New schema session");
+        assert_eq!(loaded.sessions["untitled"].title, "opencode session");
+        assert_eq!(loaded.projects.len(), 1);
+        assert_eq!(loaded.projects.values().next().unwrap().session_count, 2);
+        drop(conn);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn opencode_db_archive_lists_sessions_and_messages() {
         let db_path = std::env::temp_dir().join(format!(
             "omni-code-bridge-opencode-{}.db",
@@ -5402,7 +5513,7 @@ for line in sys.stdin:
 #[derive(Clone)]
 struct CachedMessageSet {
     fingerprint: u64,
-    messages: Vec<ChatMessage>,
+    messages: Arc<Vec<ChatMessage>>,
 }
 
 #[derive(Clone)]
@@ -5415,8 +5526,11 @@ struct CachedCodexArchive {
     messages: HashMap<String, CachedMessageSet>,
 }
 
+#[derive(Clone)]
 struct CodexProvider {
-    cache: Mutex<Option<CachedCodexArchive>>,
+    cache: Arc<Mutex<Option<CachedCodexArchive>>>,
+    #[cfg(test)]
+    allow_mock_thread_listing: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5635,13 +5749,6 @@ pub async fn list_codex_skills(cwd: &Path) -> Result<Vec<CodexSkill>> {
 }
 
 async fn list_codex_threads_from_app_server() -> Result<SessionArchiveSummary> {
-    #[cfg(test)]
-    if std::env::var_os("OMNI_CODE_CODEX_BIN").is_some()
-        && std::env::var_os("OMNI_CODE_TEST_THREAD_LIST").is_none()
-    {
-        bail!("Codex thread/list is disabled for unrelated mock app-server tests");
-    }
-
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut child = spawn_codex_app_server(&cwd).context("failed to spawn Codex thread listing")?;
     let mut stdin = child
@@ -5756,6 +5863,14 @@ fn merge_codex_thread_list_page(archive: &mut SessionArchiveSummary, result: &Va
             _ => crate::models::SessionStatus::Idle,
         };
         let project_id = project_id_for_path(&cwd);
+        let session_file = thread
+            .get("path")
+            .and_then(Value::as_str)
+            .map(PathBuf::from);
+        let profile = session_file
+            .as_deref()
+            .and_then(codex_profile_for_session_file)
+            .or_else(|| crate::session_store::codex_profile_for_session(&id));
 
         let session = SessionSummary {
             id: id.clone(),
@@ -5772,10 +5887,12 @@ fn merge_codex_thread_list_page(archive: &mut SessionArchiveSummary, result: &Va
             provider_id: None,
             reasoning_effort: None,
             model: None,
+            profile_id: profile.as_ref().map(|value| value.0.clone()),
+            profile_name: profile.map(|value| value.1),
         };
         archive.sessions.insert(id.clone(), session);
-        if let Some(path) = thread.get("path").and_then(Value::as_str) {
-            archive.session_files.insert(id, PathBuf::from(path));
+        if let Some(path) = session_file {
+            archive.session_files.insert(id, path);
         }
 
         archive
@@ -5812,8 +5929,20 @@ impl CodexProvider {
 
     fn new() -> Self {
         Self {
-            cache: Mutex::new(None),
+            cache: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            allow_mock_thread_listing: false,
         }
+    }
+
+    async fn load_live_catalog(&self) -> Result<SessionArchiveSummary> {
+        // Mock subprocess settings are process-wide; only the provider under
+        // test may enumerate threads while unrelated tests run concurrently.
+        #[cfg(test)]
+        if std::env::var_os("OMNI_CODE_CODEX_BIN").is_some() && !self.allow_mock_thread_listing {
+            bail!("Codex thread/list is disabled for unrelated mock app-server tests");
+        }
+        list_codex_threads_from_app_server().await
     }
 
     fn cached_archive(&self) -> Option<CachedCodexArchive> {
@@ -5821,6 +5950,8 @@ impl CodexProvider {
             let cache = self.cache.lock().expect("codex cache poisoned");
             if let Some(existing) = cache.as_ref()
                 && existing.checked_at.elapsed() < Self::ARCHIVE_CACHE_TTL
+                && existing.fingerprint
+                    == crate::session_store::session_archive_fingerprint().unwrap_or(0)
             {
                 return Some(existing.clone());
             }
@@ -5834,15 +5965,24 @@ impl CodexProvider {
             return existing;
         }
 
-        let catalog = list_codex_threads_from_app_server().await;
-        let summary = match catalog {
-            Ok(summary) => summary,
-            Err(error) => {
-                debug_log!(
-                    "[codex] thread/list failed; falling back to JSONL session index: {error}"
-                );
-                load_session_archive_summary()
+        let disk_summary =
+            tokio::task::spawn_blocking(crate::session_store::load_session_catalog_summary)
+                .await
+                .expect("Codex catalog task should complete");
+        // The lightweight JSONL catalog is the only source that spans every Codex profile.
+        // It also avoids spawning one app-server process for every refresh.
+        // Use thread/list only when no archive exists yet (for a brand-new
+        // session that has not flushed its first JSONL record).
+        let summary = if disk_summary.sessions.is_empty() {
+            match self.load_live_catalog().await {
+                Ok(summary) => summary,
+                Err(error) => {
+                    debug_log!("[codex] thread/list failed; using empty JSONL archive: {error}");
+                    disk_summary
+                }
             }
+        } else {
+            disk_summary
         };
 
         let mut cache = self.cache.lock().expect("codex cache poisoned");
@@ -5876,7 +6016,7 @@ impl CodexProvider {
             .expect("codex cache poisoned")
             .clone()
             .unwrap_or_else(|| {
-                let summary = load_session_archive_summary();
+                let summary = crate::session_store::load_session_catalog_summary();
                 CachedCodexArchive {
                     checked_at: Instant::now(),
                     fingerprint: summary.fingerprint,
@@ -5887,32 +6027,37 @@ impl CodexProvider {
                 }
             });
         if !archive.session_files.contains_key(session_id) {
-            let summary = load_session_archive_summary();
+            let summary = crate::session_store::load_session_catalog_summary();
             archive.session_files = summary.session_files;
         }
         let path = archive.session_files.get(session_id)?.clone();
-        let loaded = load_session_messages(&path)?;
         if let Some(existing) = archive.messages.get(session_id)
-            && existing.fingerprint == loaded.fingerprint
+            && Some(existing.fingerprint) == crate::session_store::file_fingerprint(&path)
         {
-            return Some(existing.messages.clone());
+            return Some(existing.messages.as_ref().clone());
         }
+        let loaded = load_session_messages(&path)?;
 
-        archive.messages.insert(
+        let mut cache = self.cache.lock().expect("codex cache poisoned");
+        let current = cache.get_or_insert(archive);
+        current.session_files.insert(session_id.to_string(), path);
+        current.messages.insert(
             session_id.to_string(),
             CachedMessageSet {
                 fingerprint: loaded.fingerprint,
-                messages: loaded.messages.clone(),
+                messages: Arc::new(loaded.messages.clone()),
             },
         );
-        let mut cache = self.cache.lock().expect("codex cache poisoned");
-        *cache = Some(archive);
         Some(loaded.messages)
     }
 }
 
 #[async_trait]
 impl AgentProvider for CodexProvider {
+    async fn catalog_revision(&self) -> Option<u64> {
+        crate::session_store::session_catalog_revision()
+    }
+
     async fn list_projects(&self) -> HashMap<String, ProjectSummary> {
         self.ensure_archive().await.projects
     }
@@ -5926,7 +6071,12 @@ impl AgentProvider for CodexProvider {
         if std::env::var_os("OMNI_CODE_CODEX_BIN").is_some() {
             return None;
         }
-        self.load_messages_for_session(session_id)
+        let provider = self.clone();
+        let session_id = session_id.to_string();
+        tokio::task::spawn_blocking(move || provider.load_messages_for_session(&session_id))
+            .await
+            .ok()
+            .flatten()
     }
 
     async fn default_runtime_ref(&self, session_id: &str) -> Option<String> {
@@ -6018,8 +6168,9 @@ struct CachedClaudeArchive {
     messages: HashMap<String, CachedMessageSet>,
 }
 
+#[derive(Clone)]
 struct ClaudeCodeProvider {
-    cache: Mutex<Option<CachedClaudeArchive>>,
+    cache: Arc<Mutex<Option<CachedClaudeArchive>>>,
 }
 
 impl ClaudeCodeProvider {
@@ -6027,7 +6178,7 @@ impl ClaudeCodeProvider {
 
     fn new() -> Self {
         Self {
-            cache: Mutex::new(None),
+            cache: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -6036,11 +6187,22 @@ impl ClaudeCodeProvider {
             let cache = self.cache.lock().expect("claude cache poisoned");
             if let Some(existing) = cache.as_ref()
                 && existing.checked_at.elapsed() < Self::ARCHIVE_CACHE_TTL
+                && existing.fingerprint
+                    == crate::claude_store::claude_archive_fingerprint().unwrap_or(0)
             {
                 return existing.clone();
             }
         }
 
+        if let Some(fingerprint) = crate::claude_store::claude_archive_fingerprint() {
+            let mut cache = self.cache.lock().expect("claude cache poisoned");
+            if let Some(existing) = cache.as_mut()
+                && existing.fingerprint == fingerprint
+            {
+                existing.checked_at = Instant::now();
+                return existing.clone();
+            }
+        }
         let summary = load_claude_archive_summary();
         let mut cache = self.cache.lock().expect("claude cache poisoned");
         if let Some(existing) = cache.as_mut()
@@ -6067,45 +6229,59 @@ impl ClaudeCodeProvider {
     }
 
     fn load_messages_for_session(&self, session_id: &str) -> Option<Vec<ChatMessage>> {
-        let mut archive = self.ensure_archive();
+        let archive = self.ensure_archive();
         let path = archive.session_files.get(session_id)?.clone();
-        let loaded = load_claude_messages(&path)?;
         if let Some(existing) = archive.messages.get(session_id)
-            && existing.fingerprint == loaded.fingerprint
+            && Some(existing.fingerprint) == crate::claude_store::file_fingerprint(&path)
         {
-            return Some(existing.messages.clone());
+            return Some(existing.messages.as_ref().clone());
         }
+        let loaded = load_claude_messages(&path)?;
 
-        archive.messages.insert(
+        let mut cache = self.cache.lock().expect("claude cache poisoned");
+        cache.get_or_insert(archive).messages.insert(
             session_id.to_string(),
             CachedMessageSet {
                 fingerprint: loaded.fingerprint,
-                messages: loaded.messages.clone(),
+                messages: Arc::new(loaded.messages.clone()),
             },
         );
-        let mut cache = self.cache.lock().expect("claude cache poisoned");
-        *cache = Some(archive);
         Some(loaded.messages)
     }
 }
 
 #[async_trait]
 impl AgentProvider for ClaudeCodeProvider {
+    async fn catalog_revision(&self) -> Option<u64> {
+        crate::claude_store::claude_archive_fingerprint()
+    }
+
     async fn list_projects(&self) -> HashMap<String, ProjectSummary> {
-        self.ensure_archive().projects
+        let provider = self.clone();
+        tokio::task::spawn_blocking(move || provider.ensure_archive().projects)
+            .await
+            .expect("Claude catalog task should complete")
     }
 
     async fn list_sessions(&self) -> HashMap<String, SessionSummary> {
-        self.ensure_archive().sessions
+        let provider = self.clone();
+        tokio::task::spawn_blocking(move || provider.ensure_archive().sessions)
+            .await
+            .expect("Claude catalog task should complete")
     }
 
     async fn list_messages(&self, session_id: &str) -> Option<Vec<ChatMessage>> {
-        self.load_messages_for_session(session_id)
+        let provider = self.clone();
+        let session_id = session_id.to_string();
+        tokio::task::spawn_blocking(move || provider.load_messages_for_session(&session_id))
+            .await
+            .ok()
+            .flatten()
     }
 
     async fn default_runtime_ref(&self, session_id: &str) -> Option<String> {
-        self.ensure_archive()
-            .sessions
+        self.list_sessions()
+            .await
             .contains_key(session_id)
             .then(|| session_id.to_string())
     }
@@ -6209,14 +6385,14 @@ impl OpenCodeProvider {
     fn load_messages_for_session(&self, session_id: &str) -> Option<Vec<ChatMessage>> {
         let mut archive = self.ensure_archive()?;
         if let Some(existing) = archive.messages.get(session_id) {
-            return Some(existing.messages.clone());
+            return Some(existing.messages.as_ref().clone());
         }
         let loaded = load_opencode_messages_from_db(&archive.db_path, session_id).ok()?;
         archive.messages.insert(
             session_id.to_string(),
             CachedMessageSet {
                 fingerprint: archive.fingerprint,
-                messages: loaded.clone(),
+                messages: Arc::new(loaded.clone()),
             },
         );
         let mut cache = self.cache.lock().expect("opencode cache poisoned");
@@ -6444,6 +6620,10 @@ fn claude_prompt_input(text: &str) -> String {
 
 #[async_trait]
 impl AgentProvider for OpenCodeProvider {
+    async fn catalog_revision(&self) -> Option<u64> {
+        file_fingerprint_for_opencode_db(&opencode_db_path())
+    }
+
     async fn list_projects(&self) -> HashMap<String, ProjectSummary> {
         if let Some(archive) = self.ensure_archive() {
             return archive.projects;
@@ -6817,7 +6997,9 @@ fn find_session_file(dir: &Path, session_id: &str) -> Option<PathBuf> {
 
 /// Path to the codex home directory (~/.codex)
 fn codex_home_dir() -> PathBuf {
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+    if let Some(codex_home) = std::env::var_os("CODEX_HOME").map(PathBuf::from) {
+        codex_home
+    } else if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
         home.join(".codex")
     } else {
         PathBuf::from(".codex")
@@ -13325,10 +13507,7 @@ fn file_fingerprint_for_opencode_db(path: &Path) -> Option<u64> {
         &PathBuf::from(format!("{}-wal", path.display())),
         &mut hasher,
     );
-    hash_file_metadata_for_opencode(
-        &PathBuf::from(format!("{}-shm", path.display())),
-        &mut hasher,
-    );
+    // Reader locks in the shared-memory index do not change persisted history.
     Some(hasher.finish())
 }
 
@@ -13344,7 +13523,7 @@ fn hash_file_metadata_for_opencode(
         .ok()?
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?
-        .as_millis()
+        .as_nanos()
         .hash(hasher);
     Some(())
 }
@@ -13356,9 +13535,15 @@ fn load_opencode_archive_from_db(path: &Path) -> Result<LoadedOpenCodeArchive> {
 
     let mut sessions = HashMap::new();
     let mut projects = HashMap::<String, ProjectSummary>::new();
-    let mut stmt = conn.prepare(
-        "SELECT id, directory, title, time_updated FROM session WHERE time_archived IS NULL ORDER BY time_updated DESC, id",
+    let has_v2: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_v2')",
+        [],
+        |row| row.get(0),
     )?;
+    let table = if has_v2 { "session_v2" } else { "session" };
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, directory, COALESCE(title, ''), time_updated FROM {table} WHERE time_archived IS NULL ORDER BY time_updated DESC, id"
+    ))?;
     let rows = stmt.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -13392,6 +13577,8 @@ fn load_opencode_archive_from_db(path: &Path) -> Result<LoadedOpenCodeArchive> {
             provider_id: None,
             reasoning_effort: None,
             model: None,
+            profile_id: None,
+            profile_name: None,
         };
 
         projects
@@ -13503,6 +13690,8 @@ fn opencode_session_summary(value: &Value) -> Option<SessionSummary> {
         provider_id: None,
         reasoning_effort: None,
         model: None,
+        profile_id: None,
+        profile_name: None,
     })
 }
 

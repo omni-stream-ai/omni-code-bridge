@@ -32,6 +32,12 @@ struct ParsedSessionSummaryRecord {
     session_file: PathBuf,
 }
 
+pub(crate) fn claude_archive_fingerprint() -> Option<u64> {
+    collect_jsonl_files(&claude_projects_root())
+        .ok()
+        .map(|(_, fingerprint)| fingerprint)
+}
+
 pub fn load_claude_archive_summary() -> ClaudeArchiveSummary {
     let root = claude_projects_root();
     let (paths, fingerprint) = match collect_jsonl_files(&root) {
@@ -292,6 +298,8 @@ fn parse_session_summary_file(path: &Path) -> Option<ParsedSessionSummaryRecord>
             provider_id: None,
             reasoning_effort: None,
             model: None,
+            profile_id: None,
+            profile_name: None,
         },
         session_file: path.to_path_buf(),
     })
@@ -455,7 +463,7 @@ fn collect_jsonl_files_inner(
     Ok(())
 }
 
-fn file_fingerprint(path: &Path) -> Option<u64> {
+pub(crate) fn file_fingerprint(path: &Path) -> Option<u64> {
     let metadata = fs::metadata(path).ok()?;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     metadata.len().hash(&mut hasher);
@@ -464,7 +472,7 @@ fn file_fingerprint(path: &Path) -> Option<u64> {
         .ok()?
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?
-        .as_millis()
+        .as_nanos()
         .hash(&mut hasher);
     Some(hasher.finish())
 }

@@ -111,27 +111,7 @@ impl SessionDomainStore {
         if let Some(session) = read_session(&transaction, &legacy.id)? {
             return Ok(session);
         }
-        let session = DomainSession {
-            id: legacy.id.clone(),
-            project_id: legacy.project_id.clone(),
-            title: legacy.title.clone(),
-            agent: legacy.agent,
-            status: DomainSessionStatus::Idle,
-            version: 1,
-            config: SessionConfig {
-                provider_id: legacy.provider_id.clone(),
-                reasoning_effort: legacy.reasoning_effort,
-                model: legacy.model.clone(),
-                brief_reply_mode: legacy.brief_reply_mode,
-            },
-            active_turn_id: None,
-            pending_approval_id: None,
-            forked_from: None,
-            unread_count: legacy.unread_count,
-            last_message_preview: legacy.last_message_preview.clone(),
-            created_at: legacy.updated_at,
-            updated_at: legacy.updated_at,
-        };
+        let session = domain_session_from_summary(legacy);
         write_session(&transaction, &session)?;
         let event = insert_event(
             &transaction,
@@ -226,15 +206,16 @@ impl SessionDomainStore {
                 .collect::<Result<Vec<Turn>, String>>()?
         };
         if !existing_turns.is_empty() {
-            if !legacy_turns_need_reimport(&existing_turns) {
+            // Imported snapshots must keep following the CLI archive. Native
+            // turns belong to the bridge runtime and must not be rebuilt here.
+            if session.active_turn_id.is_some()
+                || existing_turns
+                    .iter()
+                    .any(|turn| !turn.id.starts_with("imported-turn-"))
+                || imported_history_matches(&existing_turns, messages)
+            {
                 return Ok(());
             }
-            transaction
-                .execute(
-                    "DELETE FROM domain_events WHERE session_id = ?1",
-                    [session_id],
-                )
-                .map_err(|error| error.to_string())?;
             transaction
                 .execute(
                     "DELETE FROM domain_turns WHERE session_id = ?1",
@@ -248,18 +229,31 @@ impl SessionDomainStore {
             if message.role == MessageRole::User || turns.is_empty() {
                 let sequence = turns.len() as i64 + 1;
                 let is_user = message.role == MessageRole::User;
+                let previous = existing_turns.iter().find(|turn| {
+                    turn.user_message.created_at == message.created_at
+                        && if is_user {
+                            turn.user_message.id == message.id
+                                && turn.user_message.content == message.content
+                        } else {
+                            turn.user_message.content.is_empty()
+                        }
+                });
                 turns.push(Turn {
-                    id: format!("imported-turn-{}", Uuid::new_v4()),
+                    id: previous
+                        .map(|turn| turn.id.clone())
+                        .unwrap_or_else(|| format!("imported-turn-{}", Uuid::new_v4())),
                     session_id: session_id.to_string(),
                     sequence,
-                    version: 1,
+                    version: previous.map_or(1, |turn| turn.version + 1),
                     status: TurnStatus::Completed,
                     input_mode: crate::models::InputMode::Text,
                     user_message: DomainMessage {
                         id: if is_user {
                             message.id.clone()
                         } else {
-                            format!("imported-user-{}", Uuid::new_v4())
+                            previous
+                                .map(|turn| turn.user_message.id.clone())
+                                .unwrap_or_else(|| format!("imported-user-{}", Uuid::new_v4()))
                         },
                         turn_id: String::new(),
                         sequence: 1,
@@ -276,7 +270,9 @@ impl SessionDomainStore {
                         updated_at: message.created_at,
                     },
                     segments: Vec::new(),
-                    artifacts: Vec::new(),
+                    artifacts: previous
+                        .map(|turn| turn.artifacts.clone())
+                        .unwrap_or_default(),
                     final_assistant_message_id: None,
                     created_at: message.created_at,
                     started_at: Some(message.created_at),
@@ -349,6 +345,28 @@ impl SessionDomainStore {
                 });
             }
         }
+        // A repaired snapshot can split a formerly user-less turn. Retain its
+        // artifacts even when that old turn no longer has a matching user.
+        for previous in &existing_turns {
+            if turns.iter().any(|turn| turn.id == previous.id) {
+                continue;
+            }
+            for artifact in &previous.artifacts {
+                let target = artifact
+                    .payload
+                    .get("conversation_turn_id")
+                    .and_then(Value::as_str);
+                let index = turns
+                    .iter()
+                    .position(|turn| Some(turn.user_message.id.as_str()) == target)
+                    .unwrap_or(turns.len() - 1);
+                let turn = &mut turns[index];
+                let mut artifact = artifact.clone();
+                artifact.turn_id = turn.id.clone();
+                artifact.sequence = turn.artifacts.len() as i64 + 1;
+                turn.artifacts.push(artifact);
+            }
+        }
         for turn in &turns {
             write_turn(&transaction, turn)?;
         }
@@ -363,7 +381,11 @@ impl SessionDomainStore {
             &transaction,
             &session,
             None,
-            "session.history_imported",
+            if existing_turns.is_empty() {
+                "session.history_imported"
+            } else {
+                "stream.reset_required"
+            },
             Some(&session.id),
             Some(session.version),
             json!({ "session": session }),
@@ -605,21 +627,9 @@ impl SessionDomainStore {
         let Some(mut session) = read_session(&transaction, &legacy.id)? else {
             return Ok(());
         };
-        let changed = session.title != legacy.title
-            || session.config.provider_id != legacy.provider_id
-            || session.config.reasoning_effort != legacy.reasoning_effort
-            || session.config.model != legacy.model
-            || session.config.brief_reply_mode != legacy.brief_reply_mode;
-        if !changed {
+        if !update_session_metadata(&mut session, legacy) {
             return Ok(());
         }
-        session.title = legacy.title.clone();
-        session.config.provider_id = legacy.provider_id.clone();
-        session.config.reasoning_effort = legacy.reasoning_effort;
-        session.config.model = legacy.model.clone();
-        session.config.brief_reply_mode = legacy.brief_reply_mode;
-        session.version += 1;
-        session.updated_at = Utc::now();
         write_session(&transaction, &session)?;
         let event = insert_event(
             &transaction,
@@ -632,6 +642,42 @@ impl SessionDomainStore {
         )?;
         transaction.commit().map_err(|error| error.to_string())?;
         let _ = self.event_tx.send(event);
+        Ok(())
+    }
+
+    /// Synchronize a catalog in one transaction instead of opening two
+    /// transactions per session on every list request.
+    pub fn sync_session_summaries(&self, summaries: &[SessionSummary]) -> Result<(), String> {
+        let mut connection = self.connection.lock().map_err(|error| error.to_string())?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        let mut events = Vec::new();
+        for summary in summaries {
+            let (session, event_type) =
+                if let Some(mut session) = read_session(&transaction, &summary.id)? {
+                    if !update_session_metadata(&mut session, summary) {
+                        continue;
+                    }
+                    (session, "session.metadata_changed")
+                } else {
+                    (domain_session_from_summary(summary), "session.created")
+                };
+            write_session(&transaction, &session)?;
+            events.push(insert_event(
+                &transaction,
+                &session,
+                None,
+                event_type,
+                Some(&session.id),
+                Some(session.version),
+                json!({ "session": session }),
+            )?);
+        }
+        transaction.commit().map_err(|error| error.to_string())?;
+        for event in events {
+            let _ = self.event_tx.send(event);
+        }
         Ok(())
     }
 
@@ -1184,6 +1230,48 @@ impl SessionDomainStore {
     }
 }
 
+fn domain_session_from_summary(legacy: &SessionSummary) -> DomainSession {
+    DomainSession {
+        id: legacy.id.clone(),
+        project_id: legacy.project_id.clone(),
+        title: legacy.title.clone(),
+        agent: legacy.agent,
+        status: DomainSessionStatus::Idle,
+        version: 1,
+        config: SessionConfig {
+            provider_id: legacy.provider_id.clone(),
+            reasoning_effort: legacy.reasoning_effort,
+            model: legacy.model.clone(),
+            brief_reply_mode: legacy.brief_reply_mode,
+        },
+        active_turn_id: None,
+        pending_approval_id: None,
+        forked_from: None,
+        unread_count: legacy.unread_count,
+        last_message_preview: legacy.last_message_preview.clone(),
+        created_at: legacy.updated_at,
+        updated_at: legacy.updated_at,
+    }
+}
+
+fn update_session_metadata(session: &mut DomainSession, legacy: &SessionSummary) -> bool {
+    let changed = session.title != legacy.title
+        || session.config.provider_id != legacy.provider_id
+        || session.config.reasoning_effort != legacy.reasoning_effort
+        || session.config.model != legacy.model
+        || session.config.brief_reply_mode != legacy.brief_reply_mode;
+    if changed {
+        session.title = legacy.title.clone();
+        session.config.provider_id = legacy.provider_id.clone();
+        session.config.reasoning_effort = legacy.reasoning_effort;
+        session.config.model = legacy.model.clone();
+        session.config.brief_reply_mode = legacy.brief_reply_mode;
+        session.version += 1;
+        session.updated_at = Utc::now();
+    }
+    changed
+}
+
 fn aggregate_segment_state(activities: &[crate::session_domain::Activity]) -> EntityState {
     if activities
         .iter()
@@ -1210,6 +1298,48 @@ fn aggregate_segment_state(activities: &[crate::session_domain::Activity]) -> En
         return EntityState::Cancelled;
     }
     EntityState::Completed
+}
+
+fn imported_history_matches(turns: &[Turn], messages: &[ChatMessage]) -> bool {
+    let mut projected = Vec::new();
+    for turn in turns {
+        let user = &turn.user_message;
+        if !user.id.starts_with("imported-user-") || !user.content.is_empty() {
+            projected.push((
+                user.id.as_str(),
+                MessageRole::User,
+                user.content.as_str(),
+                user.created_at,
+            ));
+        }
+        for segment in &turn.segments {
+            if let Some(message) = &segment.message {
+                projected.push((
+                    message.id.as_str(),
+                    MessageRole::Assistant,
+                    message.content.as_str(),
+                    message.created_at,
+                ));
+            } else {
+                for activity in &segment.activities {
+                    projected.push((
+                        activity.id.as_str(),
+                        MessageRole::System,
+                        activity.title.as_str(),
+                        activity.created_at,
+                    ));
+                }
+            }
+        }
+    }
+    projected.into_iter().eq(messages.iter().map(|message| {
+        (
+            message.id.as_str(),
+            message.role.clone(),
+            message.content.as_str(),
+            message.created_at,
+        )
+    }))
 }
 
 fn legacy_turns_need_reimport(turns: &[Turn]) -> bool {
@@ -1578,6 +1708,8 @@ mod tests {
             provider_id: None,
             reasoning_effort: None,
             model: None,
+            profile_id: None,
+            profile_name: None,
         }
     }
 
@@ -1760,6 +1892,63 @@ mod tests {
     }
 
     #[test]
+    fn batch_summary_sync_preserves_turns_and_only_emits_changed_sessions() {
+        let store = test_store();
+        let existing = session("batch-existing");
+        let unchanged = session("batch-unchanged");
+        store.ensure_session(&existing).unwrap();
+        store.ensure_session(&unchanged).unwrap();
+        let command = CreateTurnCommand {
+            command_id: "batch-command".to_string(),
+            turn_id: "batch-turn".to_string(),
+            user_message_id: "batch-user".to_string(),
+            content: "keep running".to_string(),
+            attachments: Vec::new(),
+            input_mode: InputMode::Text,
+            system_prompt: None,
+            expected_session_version: None,
+            provider_id: None,
+            reasoning_effort: None,
+            model: None,
+        };
+        store.create_turn(&existing.id, &command).unwrap();
+        let before = store.session_state(&existing.id).unwrap().unwrap();
+        let unchanged_cursor = store.session_state(&unchanged.id).unwrap().unwrap().cursor;
+        let mut updated = existing.clone();
+        updated.title = "Updated title".to_string();
+        updated.brief_reply_mode = true;
+        let added = session("batch-added");
+        let summaries = [updated, unchanged.clone(), added.clone()];
+        let mut receiver = store.subscribe();
+        store.sync_session_summaries(&summaries).unwrap();
+
+        let after = store.session_state(&existing.id).unwrap().unwrap();
+        assert_eq!(after.session.title, "Updated title");
+        assert!(after.session.config.brief_reply_mode);
+        assert_eq!(after.session.active_turn_id, before.session.active_turn_id);
+        assert_eq!(after.turns[0].id, before.turns[0].id);
+        assert_eq!(after.turns[0].status, before.turns[0].status);
+        assert_eq!(
+            store.session_state(&unchanged.id).unwrap().unwrap().cursor,
+            unchanged_cursor
+        );
+        assert!(store.session_state(&added.id).unwrap().is_some());
+        assert_eq!(
+            receiver.try_recv().unwrap().event_type,
+            "session.metadata_changed"
+        );
+        assert_eq!(receiver.try_recv().unwrap().event_type, "session.created");
+        assert!(receiver.try_recv().is_err());
+
+        store.sync_session_summaries(&summaries).unwrap();
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(
+            store.session_state(&existing.id).unwrap().unwrap().cursor,
+            after.cursor
+        );
+    }
+
+    #[test]
     fn lists_domain_sessions_by_project_in_updated_order() {
         let store = test_store();
         let mut first = session("session-list-1");
@@ -1882,6 +2071,64 @@ mod tests {
             state.turns[0].segments[0].message.as_ref().unwrap().content,
             "已继续"
         );
+    }
+
+    #[test]
+    fn refreshes_stale_imported_history_with_missing_users() {
+        let store = test_store();
+        let session = session("session-stale-import");
+        let now = Utc::now();
+        store.ensure_session(&session).unwrap();
+        let old_reply = ChatMessage {
+            id: "old-assistant".to_string(),
+            session_id: session.id.clone(),
+            role: MessageRole::Assistant,
+            content: "old reply".to_string(),
+            created_at: now,
+        };
+        store
+            .import_message_history(&session.id, &[old_reply.clone()])
+            .unwrap();
+        let old_cursor = store.session_state(&session.id).unwrap().unwrap().cursor;
+        let messages = vec![
+            ChatMessage {
+                id: "user-1".to_string(),
+                session_id: session.id.clone(),
+                role: MessageRole::User,
+                content: "first question".to_string(),
+                created_at: now - chrono::TimeDelta::seconds(1),
+            },
+            old_reply,
+            ChatMessage {
+                id: "user-2".to_string(),
+                session_id: session.id.clone(),
+                role: MessageRole::User,
+                content: "follow-up from CLI".to_string(),
+                created_at: now + chrono::TimeDelta::minutes(1),
+            },
+        ];
+        store
+            .import_message_history(&session.id, &messages)
+            .unwrap();
+
+        let refreshed = store.session_state(&session.id).unwrap().unwrap();
+        assert_eq!(refreshed.turns.len(), 2);
+        assert_eq!(refreshed.turns[0].user_message.content, "first question");
+        assert_eq!(
+            refreshed.turns[1].user_message.content,
+            "follow-up from CLI"
+        );
+        assert!(refreshed.cursor > old_cursor);
+        let events = store.events_after(&session.id, old_cursor, 10).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "stream.reset_required");
+
+        store
+            .import_message_history(&session.id, &messages)
+            .unwrap();
+        let unchanged = store.session_state(&session.id).unwrap().unwrap();
+        assert_eq!(unchanged.cursor, refreshed.cursor);
+        assert_eq!(unchanged.turns[0].id, refreshed.turns[0].id);
     }
 
     #[test]

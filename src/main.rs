@@ -1,5 +1,6 @@
 mod acceptance;
 mod acceptance_api;
+mod acceptance_context;
 #[cfg(test)]
 mod acceptance_test_support;
 mod acp_client;
@@ -18,6 +19,7 @@ mod logging;
 mod message_projection;
 mod models;
 mod pi_plugin_store;
+mod project_environment;
 mod push;
 mod runtime_plugin;
 mod secret_store;
@@ -151,6 +153,10 @@ async fn serve(port: u16, debug: bool, pi_request_timeout: u64) -> Result<()> {
     logging::init(debug);
     let state = Arc::new(AppState::new_strict().await?);
     state.acceptance.start_maintenance();
+    state
+        .acceptance
+        .resume_automations(Arc::clone(&state))
+        .await;
     let app = router(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));

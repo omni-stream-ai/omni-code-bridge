@@ -218,6 +218,28 @@ pub struct SessionSummary {
     /// Default model override for this session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Codex configuration profile that produced this archived session.
+    /// Non-Codex sessions leave these fields empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProfileSummary {
+    pub id: String,
+    pub name: String,
+}
+
+/// Acceptance automation uses ordinary Agent sessions for durable prompts and
+/// logs, but those sessions are an implementation detail of the acceptance
+/// run and must not appear in the user's conversation lists. The prefix is a
+/// reserved server-generated id (see `acceptance::run_automation`).
+pub const INTERNAL_ACCEPTANCE_SESSION_PREFIX: &str = "acceptance-";
+
+pub fn is_internal_acceptance_session_id(session_id: &str) -> bool {
+    session_id.starts_with(INTERNAL_ACCEPTANCE_SESSION_PREFIX)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

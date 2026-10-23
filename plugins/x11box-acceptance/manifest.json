@@ -10,7 +10,7 @@
       "description": "隔离环境验收应用，支持手机远程操作和截图录像。"
     }
   },
-  "capabilities": ["acceptance", "remote_desktop", "screenshot", "recording"],
+  "capabilities": ["acceptance", "automatic_acceptance", "checklist", "remote_desktop", "screenshot", "recording", "project_environments", "agent_environment_recipes", "custom_dockerfile"],
   "runtime": {
     "provider": "docker",
     "platform": "linux",

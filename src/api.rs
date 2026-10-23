@@ -33,8 +33,8 @@ use crate::{
         AgentSummary, ApiError, ApiResponse, AppUpdateManifest, ApprovalDecisionInput,
         CancelSessionReplyResult, ClientAuthRequestInput, CreateProjectInput, CreateSessionInput,
         FileCompletionItem, FileCompletionQuery, MarkSessionReadInput, MessageListPage,
-        MessageListQuery, PiExtensionCommand, PiExtensionUiResponseInput, RegisterPushDeviceInput,
-        ReplySummary, SendMessageInput, SessionEvent, SummarizeReplyInput,
+        MessageListQuery, PiExtensionCommand, PiExtensionUiResponseInput, ProfileSummary,
+        RegisterPushDeviceInput, ReplySummary, SendMessageInput, SessionEvent, SummarizeReplyInput,
         TriggerClientMessageInput, UpdateSessionInput, UploadedFileResponse,
     },
     pi_plugin_store::{InstallPiPluginInput, PiPlugin, UpdatePiPluginInput},
@@ -99,6 +99,7 @@ pub fn router() -> Router<Arc<AppState>> {
             "/v2/sessions",
             get(list_domain_sessions).post(create_session),
         )
+        .route("/v2/codex/profiles", get(list_codex_profiles))
         .route("/v2/sessions/events", get(all_domain_session_events))
         .route("/v2/sessions/{id}", get(get_session).patch(update_session))
         .route("/v2/sessions/{id}/cancel", post(cancel_session_reply))
@@ -215,6 +216,7 @@ struct DomainEventQuery {
 #[derive(Debug, Deserialize, Default)]
 struct DomainSessionListQuery {
     project_id: Option<String>,
+    profile_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1666,14 +1668,32 @@ async fn list_domain_sessions(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let sessions = state
-        .list_domain_session_summaries(project_id)
+    let profile_id = query
+        .profile_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let mut sessions = state
+        .list_codex_session_summaries(project_id)
         .await
         .map_err(|message| ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message,
         })?;
+    if let Some(profile_id) = profile_id {
+        sessions.retain(|session| session.profile_id.as_deref() == Some(profile_id));
+    }
     Ok(Json(ApiResponse { data: sessions }))
+}
+
+async fn list_codex_profiles(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<ApiResponse<Vec<ProfileSummary>>>, ApiError> {
+    authorize_request_status(&headers, &state).await?;
+    Ok(Json(ApiResponse {
+        data: state.codex_profile_summaries(),
+    }))
 }
 
 async fn all_domain_session_events(
@@ -2773,7 +2793,10 @@ mod tests {
         let headers = authorized_headers(&state).await;
 
         let list_response = list_domain_sessions(
-            Query(super::DomainSessionListQuery { project_id: None }),
+            Query(super::DomainSessionListQuery {
+                project_id: None,
+                profile_id: None,
+            }),
             headers.clone(),
             State(Arc::clone(&state)),
         )
@@ -2942,6 +2965,7 @@ mod tests {
         let response = list_domain_sessions(
             Query(super::DomainSessionListQuery {
                 project_id: Some(first_project.id),
+                profile_id: None,
             }),
             headers,
             State(state),
@@ -3434,7 +3458,10 @@ mod tests {
         );
 
         let list = list_domain_sessions(
-            Query(super::DomainSessionListQuery { project_id: None }),
+            Query(super::DomainSessionListQuery {
+                project_id: None,
+                profile_id: None,
+            }),
             headers,
             State(restored),
         )
@@ -3914,6 +3941,8 @@ for line in sys.stdin:
             provider_id: None,
             reasoning_effort: None,
             model: None,
+            profile_id: None,
+            profile_name: None,
         });
 
         let (name, body) = encode_session_event(&event).expect("snapshot should encode");

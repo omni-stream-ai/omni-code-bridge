@@ -39,10 +39,10 @@ use crate::{
         GitStatusDetail, InputMode, MessageRole, MessageSnapshotEvent, ModelProviderConfig,
         PiExtensionCommand, PiExtensionCommandsEvent, PiExtensionUiRequest,
         PiExtensionUiRequestEvent, PiExtensionUiResolvedEvent, PiExtensionUiResponseInput,
-        ProjectGitStatus, ProjectSummary, PushDeviceRegistration, RegisterPushDeviceInput,
-        ResolvedProviderConfig, SendMessageInput, SessionDetail, SessionDiffEvent, SessionEvent,
-        SessionStatus, SessionStatusEvent, SessionSummary, TriggerClientMessageInput,
-        TriggerClientMessageResult,
+        ProfileSummary, ProjectGitStatus, ProjectSummary, PushDeviceRegistration,
+        RegisterPushDeviceInput, ResolvedProviderConfig, SendMessageInput, SessionDetail,
+        SessionDiffEvent, SessionEvent, SessionStatus, SessionStatusEvent, SessionSummary,
+        TriggerClientMessageInput, TriggerClientMessageResult, is_internal_acceptance_session_id,
     },
     push::PushService,
     secret_store::SecretStore,
@@ -214,6 +214,7 @@ fn provider_session_ref_chain_from_refs(
 struct AggregatedListCache {
     checked_at: Instant,
     git_fingerprint: u64,
+    provider_revisions: HashMap<AgentKind, Option<u64>>,
     projects: Vec<ProjectSummary>,
     sessions: Vec<SessionSummary>,
     project_sessions: HashMap<String, Vec<SessionSummary>>,
@@ -232,6 +233,7 @@ pub struct AppState {
     client_message_results: RwLock<HashMap<(String, String), (ChatMessage, ChatMessage)>>,
     devices: RwLock<HashMap<String, PushDeviceRegistration>>,
     list_cache: Mutex<Option<AggregatedListCache>>,
+    list_refresh_lock: Mutex<()>,
     runtime: Mutex<HashMap<String, SessionRuntimeState>>,
     pending_pi_ui: StdMutex<HashMap<(String, String), PendingPiExtensionUi>>,
     pi_extension_commands: StdMutex<HashMap<String, Vec<PiExtensionCommand>>>,
@@ -398,6 +400,7 @@ impl AppState {
             client_message_results: RwLock::new(HashMap::new()),
             devices: RwLock::new(load_device_registrations()),
             list_cache: Mutex::new(None),
+            list_refresh_lock: Mutex::new(()),
             runtime: Mutex::new(
                 persisted_runtime
                     .into_iter()
@@ -428,7 +431,7 @@ impl AppState {
                 &session_metadata_store_path,
             )),
             runtime_store_path,
-            session_metadata_store_path,
+            session_metadata_store_path: session_metadata_store_path.clone(),
         };
         state.ensure_domain_sessions().await;
         if let Err(error) = state.recover_domain_active_turns().await {
@@ -515,6 +518,7 @@ impl AppState {
             client_message_results: RwLock::new(HashMap::new()),
             devices: RwLock::new(load_device_registrations()),
             list_cache: Mutex::new(None),
+            list_refresh_lock: Mutex::new(()),
             runtime: Mutex::new(
                 persisted_runtime
                     .into_iter()
@@ -545,7 +549,7 @@ impl AppState {
                 &session_metadata_store_path,
             )),
             runtime_store_path,
-            session_metadata_store_path,
+            session_metadata_store_path: session_metadata_store_path.clone(),
         };
         state.ensure_domain_sessions().await;
         if let Err(error) = state.recover_domain_active_turns().await {
@@ -630,6 +634,7 @@ impl AppState {
             client_message_results: RwLock::new(HashMap::new()),
             devices: RwLock::new(load_device_registrations()),
             list_cache: Mutex::new(None),
+            list_refresh_lock: Mutex::new(()),
             runtime: Mutex::new(
                 persisted_runtime
                     .into_iter()
@@ -660,7 +665,7 @@ impl AppState {
                 &session_metadata_store_path,
             )),
             runtime_store_path,
-            session_metadata_store_path,
+            session_metadata_store_path: session_metadata_store_path.clone(),
         };
         state.ensure_domain_sessions().await;
         state
@@ -683,12 +688,8 @@ impl AppState {
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        for session in sessions {
-            if let Err(error) = self.session_domain.ensure_session(&session) {
-                debug_log!("[domain] failed to import session={}: {error}", session.id);
-            } else if let Err(error) = self.session_domain.sync_session_metadata(&session) {
-                debug_log!("[domain] failed to sync session={}: {error}", session.id);
-            }
+        if let Err(error) = self.session_domain.sync_session_summaries(&sessions) {
+            debug_log!("[domain] failed to synchronize sessions: {error}");
         }
     }
 
@@ -1011,11 +1012,44 @@ impl AppState {
     }
 
     pub async fn list_sessions(&self) -> Vec<SessionSummary> {
-        self.with_runtime_approvals(
-            self.overlay_persisted_session_titles(self.ensure_list_cache().await.sessions)
-                .await,
-        )
-        .await
+        let mut sessions = self
+            .with_runtime_approvals(
+                self.overlay_persisted_session_titles(self.ensure_list_cache().await.sessions)
+                    .await,
+            )
+            .await;
+        self.annotate_codex_profiles(&mut sessions);
+        sessions
+    }
+
+    pub fn codex_profile_summaries(&self) -> Vec<ProfileSummary> {
+        crate::session_store::codex_profile_summaries()
+    }
+
+    pub async fn list_codex_session_summaries(
+        &self,
+        project_id: Option<&str>,
+    ) -> Result<Vec<SessionSummary>, String> {
+        self.list_domain_session_summaries(project_id).await
+    }
+
+    fn annotate_codex_profiles(&self, sessions: &mut [SessionSummary]) {
+        if !sessions
+            .iter()
+            .any(|session| session.agent == AgentKind::Codex && session.profile_id.is_none())
+        {
+            return;
+        }
+        let profile_by_session = crate::session_store::codex_session_profiles();
+        for session in sessions {
+            if session.agent != AgentKind::Codex || session.profile_id.is_some() {
+                continue;
+            }
+            if let Some((id, name)) = profile_by_session.get(&session.id).cloned() {
+                session.profile_id = Some(id);
+                session.profile_name = Some(name);
+            }
+        }
     }
 
     pub async fn list_project_sessions(&self, project_id: &str) -> Option<Vec<SessionSummary>> {
@@ -1033,7 +1067,9 @@ impl AppState {
         }
         items.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         let items = self.overlay_persisted_session_titles(items).await;
-        Some(self.with_runtime_approvals(items).await)
+        let mut items = self.with_runtime_approvals(items).await;
+        self.annotate_codex_profiles(&mut items);
+        Some(items)
     }
 
     async fn with_runtime_approvals(
@@ -1125,7 +1161,9 @@ impl AppState {
     }
 
     pub async fn list_messages(&self, session_id: &str) -> Option<Vec<ChatMessage>> {
-        let session = self.find_session(session_id).await?;
+        let Some(session) = self.find_session(session_id).await else {
+            return None;
+        };
         let provider_messages = if let Some(provider) = self.provider_for_agent(session.agent) {
             let mut provider_session_ids = vec![session_id.to_string()];
             provider_session_ids.extend(self.provider_session_ref_chain(session_id).await);
@@ -1211,7 +1249,14 @@ impl AppState {
 
     pub async fn get_session(&self, session_id: &str) -> Option<SessionDetail> {
         let session = self.find_session(session_id).await?;
-        let session = self.with_runtime_approval(session).await;
+        let mut session = self.with_runtime_approval(session).await;
+        if session.agent == AgentKind::Codex
+            && session.profile_id.is_none()
+            && let Some((id, name)) = crate::session_store::codex_profile_for_session(&session.id)
+        {
+            session.profile_id = Some(id);
+            session.profile_name = Some(name);
+        }
         let git_status = self
             .find_project(&session.project_id)
             .await
@@ -1292,6 +1337,8 @@ impl AppState {
             provider_id: input.provider_id,
             reasoning_effort: input.reasoning_effort,
             model: input.model,
+            profile_id: None,
+            profile_name: None,
         };
 
         {
@@ -1407,6 +1454,8 @@ impl AppState {
             provider_id: None,
             reasoning_effort: None,
             model: None,
+            profile_id: None,
+            profile_name: None,
         };
         let message = ChatMessage {
             id: Uuid::new_v4().to_string(),
@@ -1496,7 +1545,16 @@ impl AppState {
                 .session_domain
                 .needs_legacy_history_reimport(session_id)?
         {
-            if state.session.agent == AgentKind::Codex
+            if state.session.active_turn_id.is_none()
+                && state
+                    .turns
+                    .iter()
+                    .all(|turn| turn.id.starts_with("imported-turn-"))
+                && let Some(messages) = self.list_messages(session_id).await
+            {
+                self.session_domain
+                    .import_message_history(session_id, &messages)?;
+            } else if state.session.agent == AgentKind::Codex
                 && state.session.status == DomainSessionStatus::Idle
                 && let Some(messages) = self.list_messages(session_id).await
                 && completed_codex_history_is_ready(&state, &messages)
@@ -1546,14 +1604,11 @@ impl AppState {
         &self,
         project_id: Option<&str>,
     ) -> Result<Vec<SessionSummary>, String> {
-        // The domain list is used as the synchronization snapshot. Refresh the
-        // provider-backed aggregate so sessions discovered after startup are included.
-        self.invalidate_list_cache().await;
+        // Provider revisions invalidate the catalog when a CLI adds a session.
+        // Unchanged snapshots can share the aggregate across client polls.
         let legacy_sessions = self.list_sessions().await;
-        for session in &legacy_sessions {
-            self.session_domain.ensure_session(&session)?;
-            self.session_domain.sync_session_metadata(&session)?;
-        }
+        self.session_domain
+            .sync_session_summaries(&legacy_sessions)?;
         let domain_sessions = self.session_domain.list_sessions(project_id)?;
         let legacy = legacy_sessions
             .into_iter()
@@ -1590,6 +1645,8 @@ impl AppState {
                     provider_id: domain.config.provider_id,
                     reasoning_effort: domain.config.reasoning_effort,
                     model: domain.config.model,
+                    profile_id: base.profile_id.clone(),
+                    profile_name: base.profile_name.clone(),
                 })
             })
             .collect::<Vec<_>>();
@@ -2363,6 +2420,10 @@ impl AppState {
             .await
             .ok_or_else(|| format!("unknown session: {session_id}"))?;
         let runtime_session_ref = self.provider_session_ref(&canonical_session_id).await;
+        let cancelled_domain_turn_id = self
+            .session_domain
+            .session_state(&canonical_session_id)?
+            .and_then(|snapshot| snapshot.session.active_turn_id);
         let stale_running_without_runtime = matches!(
             session_snapshot.status,
             SessionStatus::Running | SessionStatus::AwaitingApproval
@@ -2405,6 +2466,18 @@ impl AppState {
             )
         };
 
+        // Commit cancellation before notifying the provider. A fast interrupt
+        // response can otherwise finish the domain turn during the grace period.
+        if should_interrupt && let Some(turn_id) = cancelled_domain_turn_id.as_deref() {
+            self.session_domain.project_agent_event(
+                &canonical_session_id,
+                turn_id,
+                AgentProjection::TurnStatus {
+                    status: TurnStatus::Cancelled,
+                    error: None,
+                },
+            )?;
+        }
         if let Some(cancel_tx) = cancel_tx {
             let _ = cancel_tx.send(());
             tokio::time::sleep(Duration::from_millis(250)).await;
@@ -2434,6 +2507,13 @@ impl AppState {
         );
 
         if should_interrupt || provider_cancelled {
+            let active_turn_id = self
+                .session_domain
+                .session_state(&canonical_session_id)?
+                .and_then(|snapshot| snapshot.session.active_turn_id);
+            if active_turn_id.is_some() && active_turn_id != cancelled_domain_turn_id {
+                return Ok(true);
+            }
             let preview = self
                 .latest_assistant_preview(&canonical_session_id)
                 .await
@@ -2445,13 +2525,15 @@ impl AppState {
                 status: SessionStatus::Interrupted,
                 error_message: None,
             }));
-            self.project_active_turn_event(
-                &canonical_session_id,
-                AgentProjection::TurnStatus {
-                    status: TurnStatus::Cancelled,
-                    error: None,
-                },
-            );
+            if !should_interrupt {
+                self.project_active_turn_event(
+                    &canonical_session_id,
+                    AgentProjection::TurnStatus {
+                        status: TurnStatus::Cancelled,
+                        error: None,
+                    },
+                );
+            }
         }
         Ok(should_interrupt || provider_cancelled)
     }
@@ -3891,7 +3973,10 @@ impl AppState {
     }
 
     async fn find_session(&self, session_id: &str) -> Option<SessionSummary> {
-        let session = if let Some(session) = self.sessions.read().await.get(session_id).cloned() {
+        let local = self.sessions.read().await.get(session_id).cloned();
+        let session = if let Some(session) = local
+            && !Self::has_rollout_filename_title(&session)
+        {
             session
         } else {
             self.ensure_list_cache()
@@ -3903,21 +3988,48 @@ impl AppState {
         Some(self.with_runtime_approval(session).await)
     }
 
+    fn has_rollout_filename_title(session: &SessionSummary) -> bool {
+        session.agent == AgentKind::Codex
+            && session
+                .title
+                .strip_prefix("rollout-")
+                .and_then(|suffix| suffix.get(..19))
+                .is_some_and(|timestamp| {
+                    chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%dT%H-%M-%S").is_ok()
+                })
+    }
+
     async fn invalidate_list_cache(&self) {
         *self.list_cache.lock().await = None;
     }
 
-    async fn ensure_list_cache(&self) -> AggregatedListCache {
+    async fn fresh_list_cache(&self) -> Option<AggregatedListCache> {
+        let cache = self
+            .list_cache
+            .lock()
+            .await
+            .as_ref()
+            .filter(|existing| existing.checked_at.elapsed() < Self::LIST_CACHE_TTL)
+            .cloned()?;
+        if git_fingerprint_for_projects(&cache.projects) != cache.git_fingerprint
+            || self.providers.catalog_revisions().await != cache.provider_revisions
         {
-            let cache = self.list_cache.lock().await;
-            if let Some(existing) = cache.as_ref()
-                && existing.checked_at.elapsed() < Self::LIST_CACHE_TTL
-                && git_fingerprint_for_projects(&existing.projects) == existing.git_fingerprint
-            {
-                return existing.clone();
-            }
+            return None;
+        }
+        Some(cache)
+    }
+
+    async fn ensure_list_cache(&self) -> AggregatedListCache {
+        if let Some(cache) = self.fresh_list_cache().await {
+            return cache;
+        }
+        // Concurrent list/detail requests share the same expensive refresh.
+        let _refresh = self.list_refresh_lock.lock().await;
+        if let Some(cache) = self.fresh_list_cache().await {
+            return cache;
         }
 
+        let provider_revisions = self.providers.catalog_revisions().await;
         let mut merged_projects = HashMap::new();
         let mut merged_sessions = HashMap::new();
         for provider in self.providers.all() {
@@ -3931,19 +4043,45 @@ impl AppState {
                 merged_projects.insert(id.clone(), project.clone());
             }
         }
+        let mut repaired_titles = false;
         {
-            let sessions = self.sessions.read().await;
-            for (id, session) in sessions.iter() {
+            let overrides = self.session_title_overrides.read().await;
+            let mut sessions = self.sessions.write().await;
+            for (id, session) in sessions.iter_mut() {
+                // Imported sessions may have persisted the old filename fallback.
+                // Only repair that generated title; explicit renames stay local.
+                if Self::has_rollout_filename_title(session)
+                    && !overrides.contains_key(id)
+                    && let Some(provider_session) = merged_sessions.get(id)
+                    && !provider_session.title.trim().is_empty()
+                    && provider_session.title != session.title
+                {
+                    if session.last_message_preview.as_deref() == Some(session.title.as_str()) {
+                        session.last_message_preview =
+                            provider_session.last_message_preview.clone();
+                    }
+                    session.title = provider_session.title.clone();
+                    repaired_titles = true;
+                }
                 merged_sessions.insert(id.clone(), session.clone());
             }
         }
+        if repaired_titles && let Err(error) = self.write_session_metadata().await {
+            debug_log!("[catalog] failed to persist repaired session titles: {error}");
+        }
 
-        let project_git_states = merged_projects
+        let project_roots = merged_projects
             .iter()
-            .map(|(project_id, project)| {
-                (project_id.clone(), git_project_state(&project.root_path))
-            })
-            .collect::<HashMap<_, _>>();
+            .map(|(project_id, project)| (project_id.clone(), project.root_path.clone()))
+            .collect::<Vec<_>>();
+        let project_git_states = tokio::task::spawn_blocking(move || {
+            project_roots
+                .into_iter()
+                .map(|(id, root)| (id, git_project_state(&root)))
+                .collect::<HashMap<_, _>>()
+        })
+        .await
+        .expect("project Git status task should complete");
         for (project_id, project) in &mut merged_projects {
             if let Some(state) = project_git_states.get(project_id) {
                 project.git_branch = state.branch.clone();
@@ -3990,8 +4128,18 @@ impl AppState {
             merged_sessions.insert(session_id, merged);
         }
 
-        let mut sessions = merged_sessions.into_values().collect::<Vec<_>>();
-        sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        let mut all_sessions = merged_sessions.into_values().collect::<Vec<_>>();
+        all_sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        // Acceptance Agent sessions are retained in the local store so the
+        // acceptance pipeline can continue sending prompts and reports can
+        // link back to their history. They are internal implementation
+        // sessions, though, so exclude them from every user-facing aggregate
+        // list (global, per-project, domain sync, and project counts).
+        let sessions = all_sessions
+            .iter()
+            .filter(|session| !is_internal_acceptance_session_id(&session.id))
+            .cloned()
+            .collect::<Vec<_>>();
 
         let mut project_sessions = HashMap::<String, Vec<SessionSummary>>::new();
         for session in &sessions {
@@ -4016,6 +4164,7 @@ impl AppState {
 
         let cache = AggregatedListCache {
             checked_at: Instant::now(),
+            provider_revisions,
             git_fingerprint: project_git_states
                 .values()
                 .map(|state| state.fingerprint)
@@ -4025,7 +4174,10 @@ impl AppState {
                 .cloned()
                 .map(|project| (project.id.clone(), project))
                 .collect(),
-            sessions_by_id: sessions
+            // Keep the complete index for direct lookup by acceptance detail,
+            // message history, and report generation. Only the list-shaped
+            // fields above are user-visible.
+            sessions_by_id: all_sessions
                 .iter()
                 .cloned()
                 .map(|session| (session.id.clone(), session))
@@ -4187,11 +4339,15 @@ struct GitStatusState {
 fn git_fingerprint_for_projects(projects: &[ProjectSummary]) -> u64 {
     projects
         .iter()
-        .map(|project| git_project_state(&project.root_path).fingerprint)
+        .map(|project| git_project_state_with_status(&project.root_path, false).fingerprint)
         .fold(0, |acc, fingerprint| acc ^ fingerprint)
 }
 
 fn git_project_state(root_path: &str) -> GitProjectState {
+    git_project_state_with_status(root_path, true)
+}
+
+fn git_project_state_with_status(root_path: &str, include_status: bool) -> GitProjectState {
     if root_path.contains("://") {
         return GitProjectState::default();
     }
@@ -4224,7 +4380,9 @@ fn git_project_state(root_path: &str) -> GitProjectState {
                 .strip_prefix("refs/heads/")
                 .map(ToString::to_string)
         });
-    let status = git_status_for_project(root_path);
+    let status = include_status
+        .then(|| git_status_for_project(root_path))
+        .flatten();
 
     GitProjectState {
         branch: status
@@ -4385,7 +4543,6 @@ fn domain_store_path(metadata_path: &Path) -> PathBuf {
         .unwrap_or("sessions-metadata.json");
     metadata_path.with_file_name(format!("{file_name}.v2.sqlite3"))
 }
-
 fn pi_plugin_store_path(metadata_path: &Path) -> PathBuf {
     metadata_path
         .parent()
@@ -4537,6 +4694,7 @@ mod tests {
     }
 
     struct TestMessageProvider {
+        revision: std::sync::atomic::AtomicU64,
         sessions: TokioMutex<HashMap<String, SessionSummary>>,
         messages: TokioMutex<HashMap<String, Vec<ChatMessage>>>,
         cancelled: TokioMutex<Vec<(String, Option<String>)>>,
@@ -4545,6 +4703,7 @@ mod tests {
     impl TestMessageProvider {
         fn new(messages: HashMap<String, Vec<ChatMessage>>) -> Self {
             Self {
+                revision: std::sync::atomic::AtomicU64::new(0),
                 sessions: TokioMutex::new(HashMap::new()),
                 messages: TokioMutex::new(messages),
                 cancelled: TokioMutex::new(Vec::new()),
@@ -4556,6 +4715,8 @@ mod tests {
                 .lock()
                 .await
                 .insert(session.id.clone(), session);
+            self.revision
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
 
         async fn set_messages(&self, session_id: impl Into<String>, messages: Vec<ChatMessage>) {
@@ -4572,6 +4733,10 @@ mod tests {
 
     #[async_trait]
     impl AgentProvider for TestMessageProvider {
+        async fn catalog_revision(&self) -> Option<u64> {
+            Some(self.revision.load(std::sync::atomic::Ordering::SeqCst))
+        }
+
         async fn list_sessions(&self) -> HashMap<String, SessionSummary> {
             self.sessions.lock().await.clone()
         }
@@ -5054,6 +5219,8 @@ mod tests {
             provider_id: None,
             reasoning_effort: None,
             model: None,
+            profile_id: None,
+            profile_name: None,
         };
         provider.set_session(provider_session.clone()).await;
         let now = Utc::now();
@@ -5127,6 +5294,155 @@ mod tests {
             Some("provider-user")
         );
         assert_eq!(snapshot.cursor, 3);
+
+        let mut messages = state.list_messages(&provider_session.id).await.unwrap();
+        messages.extend([
+            test_message(
+                "cli-user-2",
+                &provider_session.id,
+                MessageRole::User,
+                "continue in CLI",
+                now + chrono::TimeDelta::minutes(1),
+            ),
+            test_message(
+                "cli-assistant-2",
+                &provider_session.id,
+                MessageRole::Assistant,
+                "latest CLI reply",
+                now + chrono::TimeDelta::minutes(2),
+            ),
+        ]);
+        provider
+            .set_messages(provider_session.id.clone(), messages)
+            .await;
+
+        let refreshed = state
+            .domain_session_state(&provider_session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(refreshed.turns.len(), 2);
+        assert_eq!(refreshed.turns[0].id, snapshot.turns[0].id);
+        assert_eq!(refreshed.turns[0].artifacts.len(), 1);
+        assert_eq!(refreshed.turns[1].user_message.content, "continue in CLI");
+        assert_eq!(
+            refreshed.turns[1].segments[0]
+                .message
+                .as_ref()
+                .unwrap()
+                .content,
+            "latest CLI reply"
+        );
+        assert!(refreshed.cursor > snapshot.cursor);
+        assert_eq!(
+            state
+                .domain_session_state(&provider_session.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .cursor,
+            refreshed.cursor
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_cleanup_does_not_interrupt_a_new_turn() {
+        let provider = Arc::new(TestMessageProvider::new(HashMap::new()));
+        let registry = ProviderRegistry::from_map(HashMap::from([(
+            AgentKind::Codex,
+            provider as Arc<dyn AgentProvider>,
+        )]));
+        let state = Arc::new(test_state_with_providers("cancel-next-turn", registry).await);
+        let project = state
+            .create_project(CreateProjectInput {
+                name: "Project".to_string(),
+                root_path: std::env::temp_dir().to_string_lossy().to_string(),
+            })
+            .await;
+        let session = state
+            .create_session(CreateSessionInput {
+                client_session_id: Uuid::new_v4().to_string(),
+                project_id: project.id,
+                title: Some("Cancel race".to_string()),
+                agent: AgentKind::Codex,
+                brief_reply_mode: false,
+                provider_id: None,
+                reasoning_effort: None,
+                model: None,
+            })
+            .await
+            .unwrap();
+        let mut command = CreateTurnCommand {
+            command_id: "old-command".to_string(),
+            turn_id: "old-turn".to_string(),
+            user_message_id: "old-user".to_string(),
+            content: "first".to_string(),
+            attachments: Vec::new(),
+            input_mode: InputMode::Text,
+            system_prompt: None,
+            expected_session_version: None,
+            provider_id: None,
+            reasoning_effort: None,
+            model: None,
+        };
+        state
+            .create_domain_turn(&session.id, &command)
+            .await
+            .unwrap();
+        state
+            .patch_session(&session.id, SessionStatus::Running, None)
+            .await;
+        let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
+        {
+            let mut runtime = state.runtime.lock().await;
+            let entry = runtime.entry(session.id.clone()).or_default();
+            entry.turn_in_flight = true;
+            entry.cancel_tx = Some(cancel_tx);
+        }
+        let cancelling_state = Arc::clone(&state);
+        let session_id = session.id.clone();
+        let cancelling =
+            tokio::spawn(async move { cancelling_state.cancel_turn(&session_id).await });
+        tokio::time::timeout(Duration::from_secs(2), cancel_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            state
+                .session_domain
+                .session_state(&session.id)
+                .unwrap()
+                .unwrap()
+                .turns[0]
+                .status,
+            TurnStatus::Cancelled
+        );
+
+        command.command_id = "new-command".to_string();
+        command.turn_id = "new-turn".to_string();
+        command.user_message_id = "new-user".to_string();
+        state
+            .create_domain_turn(&session.id, &command)
+            .await
+            .unwrap();
+        {
+            let mut runtime = state.runtime.lock().await;
+            let entry = runtime.get_mut(&session.id).unwrap();
+            entry.turn_in_flight = true;
+            entry.interrupted = false;
+        }
+        assert!(cancelling.await.unwrap().unwrap());
+        let snapshot = state
+            .session_domain
+            .session_state(&session.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.session.active_turn_id.as_deref(), Some("new-turn"));
+        assert_eq!(snapshot.turns[0].status, TurnStatus::Cancelled);
+        assert!(matches!(
+            state.get_session(&session.id).await.unwrap().session.status,
+            SessionStatus::Running
+        ));
     }
 
     #[tokio::test]
@@ -5152,6 +5468,8 @@ mod tests {
             provider_id: None,
             reasoning_effort: None,
             model: None,
+            profile_id: None,
+            profile_name: None,
         };
         provider.set_session(provider_session.clone()).await;
 
@@ -5164,6 +5482,16 @@ mod tests {
         assert_eq!(sessions[0].id, provider_session.id);
         assert_eq!(sessions[0].title, provider_session.title);
         assert_eq!(sessions[0].updated_at, provider_session.updated_at);
+
+        let mut added = provider_session.clone();
+        added.id = "new-provider-session-after-cached-list".to_string();
+        provider.set_session(added.clone()).await;
+        let refreshed = state
+            .list_domain_session_summaries(Some("provider-project"))
+            .await
+            .unwrap();
+        assert_eq!(refreshed.len(), 2);
+        assert!(refreshed.iter().any(|session| session.id == added.id));
     }
 
     #[tokio::test]
@@ -5303,6 +5631,8 @@ mod tests {
             provider_id: None,
             reasoning_effort: None,
             model: None,
+            profile_id: None,
+            profile_name: None,
         };
         provider
             .set_session(session(
@@ -5905,6 +6235,8 @@ mod tests {
                     provider_id: None,
                     reasoning_effort: None,
                     model: None,
+                    profile_id: None,
+                    profile_name: None,
                 },
             ),
             (
@@ -5924,6 +6256,8 @@ mod tests {
                     provider_id: None,
                     reasoning_effort: None,
                     model: None,
+                    profile_id: None,
+                    profile_name: None,
                 },
             ),
             (
@@ -5943,6 +6277,8 @@ mod tests {
                     provider_id: None,
                     reasoning_effort: None,
                     model: None,
+                    profile_id: None,
+                    profile_name: None,
                 },
             ),
         ]);
@@ -6007,6 +6343,8 @@ mod tests {
             provider_id: None,
             reasoning_effort: None,
             model: None,
+            profile_id: None,
+            profile_name: None,
         };
 
         let resolved = state.resolve_provider_config(&session, &None).await;
@@ -6679,6 +7017,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persisted_rollout_titles_are_repaired_without_changing_explicit_names() {
+        for explicit_name in [false, true] {
+            let provider = Arc::new(TestMessageProvider::new(HashMap::new()));
+            let registry = ProviderRegistry::from_map(HashMap::from([(
+                AgentKind::Codex,
+                provider.clone() as Arc<dyn AgentProvider>,
+            )]));
+            let state = test_state_with_providers("repair-rollout-title", registry).await;
+            let project = state
+                .create_project(CreateProjectInput {
+                    name: "Project".to_string(),
+                    root_path: std::env::temp_dir().to_string_lossy().to_string(),
+                })
+                .await;
+            let filename_title = "rollout-2026-10-23T18-50-13-01a1";
+            let mut local = state
+                .create_session(CreateSessionInput {
+                    client_session_id: Uuid::new_v4().to_string(),
+                    project_id: project.id,
+                    title: Some(filename_title.to_string()),
+                    agent: AgentKind::Codex,
+                    brief_reply_mode: false,
+                    provider_id: None,
+                    reasoning_effort: None,
+                    model: None,
+                })
+                .await
+                .unwrap();
+            local.status = SessionStatus::Interrupted;
+            local.unread_count = 7;
+            state
+                .sessions
+                .write()
+                .await
+                .insert(local.id.clone(), local.clone());
+            if explicit_name {
+                state
+                    .persist_session_title_override(&local.id, filename_title)
+                    .await
+                    .unwrap();
+            } else {
+                state.write_session_metadata().await.unwrap();
+            }
+            let mut native = local.clone();
+            native.title = "支持暗色模式".to_string();
+            native.status = SessionStatus::Idle;
+            native.unread_count = 0;
+            provider.set_session(native).await;
+            state.invalidate_list_cache().await;
+            let expected = if explicit_name {
+                filename_title
+            } else {
+                "支持暗色模式"
+            };
+            // A detail read before a list read must repair the restored local copy.
+            let found = state.find_session(&local.id).await.unwrap();
+            assert_eq!(found.title, expected);
+            assert!(matches!(found.status, SessionStatus::Interrupted));
+            assert_eq!(found.unread_count, 7);
+            assert_eq!(found.updated_at, local.updated_at);
+            assert_eq!(
+                state
+                    .list_sessions()
+                    .await
+                    .into_iter()
+                    .find(|s| s.id == local.id)
+                    .unwrap()
+                    .title,
+                expected
+            );
+            assert_eq!(
+                state
+                    .list_domain_session_summaries(None)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|s| s.id == local.id)
+                    .unwrap()
+                    .title,
+                expected
+            );
+            let persisted =
+                load_persisted_session_metadata(&state.session_metadata_store_path).await;
+            let entry = &persisted.sessions[&local.id];
+            assert_eq!(entry.session.as_ref().unwrap().title, expected);
+            assert_eq!(entry.title.is_some(), explicit_name);
+        }
+    }
+
+    #[tokio::test]
     async fn update_session_title_persists_override_metadata() {
         let settings_path = test_path("persist-title-settings");
         let runtime_path = test_path("persist-title-runtime");
@@ -6776,6 +7204,8 @@ mod tests {
                 provider_id: None,
                 reasoning_effort: None,
                 model: None,
+                profile_id: None,
+                profile_name: None,
             })
             .await;
 
@@ -6978,6 +7408,8 @@ mod tests {
                 provider_id: None,
                 reasoning_effort: None,
                 model: None,
+                profile_id: None,
+                profile_name: None,
             })
             .await;
         state.messages.write().await.insert(
@@ -7100,6 +7532,8 @@ mod tests {
             provider_id: Some(AUTO_PROVIDER_ID.to_string()),
             reasoning_effort: None,
             model: None,
+            profile_id: None,
+            profile_name: None,
         };
 
         let resolved = state.resolve_provider_config(&session, &None).await;
@@ -7156,6 +7590,8 @@ mod tests {
             provider_id: Some(AUTO_PROVIDER_ID.to_string()),
             reasoning_effort: None,
             model: None,
+            profile_id: None,
+            profile_name: None,
         };
 
         let resolved = state

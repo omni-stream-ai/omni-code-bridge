@@ -251,7 +251,15 @@ impl RuntimePluginStore {
         Ok(image_id)
     }
 
-    async fn verify_image(&self, image: &str) -> Result<()> {
+    pub(crate) async fn verify_image(&self, image: &str) -> Result<()> {
+        self.docker(
+            &[
+                "run", "--rm", "--network=none", "--cap-drop=ALL",
+                "--security-opt=no-new-privileges", "--entrypoint=timeout", image,
+                "--kill-after=2s", "25s", "sh", "-c",
+                "test \"$(id -u)\" = 1000 && test -w /workspace && test -w /var/lib/x11box && command -v x11box && command -v ffmpeg",
+            ], 30,
+        ).await.context("image must retain the writable x11box user environment")?;
         let name = format!("omni-x11box-check-{}", Uuid::new_v4().simple());
         let result = async {
             self.docker(
@@ -270,8 +278,8 @@ impl RuntimePluginStore {
                     "--memory=1g",
                     "--shm-size=256m",
                     "--network=none",
+                    "--entrypoint=timeout",
                     image,
-                    "timeout",
                     "--kill-after=5s",
                     "240s",
                     "x11box",

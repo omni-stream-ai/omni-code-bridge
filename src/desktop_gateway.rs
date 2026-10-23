@@ -732,6 +732,19 @@ mod tests {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
+        fixture
+            .state
+            .acceptance
+            .environments
+            .save_config(
+                "browser-fixture",
+                crate::project_environment::EnvironmentConfig {
+                    mode: crate::project_environment::EnvironmentMode::Base,
+                    ..Default::default()
+                },
+                false,
+            )
+            .unwrap();
         let id = Uuid::new_v4().to_string();
         fixture
             .state
@@ -744,9 +757,13 @@ mod tests {
                     command: "chromium --no-sandbox --new-window file:///workspace/index.html"
                         .into(),
                     size: "pc".into(),
+                    automatic: false,
+                    requirements: None,
                 },
                 &project,
                 "acceptance-test",
+                Vec::new(),
+                None,
             )
             .await
             .unwrap();

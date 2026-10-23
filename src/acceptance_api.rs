@@ -10,9 +10,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
-    acceptance::{AcceptanceResult, AcceptanceRun, CreateAcceptance},
+    acceptance::{AcceptanceResult, AcceptanceRun, AcceptanceTestCase, CreateAcceptance},
     app_state::AppState,
     models::{ApiError, ApiResponse},
+    project_environment::{EnvironmentConfig, EnvironmentMode, EnvironmentSettings},
     runtime_plugin::{MANIFEST, PluginInstallation},
 };
 
@@ -25,13 +26,92 @@ pub fn router() -> Router<Arc<AppState>> {
                 .delete(uninstall_plugin),
         )
         .route("/v2/acceptance", get(list_runs).post(create_run))
+        .route(
+            "/v2/projects/{project_id}/acceptance-environment",
+            get(project_environment).post(save_project_environment),
+        )
         .route("/v2/acceptance/{id}", get(get_run))
+        .route("/v2/acceptance/{id}/test-plan", post(edit_test_plan))
+        .route("/v2/acceptance/{id}/test-plan/retry", post(retry_test_plan))
+        .route(
+            "/v2/acceptance/{id}/test-plan/messages",
+            post(revise_test_plan),
+        )
+        .route(
+            "/v2/acceptance/{id}/test-plan/confirm",
+            post(confirm_test_plan),
+        )
         .route("/v2/acceptance/{id}/control", post(control))
         .route("/v2/acceptance/{id}/instructions", post(instruction))
         .route("/v2/acceptance/{id}/screenshots", post(screenshot))
+        .route("/v2/acceptance/{id}/evidence", post(save_evidence))
         .route("/v2/acceptance/{id}/preview", get(preview))
         .route("/v2/acceptance/{id}/stop", post(stop))
         .route("/v2/acceptance/{id}/artifacts/{name}", get(artifact))
+}
+
+async fn require_project(state: &AppState, id: &str) -> Result<(), ApiError> {
+    if !state
+        .list_projects()
+        .await
+        .iter()
+        .any(|project| project.id == id)
+    {
+        return Err(bad_request("project not found"));
+    }
+    Ok(())
+}
+
+async fn project_environment(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+) -> Result<Json<ApiResponse<EnvironmentSettings>>, ApiError> {
+    crate::api::authorize_request(&headers, &state).await?;
+    require_project(&state, &project_id).await?;
+    Ok(Json(ApiResponse {
+        data: state
+            .acceptance
+            .environments
+            .settings(&project_id)
+            .map_err(internal)?,
+    }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SaveEnvironment {
+    #[serde(default)]
+    mode: EnvironmentMode,
+    #[serde(default)]
+    dockerfile: String,
+    #[serde(default)]
+    image: String,
+    #[serde(default)]
+    rebuild: bool,
+}
+
+async fn save_project_environment(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+    Json(input): Json<SaveEnvironment>,
+) -> Result<Json<ApiResponse<EnvironmentSettings>>, ApiError> {
+    crate::api::authorize_request(&headers, &state).await?;
+    require_project(&state, &project_id).await?;
+    let config = EnvironmentConfig {
+        mode: input.mode,
+        dockerfile: input.dockerfile,
+        image: input.image,
+        ..Default::default()
+    };
+    Ok(Json(ApiResponse {
+        data: state
+            .acceptance
+            .environments
+            .save_config(&project_id, config, input.rebuild)
+            .map_err(operation_error)?,
+    }))
 }
 
 async fn list_runs(
@@ -56,6 +136,7 @@ async fn create_run(
         .into_iter()
         .find(|p| p.id == input.project_id)
         .ok_or_else(|| bad_request("project not found"))?;
+    let mut context_messages = Vec::new();
     if let Some(session_id) = &input.session_id {
         let session = state
             .get_session(session_id)
@@ -64,11 +145,23 @@ async fn create_run(
         if session.session.project_id != project.id {
             return Err(bad_request("session belongs to another project"));
         }
+        if input.automatic {
+            context_messages = state
+                .list_messages(session_id)
+                .await
+                .ok_or_else(|| bad_request("无法读取当前会话的验收需求"))?;
+        }
     }
     let client = client_id(&headers)?;
     let data = state
         .acceptance
-        .create(input, std::path::Path::new(&project.root_path), client)
+        .create(
+            input,
+            std::path::Path::new(&project.root_path),
+            client,
+            context_messages,
+            Some(Arc::clone(&state)),
+        )
         .await
         .map_err(operation_error)?;
     Ok((StatusCode::ACCEPTED, Json(ApiResponse { data })))
@@ -87,6 +180,86 @@ async fn get_run(
             .await
             .map_err(operation_error)?,
     }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EditTestPlan {
+    version: u64,
+    cases: Vec<AcceptanceTestCase>,
+}
+
+async fn retry_test_plan(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<(StatusCode, Json<ApiResponse<AcceptanceRun>>), ApiError> {
+    crate::api::authorize_request(&headers, &state).await?;
+    let data = state
+        .acceptance
+        .retry_test_plan(Arc::clone(&state), &id)
+        .await
+        .map_err(operation_error)?;
+    Ok((StatusCode::ACCEPTED, Json(ApiResponse { data })))
+}
+
+async fn edit_test_plan(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<EditTestPlan>,
+) -> Result<Json<ApiResponse<AcceptanceRun>>, ApiError> {
+    crate::api::authorize_request(&headers, &state).await?;
+    Ok(Json(ApiResponse {
+        data: state
+            .acceptance
+            .edit_test_plan(&id, input.version, input.cases)
+            .await
+            .map_err(operation_error)?,
+    }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReviseTestPlan {
+    version: u64,
+    message: String,
+}
+
+async fn revise_test_plan(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<ReviseTestPlan>,
+) -> Result<(StatusCode, Json<ApiResponse<AcceptanceRun>>), ApiError> {
+    crate::api::authorize_request(&headers, &state).await?;
+    let data = state
+        .acceptance
+        .revise_test_plan(Arc::clone(&state), &id, input.version, input.message)
+        .await
+        .map_err(operation_error)?;
+    Ok((StatusCode::ACCEPTED, Json(ApiResponse { data })))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfirmTestPlan {
+    version: u64,
+}
+
+async fn confirm_test_plan(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<ConfirmTestPlan>,
+) -> Result<(StatusCode, Json<ApiResponse<AcceptanceRun>>), ApiError> {
+    crate::api::authorize_request(&headers, &state).await?;
+    let data = state
+        .acceptance
+        .confirm_test_plan(Arc::clone(&state), &id, input.version, client_id(&headers)?)
+        .await
+        .map_err(operation_error)?;
+    Ok((StatusCode::ACCEPTED, Json(ApiResponse { data })))
 }
 
 #[derive(Deserialize)]
@@ -167,6 +340,38 @@ async fn preview(
         bytes,
     )
         .into_response())
+}
+
+async fn save_evidence(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<AcceptanceRun>>, ApiError> {
+    crate::api::authorize_request(&headers, &state).await?;
+    let run = state
+        .acceptance
+        .snapshot(&id)
+        .await
+        .map_err(operation_error)?;
+    if run.automatic
+        && !matches!(
+            run.automation,
+            crate::acceptance::AutomationPhase::AwaitingConfirmation
+                | crate::acceptance::AutomationPhase::Completed
+                | crate::acceptance::AutomationPhase::Failed
+        )
+    {
+        return Err(ApiError {
+            status: StatusCode::CONFLICT,
+            message: "Automatic acceptance is still running".into(),
+        });
+    }
+    let data = state
+        .acceptance
+        .save_evidence(&id)
+        .await
+        .map_err(operation_error)?;
+    Ok(Json(ApiResponse { data }))
 }
 
 #[derive(Deserialize)]
@@ -348,6 +553,8 @@ fn operation_error(error: anyhow::Error) -> ApiError {
         || message.contains("not ready")
         || message.contains("not running")
         || message.contains("already exists")
+        || message.contains("已更新")
+        || message.contains("当前不能")
     {
         StatusCode::CONFLICT
     } else {
@@ -402,6 +609,121 @@ async fn uninstall_plugin(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn project_environments_are_authenticated_isolated_and_validated() {
+        let fixture = crate::acceptance_test_support::Fixture::new().await;
+        let a = fixture
+            .state
+            .create_project(crate::models::CreateProjectInput {
+                name: "A".into(),
+                root_path: fixture.root.join("a").to_string_lossy().into_owned(),
+            })
+            .await;
+        let b = fixture
+            .state
+            .create_project(crate::models::CreateProjectInput {
+                name: "B".into(),
+                root_path: fixture.root.join("b").to_string_lossy().into_owned(),
+            })
+            .await;
+        let (origin, server) = fixture.server().await;
+        let client = reqwest::Client::new();
+        let url = format!("{origin}/v2/projects/{}/acceptance-environment", a.id);
+        assert_eq!(
+            client.get(&url).send().await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let response = client
+            .post(&url)
+            .headers(fixture.headers.clone())
+            .json(&json!({"mode":"dockerfile","dockerfile":"FROM {{BASE_IMAGE}}","rebuild":true}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let data: Value = response.json().await.unwrap();
+        assert_eq!(data["data"]["config"]["mode"], "dockerfile");
+        assert!(
+            !data["data"]["config"]["generation"]
+                .as_str()
+                .unwrap()
+                .is_empty()
+        );
+        let response = client
+            .get(format!(
+                "{origin}/v2/projects/{}/acceptance-environment",
+                b.id
+            ))
+            .headers(fixture.headers.clone())
+            .send()
+            .await
+            .unwrap();
+        let data: Value = response.json().await.unwrap();
+        assert_eq!(data["data"]["config"]["mode"], "auto");
+        let response = client
+            .post(&url)
+            .headers(fixture.headers.clone())
+            .json(&json!({"mode":"image","image":"--privileged"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let response = client
+            .get(format!(
+                "{origin}/v2/projects/missing/acceptance-environment"
+            ))
+            .headers(fixture.headers.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_plan_http_edits_are_persisted_and_old_confirmation_is_rejected() {
+        let fixture = crate::acceptance_test_support::Fixture::new().await;
+        let path = fixture
+            .state
+            .runtime_plugins
+            .root
+            .join("runs")
+            .join(&fixture.id)
+            .join("run.json");
+        let mut value: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        value["phase"] = json!("planning");
+        value["automatic"] = json!(true);
+        value["automation"] = json!("awaiting_plan_approval");
+        let cases = json!([{"id":"login","title":"Login errors","steps":["Enter an invalid password"],"expected":"Show an error"}]);
+        value["test_plan"] = json!({"version":1,"cases":cases});
+        crate::runtime_plugin::atomic_json(&path, &value).unwrap();
+        let (url, server) = fixture.server().await;
+        let client = reqwest::Client::new();
+        let saved = client
+            .post(format!("{url}/v2/acceptance/{}/test-plan", fixture.id))
+            .headers(fixture.headers.clone())
+            .json(&json!({"version":1,"cases":cases}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(saved.status(), StatusCode::OK);
+        let saved: Value = saved.json().await.unwrap();
+        assert_eq!(saved["data"]["test_plan"]["version"], 2);
+        assert!(saved["data"]["desktop_port"].is_null());
+        let stale = client
+            .post(format!(
+                "{url}/v2/acceptance/{}/test-plan/confirm",
+                fixture.id
+            ))
+            .headers(fixture.headers.clone())
+            .json(&json!({"version":1}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+        server.abort();
+    }
 
     #[test]
     fn media_ranges_cover_open_suffix_clamped_and_unsatisfiable_requests() {
@@ -495,6 +817,36 @@ mod tests {
                 None,
             ),
             (reqwest::Method::GET, "/v2/acceptance".into(), None),
+            (
+                reqwest::Method::POST,
+                format!("/v2/acceptance/{id}/test-plan"),
+                Some(json!({"version":1,"cases":[]})),
+            ),
+            (
+                reqwest::Method::POST,
+                format!("/v2/acceptance/{id}/test-plan/messages"),
+                Some(json!({"version":1,"message":"change cases"})),
+            ),
+            (
+                reqwest::Method::POST,
+                format!("/v2/acceptance/{id}/test-plan/confirm"),
+                Some(json!({"version":1})),
+            ),
+            (
+                reqwest::Method::POST,
+                format!("/v2/acceptance/{id}/test-plan/retry"),
+                None,
+            ),
+            (
+                reqwest::Method::GET,
+                "/v2/projects/missing/acceptance-environment".into(),
+                None,
+            ),
+            (
+                reqwest::Method::POST,
+                "/v2/projects/missing/acceptance-environment".into(),
+                Some(json!({"mode":"base"})),
+            ),
             (
                 reqwest::Method::GET,
                 format!("/v2/acceptance/{id}/preview"),
