@@ -8403,6 +8403,26 @@ async fn run_codex(
                     }
                     CodexAppServerEvent::TurnCompleted => {
                         turn_finished = true;
+                        // A turn can complete without a final commandExecution
+                        // update (for example when the app-server batches the
+                        // terminal item notification). In that case the last
+                        // watchdog status remains "command still running" in
+                        // the conversation forever. Publish a terminal
+                        // activity before leaving the loop so the correlated
+                        // running activity is closed in the domain projection.
+                        if let Some(command) = parsed
+                            .running_command
+                            .as_ref()
+                            .map(|running| running.command.clone())
+                        {
+                            state
+                                .emit_progress(
+                                    &session.id,
+                                    render_command_summary(&command, "completed", None),
+                                )
+                                .await;
+                            parsed.running_command = None;
+                        }
                         if !parsed.has_background_processes()
                             && (!goal_mode || parsed.goal_is_terminal())
                         {
