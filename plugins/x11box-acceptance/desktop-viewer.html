@@ -18,6 +18,8 @@
     iframe { position: absolute; top: 0; left: 0; border: 0; transform-origin: top left; }
     #pan-layer { display: none; position: absolute; inset: 0; cursor: grab; touch-action: none; }
     #pan-layer.active { display: block; }
+    #native-input { display: none; margin: 4px; padding: 8px; min-height: 42px; font: 16px system-ui; }
+    #native-input.active { display: block; }
   </style>
 </head>
 <body>
@@ -25,9 +27,11 @@
     <button id="fit" aria-pressed="true">Fit</button>
     <button id="actual" aria-pressed="false">100%</button>
     <button id="pan" aria-pressed="false">Pan</button>
+    <button id="scroll" aria-pressed="false">Scroll</button>
     <button id="keyboard" aria-pressed="false">Keyboard</button>
     <output id="zoom" aria-live="polite"></output>
   </nav>
+  <textarea id="native-input" rows="1" autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="Remote keyboard"></textarea>
   <main id="viewport">
     <div id="stage">
       <iframe id="desktop" title="Remote desktop" allow="clipboard-read; clipboard-write; fullscreen"></iframe>
@@ -46,19 +50,27 @@
       const actualButton = document.getElementById('actual');
       const panButton = document.getElementById('pan');
       const keyboardButton = document.getElementById('keyboard');
+      const scrollButton = document.getElementById('scroll');
+      const input = document.getElementById('native-input');
       const zoom = document.getElementById('zoom');
       let fitting = true;
       let panning = false;
+      let scrolling = false;
       const chinese = navigator.language.startsWith('zh');
       if (chinese) {
         document.documentElement.lang = 'zh';
         fitButton.textContent = '适应屏幕';
         panButton.textContent = '拖动查看';
-        keyboardButton.textContent = '键盘';
+        keyboardButton.textContent = '手机键盘';
+        scrollButton.textContent = '滚动页面';
+        input.placeholder = '输入文字，发送到远程桌面';
+        input.setAttribute('aria-label', '手机键盘输入');
       }
       function pan(enabled) {
         panning = enabled;
-        layer.classList.toggle('active', enabled);
+        if (enabled) scrolling = false;
+        scrollButton.setAttribute('aria-pressed', String(scrolling));
+        layer.classList.toggle('active', enabled || scrolling);
         panButton.setAttribute('aria-pressed', String(enabled));
         panButton.textContent = chinese ? (enabled ? '恢复操作' : '拖动查看') : (enabled ? 'Control' : 'Pan');
       }
@@ -79,13 +91,66 @@
       fitButton.onclick = () => { fitting = true; pan(false); layout(); };
       actualButton.onclick = () => { fitting = false; layout(); };
       panButton.onclick = () => pan(!panning);
-      keyboardButton.onclick = () => {
-        const remote = frame.contentWindow;
-        if (typeof remote.toggle_keyboard !== 'function') return;
-        remote.toggle_keyboard();
-        const visible = remote.getComputedStyle(remote.document.querySelector('.simple-keyboard')).display !== 'none';
-        keyboardButton.setAttribute('aria-pressed', String(visible));
+      scrollButton.onclick = () => {
+        const enabled = !scrolling;
+        pan(false);
+        scrolling = enabled;
+        layer.classList.toggle('active', enabled);
+        scrollButton.setAttribute('aria-pressed', String(enabled));
       };
+      keyboardButton.onclick = () => {
+        const enabled = !input.classList.contains('active');
+        input.classList.toggle('active', enabled);
+        keyboardButton.setAttribute('aria-pressed', String(enabled));
+        if (enabled) input.focus();
+        else input.blur();
+      };
+      // A real editable element is required to open Android/iOS keyboards.
+      // Send committed IME text only, so Chinese composition is not duplicated.
+      function sendKey(name, text, keyval) {
+        const client = frame.contentWindow.client;
+        if (!client?.connected || client.server_readonly) return;
+        const wid = client.focused_wid || client.topwindow;
+        if (!wid) return;
+        for (const pressed of [true, false]) {
+          client.send(['key-action', wid, name, pressed, [], keyval, text, 0, 0]);
+        }
+      }
+      function commit() {
+        for (const char of input.value) {
+          const point = char.codePointAt(0);
+          const special = {'\n': ['Return', 0xff0d], ' ': ['space', 32]};
+          const [name, value] = special[char] ||
+            [point <= 255 ? char : 'U' + point.toString(16).toUpperCase(),
+             point <= 255 ? point : 0x01000000 + point];
+          sendKey(name, char, value);
+        }
+        input.value = '';
+      }
+      let composing = false;
+      input.addEventListener('compositionstart', () => { composing = true; });
+      input.addEventListener('compositionend', () => { composing = false; commit(); });
+      input.addEventListener('input', event => {
+        if (composing || event.isComposing) return;
+        if (event.inputType === 'deleteContentBackward') sendKey('BackSpace', '', 0xff08);
+        else commit();
+      });
+      input.addEventListener('keydown', event => {
+        if (composing || event.isComposing || event.keyCode === 229) return;
+        const special = {Backspace: ['BackSpace', 0xff08], Enter: ['Return', 0xff0d], Tab: ['Tab', 0xff09]};
+        if (special[event.key]) {
+          event.preventDefault();
+          sendKey(special[event.key][0], '', special[event.key][1]);
+        }
+      });
+      function wheel(x, y, dx, dy) {
+        const remote = frame.contentWindow;
+        const target = remote.document.elementFromPoint(x, y);
+        target?.dispatchEvent(new remote.WheelEvent('wheel', {
+          bubbles: true, cancelable: true, clientX: x, clientY: y,
+          deltaX: dx, deltaY: dy, deltaMode: 0,
+        }));
+      }
       let last = null;
       layer.onpointerdown = event => {
         last = [event.clientX, event.clientY];
@@ -93,7 +158,12 @@
       };
       layer.onpointermove = event => {
         if (!last) return;
-        viewport.scrollBy(last[0] - event.clientX, last[1] - event.clientY);
+        if (scrolling) {
+          const rect = frame.getBoundingClientRect();
+          const scale = rect.width / width;
+          wheel((event.clientX - rect.left) / scale, (event.clientY - rect.top) / scale,
+            (last[0] - event.clientX) / scale, (last[1] - event.clientY) / scale);
+        } else viewport.scrollBy(last[0] - event.clientX, last[1] - event.clientY);
         last = [event.clientX, event.clientY];
       };
       layer.onpointerup = layer.onpointercancel = () => { last = null; };
@@ -102,6 +172,26 @@
       frame.onload = () => {
         // Xpra prevents the default pointer action. Explicitly focus the frame
         // so a touch still routes hardware keys and clipboard events to Xpra.
+        let touch = null;
+        const doc = frame.contentDocument;
+        doc.addEventListener('touchstart', event => {
+          if (event.touches.length !== 2) return;
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          touch = [event.touches[0].clientX, event.touches[0].clientY];
+        }, {capture: true, passive: false});
+        doc.addEventListener('touchmove', event => {
+          if (!touch) return;
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          const point = event.touches[0];
+          if (!point) return;
+          wheel(point.clientX, point.clientY, touch[0] - point.clientX, touch[1] - point.clientY);
+          touch = [point.clientX, point.clientY];
+        }, {capture: true, passive: false});
+        const end = () => { touch = null; };
+        doc.addEventListener('touchend', end, true);
+        doc.addEventListener('touchcancel', end, true);
         const focus = () => frame.contentWindow.focus();
         frame.contentDocument.addEventListener('pointerdown', focus, true);
         frame.contentDocument.addEventListener('touchstart', focus, {capture: true, passive: true});

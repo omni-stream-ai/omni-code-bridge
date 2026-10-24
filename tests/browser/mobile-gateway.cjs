@@ -53,9 +53,9 @@ const {chromium} = require('playwright');
     await page.locator('#fit').click();
     await assertFits();
     await page.locator('#keyboard').click();
-    assert.equal(await remote.locator('.simple-keyboard').isVisible(), true);
+    assert(await page.locator('#native-input').evaluate(el => document.activeElement === el));
     await page.locator('#keyboard').click();
-    assert.equal(await remote.locator('.simple-keyboard').isVisible(), false);
+    assert.equal(await page.locator('#native-input').isVisible(), false);
     await page.screenshot({path: config.screenshot});
     // A real touch event traverses browser -> authenticated WS -> Xpra -> X11.
     const rect = await iframe.boundingBox();
