@@ -441,6 +441,14 @@ async fn proxy(
             .on_upgrade(move |socket| relay(state, grant, socket, upstream))
             .into_response());
     }
+    if path == "input-focus" {
+        let focused = state.acceptance.desktop_input_focus(&id).await.ok();
+        return Ok((
+            [(header::CACHE_CONTROL, "private, no-store")],
+            Json(json!({"focused": focused})),
+        )
+            .into_response());
+    }
     if path == "viewer.html" {
         let shared = state
             .acceptance

@@ -4208,7 +4208,7 @@ dependencies = [
 
 [[package]]
 name = "omni-code-bridge"
-version = "0.8.0-beta.2"
+version = "0.8.0-beta.3"
 dependencies = [
  "agent-client-protocol",
  "anyhow",

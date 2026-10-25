@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=5">
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
   <meta name="referrer" content="no-referrer">
   <title>Remote desktop</title>
   <style>
@@ -20,6 +20,10 @@
     #pan-layer.active { display: block; }
     #native-input { display: none; margin: 4px; padding: 8px; min-height: 42px; font: 16px system-ui; }
     #native-input.active { display: block; }
+    #keys { display: none; gap: 4px; overflow-x: auto; padding: 4px; flex-shrink: 0; }
+    #keys.active { display: flex; }
+    #connection { padding: 4px 8px; font-size: 12px; }
+    #gesture-help { padding: 4px 8px; font-size: 12px; color: #c2ccd8; }
   </style>
 </head>
 <body>
@@ -31,6 +35,9 @@
     <button id="keyboard" aria-pressed="false">Keyboard</button>
     <output id="zoom" aria-live="polite"></output>
   </nav>
+  <output id="connection" role="status" aria-live="polite"></output>
+  <div id="keys" aria-label="Remote keys"></div>
+  <details id="gesture-help"><summary id="gesture-title">Touch gestures</summary><span id="gesture-text">Tap to click. Drag to pan the desktop. Two fingers scroll content; pinch to zoom. Hold then drag to move remote items.</span></details>
   <textarea id="native-input" rows="1" autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="Remote keyboard"></textarea>
   <main id="viewport">
     <div id="stage">
@@ -53,7 +60,27 @@
       const scrollButton = document.getElementById('scroll');
       const input = document.getElementById('native-input');
       const zoom = document.getElementById('zoom');
+      const keys = document.getElementById('keys');
+      const modifiers = new Set();
+      let anchor = null;
+      let coast = 0;
+      let cleanupGesture = () => {};
+      function stopCoast() { cancelAnimationFrame(coast); coast = 0; }
+      function inertia(vx, vy) {
+        stopCoast();
+        let previous = performance.now();
+        const tick = now => {
+          const dt = Math.min(32, now - previous); previous = now;
+          const x = viewport.scrollLeft, y = viewport.scrollTop;
+          viewport.scrollBy(vx * dt, vy * dt);
+          const decay = Math.pow(0.92, dt / 16); vx *= decay; vy *= decay;
+          if (Math.hypot(vx, vy) > 0.025 && (x !== viewport.scrollLeft || y !== viewport.scrollTop)) coast = requestAnimationFrame(tick);
+        };
+        coast = requestAnimationFrame(tick);
+      }
       let fitting = true;
+      let manualScale = 1;
+      let displayScale = 1;
       let panning = false;
       let scrolling = false;
       const chinese = navigator.language.startsWith('zh');
@@ -63,6 +90,8 @@
         panButton.textContent = '拖动查看';
         keyboardButton.textContent = '手机键盘';
         scrollButton.textContent = '滚动页面';
+        document.getElementById('gesture-title').textContent = '触控操作说明';
+        document.getElementById('gesture-text').textContent = '单指点击操作、拖动查看桌面；双指滑动滚动远程内容，捏合缩放；长按后拖动远程对象；双指轻点右键，快速连点双击。输入框聚焦时自动显示键盘；不支持自动识别的应用可点手机键盘。';
         input.placeholder = '输入文字，发送到远程桌面';
         input.setAttribute('aria-label', '手机键盘输入');
       }
@@ -77,7 +106,11 @@
       function layout() {
         // The iframe keeps the acceptance resolution. Browser hit testing maps
         // touches through the CSS transform into the original Xpra coordinates.
-        const scale = fitting ? Math.min(1, viewport.clientWidth / width, viewport.clientHeight / height) : 1;
+        const scale = fitting ? Math.min(1, viewport.clientWidth / width, viewport.clientHeight / height) : manualScale;
+        const oldScale = displayScale;
+        const center = [(viewport.scrollLeft + viewport.clientWidth / 2) / oldScale,
+          (viewport.scrollTop + viewport.clientHeight / 2) / oldScale];
+        displayScale = scale;
         frame.style.width = width + 'px';
         frame.style.height = height + 'px';
         frame.style.transform = 'scale(' + scale + ')';
@@ -87,9 +120,10 @@
         fitButton.setAttribute('aria-pressed', String(fitting));
         actualButton.setAttribute('aria-pressed', String(!fitting));
         if (fitting) viewport.scrollTo(0, 0);
+        else if (oldScale !== scale) viewport.scrollTo(center[0] * scale - viewport.clientWidth / 2, center[1] * scale - viewport.clientHeight / 2);
       }
-      fitButton.onclick = () => { fitting = true; pan(false); layout(); };
-      actualButton.onclick = () => { fitting = false; layout(); };
+      fitButton.onclick = () => { stopCoast(); fitting = true; pan(false); layout(); };
+      actualButton.onclick = () => { fitting = false; manualScale = 1; layout(); };
       panButton.onclick = () => pan(!panning);
       scrollButton.onclick = () => {
         const enabled = !scrolling;
@@ -98,12 +132,48 @@
         layer.classList.toggle('active', enabled);
         scrollButton.setAttribute('aria-pressed', String(enabled));
       };
+      let autoKeyboard = false;
+      let keyboardDismissed = false;
+      let focusProbeBusy = false;
+      let focusChecksUntil = 0;
+      async function checkInputFocus() {
+        if (focusProbeBusy || (Date.now() > focusChecksUntil && !autoKeyboard) || document.hidden) return;
+        focusProbeBusy = true;
+        try {
+          const response = await fetch('input-focus', {cache: 'no-store'});
+          if (!response.ok) return;
+          const {focused} = await response.json();
+          if (focused === false) keyboardDismissed = false;
+          if (focused === true && !keyboardDismissed && !input.classList.contains('active')) {
+            autoKeyboard = true;
+            showKeyboard();
+          } else if (focused === false && autoKeyboard) {
+            input.classList.remove('active');
+            keys.classList.remove('active');
+            keyboardButton.setAttribute('aria-pressed', 'false');
+            input.blur();
+            releaseAll();
+            autoKeyboard = false;
+          }
+        } catch (_) { /* No focus signal: keep the explicit keyboard button. */ }
+        finally { focusProbeBusy = false; }
+      }
+      setInterval(checkInputFocus, 600);
+      function showKeyboard() {
+        input.classList.add('active');
+        keys.classList.add('active');
+        keyboardButton.setAttribute('aria-pressed', 'true');
+        input.focus({preventScroll: true});
+        window.DesktopKeyboard?.postMessage('show');
+      }
       keyboardButton.onclick = () => {
+        autoKeyboard = false;
         const enabled = !input.classList.contains('active');
         input.classList.toggle('active', enabled);
         keyboardButton.setAttribute('aria-pressed', String(enabled));
-        if (enabled) input.focus();
-        else input.blur();
+        keys.classList.toggle('active', enabled);
+        if (enabled) showKeyboard();
+        else { keyboardDismissed = true; input.blur(); releaseAll(); }
       };
       // A real editable element is required to open Android/iOS keyboards.
       // Send committed IME text only, so Chinese composition is not duplicated.
@@ -113,9 +183,58 @@
         const wid = client.focused_wid || client.topwindow;
         if (!wid) return;
         for (const pressed of [true, false]) {
-          client.send(['key-action', wid, name, pressed, [], keyval, text, 0, 0]);
+          client.send(['key-action', wid, name, pressed, [...modifiers], keyval, text, 0, 0]);
         }
       }
+      const specialKeys = [['Esc','Escape',0xff1b],['Tab','Tab',0xff09],['↑','Up',0xff52],['↓','Down',0xff54],['←','Left',0xff51],['→','Right',0xff53],['Enter','Return',0xff0d],['Del','Delete',0xffff]];
+      for (const [label, name, value] of specialKeys) {
+        const button = document.createElement('button'); button.textContent = label;
+        button.onpointerdown = event => event.preventDefault();
+        button.onclick = () => sendKey(name, '', value); keys.append(button);
+      }
+      const modifierKeys = {control: ['Control_L', 0xffe3], mod1: ['Alt_L', 0xffe9], shift: ['Shift_L', 0xffe1]};
+      function setModifier(modifier, enabled) {
+        enabled ? modifiers.add(modifier) : modifiers.delete(modifier);
+        const client = frame.contentWindow?.client;
+        const wid = client?.focused_wid || client?.topwindow;
+        if (client?.connected && !client.server_readonly && wid) {
+          const [name, value] = modifierKeys[modifier];
+          client.send(['key-action', wid, name, enabled, [...modifiers], value, '', 0, 0]);
+        }
+      }
+      for (const [label, modifier] of [['Ctrl','control'],['Alt','mod1'],['Shift','shift']]) {
+        const button = document.createElement('button'); button.textContent = label;
+        button.setAttribute('aria-pressed','false');
+        button.onpointerdown = event => event.preventDefault();
+        button.onclick = () => { setModifier(modifier, !modifiers.has(modifier)); button.setAttribute('aria-pressed', String(modifiers.has(modifier))); };
+        keys.prepend(button);
+      }
+      function releaseAll() {
+        stopCoast(); cleanupGesture(); last = null;
+        for (const modifier of [...modifiers]) setModifier(modifier, false);
+        keys.querySelectorAll('[aria-pressed]').forEach(button => button.setAttribute('aria-pressed','false'));
+      }
+      document.addEventListener('visibilitychange', () => { if (document.hidden) releaseAll(); });
+      window.addEventListener('pagehide', releaseAll);
+      window.addEventListener('blur', () => { setTimeout(() => { if (!document.hasFocus()) releaseAll(); }, 0); });
+      let wasConnected = false;
+      setInterval(() => {
+        const client = frame.contentWindow?.client;
+        const connected = !!client?.connected;
+        document.getElementById('connection').textContent = chinese
+          ? (connected ? '已连接' : '连接中／等待自动重连…')
+          : (connected ? 'Connected' : 'Connecting / waiting to reconnect…');
+        if (wasConnected && !connected) releaseAll();
+        wasConnected = connected;
+      }, 1000);
+      // Keep the last touched location visible when the soft keyboard resizes the view.
+      new ResizeObserver(() => {
+        if (!input.classList.contains('active') || !anchor) return;
+        requestAnimationFrame(() => {
+          viewport.scrollLeft = Math.max(0, anchor.x * displayScale - viewport.clientWidth / 2);
+          viewport.scrollTop = Math.max(0, anchor.y * displayScale - viewport.clientHeight / 2);
+        });
+      }).observe(viewport);
       function commit() {
         for (const char of input.value) {
           const point = char.codePointAt(0);
@@ -172,34 +291,141 @@
       frame.onload = () => {
         // Xpra prevents the default pointer action. Explicitly focus the frame
         // so a touch still routes hardware keys and clipboard events to Xpra.
-        let touch = null;
         const doc = frame.contentDocument;
+        let gesture = null;
+        let hold = null;
+        const cancelHold = () => { clearTimeout(hold); hold = null; };
+        function mouse(type, x, y, pressed = false, button = 0) {
+          const target = doc.elementFromPoint(x, y);
+          target?.dispatchEvent(new frame.contentWindow.MouseEvent(type, {
+            bubbles: true, cancelable: true, clientX: x, clientY: y,
+            button, buttons: pressed ? (button === 2 ? 2 : 1) : 0,
+          }));
+        }
+        let lastTap = null;
+        cleanupGesture = () => {
+          stopCoast();
+          cancelHold();
+          if (gesture?.dragging) mouse('mouseup', gesture.x, gesture.y);
+          gesture = null;
+        };
+        function pair(touches) {
+          const [a, b] = touches;
+          return {x: (a.clientX + b.clientX) / 2, y: (a.clientY + b.clientY) / 2,
+            sx: (a.screenX + b.screenX) / 2, sy: (a.screenY + b.screenY) / 2,
+            distance: Math.hypot(a.screenX - b.screenX, a.screenY - b.screenY)};
+        }
+        doc.addEventListener('pointerdown', event => {
+          if (event.pointerType === 'touch') event.stopImmediatePropagation();
+        }, true);
         doc.addEventListener('touchstart', event => {
-          if (event.touches.length !== 2) return;
           event.preventDefault();
           event.stopImmediatePropagation();
-          touch = [event.touches[0].clientX, event.touches[0].clientY];
+          stopCoast();
+          cancelHold();
+          if (gesture?.dragging) mouse('mouseup', gesture.x, gesture.y);
+          if (event.touches.length === 2) {
+            const p = pair(event.touches);
+            gesture = {two: true, ...p, initialDistance: p.distance,
+              initialScale: displayScale, anchorX: p.x, anchorY: p.y,
+              localX: p.x * displayScale - viewport.scrollLeft, localY: p.y * displayScale - viewport.scrollTop,
+              initialSX: p.sx, initialSY: p.sy, mode: null, started: performance.now()};
+            return;
+          }
+          if (event.touches.length !== 1) { gesture = null; return; }
+          const point = event.touches[0];
+          gesture = {x: point.clientX, y: point.clientY,
+            startX: point.clientX, startY: point.clientY, sx: point.screenX, sy: point.screenY,
+            startSX: point.screenX, startSY: point.screenY, moved: false, time: performance.now(), vx: 0, vy: 0};
+          hold = setTimeout(() => {
+            if (!gesture || gesture.two || gesture.moved) return;
+            gesture.dragging = true;
+            mouse('mousemove', gesture.x, gesture.y);
+            mouse('mousedown', gesture.x, gesture.y, true);
+          }, 450);
         }, {capture: true, passive: false});
         doc.addEventListener('touchmove', event => {
-          if (!touch) return;
           event.preventDefault();
           event.stopImmediatePropagation();
+          if (!gesture) return;
+          if (gesture.two) {
+            if (event.touches.length !== 2) return;
+            const p = pair(event.touches);
+            if (!gesture.mode) {
+              if (Math.abs(p.distance / gesture.initialDistance - 1) > 0.08) gesture.mode = 'zoom';
+              else if (Math.hypot(p.sx - gesture.sx, p.sy - gesture.sy) > 8) gesture.mode = 'scroll';
+              else return;
+            }
+            if (gesture.mode === 'zoom') {
+              // Preserve the content under the fingers while changing scale.
+              fitting = false;
+              manualScale = Math.max(Math.min(1, viewport.clientWidth / width, viewport.clientHeight / height),
+                Math.min(3, gesture.initialScale * p.distance / gesture.initialDistance));
+              layout();
+              viewport.scrollLeft = gesture.anchorX * displayScale - gesture.localX - (p.sx - gesture.initialSX);
+              viewport.scrollTop = gesture.anchorY * displayScale - gesture.localY - (p.sy - gesture.initialSY);
+            } else wheel(p.x, p.y, gesture.x - p.x, gesture.y - p.y);
+            gesture.x = p.x;
+            gesture.y = p.y;
+            gesture.sx = p.sx; gesture.sy = p.sy;
+            return;
+          }
+          if (event.touches.length !== 1) return;
           const point = event.touches[0];
-          if (!point) return;
-          wheel(point.clientX, point.clientY, touch[0] - point.clientX, touch[1] - point.clientY);
-          touch = [point.clientX, point.clientY];
+          if (Math.hypot(point.screenX - gesture.startSX, point.screenY - gesture.startSY) > 8) {
+            gesture.moved = true;
+            cancelHold();
+          }
+          if (!gesture.moved && !gesture.dragging) return;
+          const dx = gesture.sx - point.screenX, dy = gesture.sy - point.screenY;
+          if (gesture.dragging) mouse('mousemove', point.clientX, point.clientY, true);
+          else if (viewport.scrollWidth > viewport.clientWidth + 1 || viewport.scrollHeight > viewport.clientHeight + 1) {
+            viewport.scrollBy(dx, dy);
+            const now = performance.now(), dt = Math.max(1, now - gesture.time);
+            gesture.vx = dx / dt; gesture.vy = dy / dt;
+            gesture.time = now; gesture.panned = true;
+          }
+          gesture.x = point.clientX;
+          gesture.y = point.clientY;
+          gesture.sx = point.screenX; gesture.sy = point.screenY;
         }, {capture: true, passive: false});
-        const end = () => { touch = null; };
-        doc.addEventListener('touchend', end, true);
-        doc.addEventListener('touchcancel', end, true);
-        const focus = () => frame.contentWindow.focus();
-        frame.contentDocument.addEventListener('pointerdown', focus, true);
-        frame.contentDocument.addEventListener('touchstart', focus, {capture: true, passive: true});
+        function end(event) {
+          cancelHold();
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          if (!gesture) return;
+          if (gesture.dragging) mouse('mouseup', gesture.x, gesture.y);
+          else if (event.type !== 'touchcancel' && gesture.two && !gesture.mode && performance.now() - gesture.started < 350) {
+            mouse('mousemove', gesture.x, gesture.y);
+            mouse('mousedown', gesture.x, gesture.y, true, 2);
+            mouse('mouseup', gesture.x, gesture.y, false, 2);
+            mouse('contextmenu', gesture.x, gesture.y, false, 2);
+          } else if (!gesture.two && !gesture.moved && event.type !== 'touchcancel') {
+            mouse('mousemove', gesture.startX, gesture.startY);
+            mouse('mousedown', gesture.startX, gesture.startY, true);
+            mouse('mouseup', gesture.startX, gesture.startY);
+            mouse('click', gesture.startX, gesture.startY);
+            const now = performance.now();
+            if (lastTap && now - lastTap.time < 350 && Math.hypot(gesture.startX - lastTap.x, gesture.startY - lastTap.y) * displayScale < 24) {
+              mouse('dblclick', gesture.startX, gesture.startY); lastTap = null;
+            } else lastTap = {time: now, x: gesture.startX, y: gesture.startY};
+            anchor = {x: gesture.startX, y: gesture.startY};
+            keyboardDismissed = false;
+            focusChecksUntil = Date.now() + 5000;
+            void checkInputFocus();
+          }
+          if (gesture.panned && event.type !== 'touchcancel' && performance.now() - gesture.time < 80) inertia(gesture.vx, gesture.vy);
+          gesture = null;
+        }
+        doc.addEventListener('touchend', end, {capture: true, passive: false});
+        doc.addEventListener('touchcancel', end, {capture: true, passive: false});
+
       };
       const url = new URL('index.html', location.href);
       url.searchParams.set('path', new URL('./', location.href).pathname);
       url.searchParams.set('autoconnect', 'true');
       url.searchParams.set('keyboard', 'false');
+      url.searchParams.set('reconnect', 'true');
       url.searchParams.set('floating_menu', 'false');
       frame.src = url.href;
     })();

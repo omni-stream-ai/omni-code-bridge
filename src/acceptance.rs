@@ -1681,6 +1681,31 @@ tail -c 6000 "$state/start-app.log" 2>/dev/null || true"#,
         Ok(run.clone())
     }
 
+    /// Read-only browser focus probe, also allowed during manual control.
+    pub async fn desktop_input_focus(&self, id: &str) -> Result<bool> {
+        let name = container_name(id);
+        let probe = r#"browser eval (()=>{if(!document.hasFocus())return 'OMNI_INPUT_'+'BLURRED';let e=document.activeElement;while(e){if(e.shadowRoot?.activeElement){e=e.shadowRoot.activeElement;continue}if(e.tagName==='IFRAME'){try{const d=e.contentDocument;if(d){e=d.activeElement;continue}}catch(_){} }break}const yes=e&&!e.disabled&&!e.readOnly&&(e.isContentEditable||e.tagName==='TEXTAREA'||(e.tagName==='INPUT'&&!['button','submit','reset','checkbox','radio','range','color','file','hidden','image'].includes(e.type)));return 'OMNI_INPUT_'+(yes?'FOCUSED':'BLURRED')})()"#;
+        let result = self
+            .runtime
+            .docker(
+                &[
+                    "exec",
+                    &name,
+                    "timeout",
+                    "--kill-after=1s",
+                    "2s",
+                    "x11box",
+                    "do",
+                    probe,
+                    "--timeout-ms",
+                    "1000",
+                ],
+                4,
+            )
+            .await?;
+        Ok(result.contains("OMNI_INPUT_FOCUSED") && !result.contains("OMNI_INPUT_BLURRED"))
+    }
+
     pub async fn instruction(
         &self,
         id: &str,
