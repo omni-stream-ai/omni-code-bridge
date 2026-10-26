@@ -16,12 +16,11 @@
     #viewport { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; position: relative; }
     #stage { position: relative; }
     iframe { position: absolute; top: 0; left: 0; border: 0; transform-origin: top left; }
-    #pan-layer { display: none; position: absolute; inset: 0; cursor: grab; touch-action: none; }
-    #pan-layer.active { display: block; }
-    #native-input { display: none; margin: 4px; padding: 8px; min-height: 42px; font: 16px system-ui; }
+    #native-input { display: none; position: fixed; left: 0; bottom: 0; width: 1px; height: 1px; opacity: 0; padding: 0; border: 0; font: 16px system-ui; }
     #native-input.active { display: block; }
     #keys { display: none; gap: 4px; overflow-x: auto; padding: 4px; flex-shrink: 0; }
     #keys.active { display: flex; }
+    #keys button { flex-shrink: 0; }
     #connection { padding: 4px 8px; font-size: 12px; }
     #gesture-help { padding: 4px 8px; font-size: 12px; color: #c2ccd8; }
   </style>
@@ -29,9 +28,6 @@
 <body>
   <nav aria-label="Desktop view">
     <button id="fit" aria-pressed="true">Fit</button>
-    <button id="actual" aria-pressed="false">100%</button>
-    <button id="pan" aria-pressed="false">Pan</button>
-    <button id="scroll" aria-pressed="false">Scroll</button>
     <button id="keyboard" aria-pressed="false">Keyboard</button>
     <output id="zoom" aria-live="polite"></output>
   </nav>
@@ -42,7 +38,6 @@
   <main id="viewport">
     <div id="stage">
       <iframe id="desktop" title="Remote desktop" allow="clipboard-read; clipboard-write; fullscreen"></iframe>
-      <div id="pan-layer"></div>
     </div>
   </main>
   <script>
@@ -52,12 +47,8 @@
       const viewport = document.getElementById('viewport');
       const stage = document.getElementById('stage');
       const frame = document.getElementById('desktop');
-      const layer = document.getElementById('pan-layer');
       const fitButton = document.getElementById('fit');
-      const actualButton = document.getElementById('actual');
-      const panButton = document.getElementById('pan');
       const keyboardButton = document.getElementById('keyboard');
-      const scrollButton = document.getElementById('scroll');
       const input = document.getElementById('native-input');
       const zoom = document.getElementById('zoom');
       const keys = document.getElementById('keys');
@@ -81,32 +72,20 @@
       let fitting = true;
       let manualScale = 1;
       let displayScale = 1;
-      let panning = false;
-      let scrolling = false;
       const chinese = navigator.language.startsWith('zh');
       if (chinese) {
         document.documentElement.lang = 'zh';
         fitButton.textContent = '适应屏幕';
-        panButton.textContent = '拖动查看';
         keyboardButton.textContent = '手机键盘';
-        scrollButton.textContent = '滚动页面';
         document.getElementById('gesture-title').textContent = '触控操作说明';
         document.getElementById('gesture-text').textContent = '单指点击操作、拖动查看桌面；双指滑动滚动远程内容，捏合缩放；长按后拖动远程对象；双指轻点右键，快速连点双击。输入框聚焦时自动显示键盘；不支持自动识别的应用可点手机键盘。';
         input.placeholder = '输入文字，发送到远程桌面';
         input.setAttribute('aria-label', '手机键盘输入');
       }
-      function pan(enabled) {
-        panning = enabled;
-        if (enabled) scrolling = false;
-        scrollButton.setAttribute('aria-pressed', String(scrolling));
-        layer.classList.toggle('active', enabled || scrolling);
-        panButton.setAttribute('aria-pressed', String(enabled));
-        panButton.textContent = chinese ? (enabled ? '恢复操作' : '拖动查看') : (enabled ? 'Control' : 'Pan');
-      }
       function layout() {
         // The iframe keeps the acceptance resolution. Browser hit testing maps
         // touches through the CSS transform into the original Xpra coordinates.
-        const scale = fitting ? Math.min(1, viewport.clientWidth / width, viewport.clientHeight / height) : manualScale;
+        const scale = fitting ? Math.min(1, viewport.clientWidth / width, input.classList.contains('active') ? Infinity : viewport.clientHeight / height) : manualScale;
         const oldScale = displayScale;
         const center = [(viewport.scrollLeft + viewport.clientWidth / 2) / oldScale,
           (viewport.scrollTop + viewport.clientHeight / 2) / oldScale];
@@ -118,21 +97,19 @@
         stage.style.height = Math.ceil(height * scale) + 'px';
         zoom.textContent = Math.round(scale * 100) + '%';
         fitButton.setAttribute('aria-pressed', String(fitting));
-        actualButton.setAttribute('aria-pressed', String(!fitting));
-        if (fitting) viewport.scrollTo(0, 0);
+        if (fitting && !input.classList.contains('active')) viewport.scrollTo(0, 0);
         else if (oldScale !== scale) viewport.scrollTo(center[0] * scale - viewport.clientWidth / 2, center[1] * scale - viewport.clientHeight / 2);
       }
-      fitButton.onclick = () => { stopCoast(); fitting = true; pan(false); layout(); };
-      actualButton.onclick = () => { fitting = false; manualScale = 1; layout(); };
-      panButton.onclick = () => pan(!panning);
-      scrollButton.onclick = () => {
-        const enabled = !scrolling;
-        pan(false);
-        scrolling = enabled;
-        layer.classList.toggle('active', enabled);
-        scrollButton.setAttribute('aria-pressed', String(enabled));
-      };
+      fitButton.onclick = () => { stopCoast(); fitting = true; layout(); };
       let autoKeyboard = false;
+      const inputGuard = '\u200b';
+      let inputSnapshot = '';
+      let composing = false;
+      function resetInput() {
+        inputSnapshot = '';
+        input.value = inputGuard;
+        input.setSelectionRange(1, 1);
+      }
       let keyboardDismissed = false;
       let focusProbeBusy = false;
       let focusChecksUntil = 0;
@@ -160,6 +137,7 @@
       }
       setInterval(checkInputFocus, 600);
       function showKeyboard() {
+        if (!input.classList.contains('active')) resetInput();
         input.classList.add('active');
         keys.classList.add('active');
         keyboardButton.setAttribute('aria-pressed', 'true');
@@ -169,6 +147,7 @@
       keyboardButton.onclick = () => {
         autoKeyboard = false;
         const enabled = !input.classList.contains('active');
+        if (enabled) resetInput();
         input.classList.toggle('active', enabled);
         keyboardButton.setAttribute('aria-pressed', String(enabled));
         keys.classList.toggle('active', enabled);
@@ -177,30 +156,61 @@
       };
       // A real editable element is required to open Android/iOS keyboards.
       // Send committed IME text only, so Chinese composition is not duplicated.
-      function sendKey(name, text, keyval) {
+      let inputQueue = Promise.resolve();
+      let clipboardCopyUntil = 0;
+      const clipboardBridges = new WeakMap();
+      function bridgeClipboard(client) {
+        const original = client?.packet_handlers?.['clipboard-token'];
+        if (!original || original === clipboardBridges.get(client)) return;
+        const handler = function(packet) {
+          original.call(this, packet);
+          if (packet.length < 8 || !packet[3] || packet[1] !== 'CLIPBOARD' || Date.now() > clipboardCopyUntil || typeof this.clipboard_buffer !== 'string') return;
+          clipboardCopyUntil = 0;
+          // The iframe loses browser focus while the native IME is active.
+          window.DesktopClipboard?.postMessage(this.clipboard_buffer);
+          navigator.clipboard?.writeText(this.clipboard_buffer).catch(() => {});
+        };
+        client.packet_handlers['clipboard-token'] = handler;
+        clipboardBridges.set(client, handler);
+      }
+      function enqueueInput(action) {
+        inputQueue = inputQueue.then(action).catch(() => {
+          document.getElementById('connection').textContent = chinese ? '输入失败，请重新连接' : 'Input failed; reconnect to the desktop';
+        });
+      }
+      function sendKey(name, text, keyval, extraModifiers = []) {
+        const held = [...new Set([...modifiers, ...extraModifiers])];
+        enqueueInput(() => sendKeyNow(name, text, keyval, held));
+      }
+      function sendKeyNow(name, text, keyval, held) {
         const client = frame.contentWindow.client;
         if (!client?.connected || client.server_readonly) return;
+        bridgeClipboard(client);
         const wid = client.focused_wid || client.topwindow;
         if (!wid) return;
+        if (held.some(modifier => modifier === 'control' || modifier === 'mod4') && ['c', 'x'].includes(name.toLowerCase())) clipboardCopyUntil = Date.now() + 5000;
         for (const pressed of [true, false]) {
-          client.send(['key-action', wid, name, pressed, [...modifiers], keyval, text, 0, 0]);
+          client.send(['key-action', wid, name, pressed, held, keyval, text, 0, 0]);
         }
       }
-      const specialKeys = [['Esc','Escape',0xff1b],['Tab','Tab',0xff09],['↑','Up',0xff52],['↓','Down',0xff54],['←','Left',0xff51],['→','Right',0xff53],['Enter','Return',0xff0d],['Del','Delete',0xffff]];
+      const specialKeys = [['Esc','Escape',0xff1b],['Tab','Tab',0xff09],['↑','Up',0xff52],['↓','Down',0xff54],['←','Left',0xff51],['→','Right',0xff53],['Home','Home',0xff50],['End','End',0xff57],['PgUp','Prior',0xff55],['PgDn','Next',0xff56],['⌫','BackSpace',0xff08],['Enter','Return',0xff0d],['Del','Delete',0xffff]];
       for (const [label, name, value] of specialKeys) {
         const button = document.createElement('button'); button.textContent = label;
         button.onpointerdown = event => event.preventDefault();
-        button.onclick = () => sendKey(name, '', value); keys.append(button);
+        button.onclick = () => { sendKey(name, '', value); resetInput(); input.focus({preventScroll: true}); }; keys.append(button);
       }
       const modifierKeys = {control: ['Control_L', 0xffe3], mod1: ['Alt_L', 0xffe9], shift: ['Shift_L', 0xffe1]};
       function setModifier(modifier, enabled) {
         enabled ? modifiers.add(modifier) : modifiers.delete(modifier);
-        const client = frame.contentWindow?.client;
-        const wid = client?.focused_wid || client?.topwindow;
-        if (client?.connected && !client.server_readonly && wid) {
-          const [name, value] = modifierKeys[modifier];
-          client.send(['key-action', wid, name, enabled, [...modifiers], value, '', 0, 0]);
-        }
+        const held = [...modifiers];
+        enqueueInput(() => {
+          const client = frame.contentWindow?.client;
+          const wid = client?.focused_wid || client?.topwindow;
+          if (client?.connected && !client.server_readonly && wid) {
+            const [name, value] = modifierKeys[modifier];
+            client.send(['key-action', wid, name, enabled, held, value, '', 0, 0]);
+          }
+        });
       }
       for (const [label, modifier] of [['Ctrl','control'],['Alt','mod1'],['Shift','shift']]) {
         const button = document.createElement('button'); button.textContent = label;
@@ -210,7 +220,7 @@
         keys.prepend(button);
       }
       function releaseAll() {
-        stopCoast(); cleanupGesture(); last = null;
+        stopCoast(); cleanupGesture();
         for (const modifier of [...modifiers]) setModifier(modifier, false);
         keys.querySelectorAll('[aria-pressed]').forEach(button => button.setAttribute('aria-pressed','false'));
       }
@@ -221,6 +231,7 @@
       setInterval(() => {
         const client = frame.contentWindow?.client;
         const connected = !!client?.connected;
+        if (connected) bridgeClipboard(client);
         document.getElementById('connection').textContent = chinese
           ? (connected ? '已连接' : '连接中／等待自动重连…')
           : (connected ? 'Connected' : 'Connecting / waiting to reconnect…');
@@ -235,32 +246,84 @@
           viewport.scrollTop = Math.max(0, anchor.y * displayScale - viewport.clientHeight / 2);
         });
       }).observe(viewport);
-      function commit() {
-        for (const char of input.value) {
+      function sendText(text, extraModifiers = []) {
+        const held = [...new Set([...modifiers, ...extraModifiers])];
+        enqueueInput(() => sendTextNow(text, held));
+      }
+      async function sendTextNow(text, held) {
+        if (/[^\x00-\x7f]/u.test(text) && !held.some(modifier => modifier !== 'shift')) {
+          const client = frame.contentWindow.client;
+          if (!client?.connected || client.server_readonly) return;
+          // X11 keymaps cannot represent arbitrary committed IME text. Xpra's
+          // UTF-8 clipboard transport also works for native applications.
+          client.clipboard_buffer = text;
+          client.send_clipboard_token(text);
+          sendKeyNow('v', 'v', 118, ['control']);
+          await new Promise(resolve => setTimeout(resolve, 150));
+          return;
+        }
+        for (const char of text) {
           const point = char.codePointAt(0);
           const special = {'\n': ['Return', 0xff0d], ' ': ['space', 32]};
           const [name, value] = special[char] ||
-            [point <= 255 ? char : 'U' + point.toString(16).toUpperCase(),
+            [frame.contentWindow.CHAR_TO_NAME?.[char] || (point <= 255 ? char : 'U' + point.toString(16).toUpperCase()),
              point <= 255 ? point : 0x01000000 + point];
-          sendKey(name, char, value);
+          sendKeyNow(name, char, value, held);
         }
-        input.value = '';
       }
-      let composing = false;
+      function commit(inputType = '') {
+        // Keep committed context so IME suggestions can replace earlier text.
+        // The guard gives Android an editable character even at an empty remote
+        // caret, where otherwise Backspace produces no input event at all.
+        const value = input.value.startsWith(inputGuard) ? input.value.slice(1) : input.value;
+        const before = Array.from(inputSnapshot), after = Array.from(value);
+        let common = 0;
+        while (common < before.length && common < after.length && before[common] === after[common]) common++;
+        for (let i = common; i < before.length; i++) sendKey('BackSpace', '', 0xff08);
+        if (common === before.length && common === after.length && inputType.startsWith('delete')) {
+          sendKey(inputType.includes('Forward') ? 'Delete' : 'BackSpace', '', inputType.includes('Forward') ? 0xffff : 0xff08);
+        }
+        sendText(after.slice(common).join(''));
+        inputSnapshot = after.slice(-256).join('');
+        input.value = inputGuard + inputSnapshot;
+        input.setSelectionRange(input.value.length, input.value.length);
+      }
       input.addEventListener('compositionstart', () => { composing = true; });
       input.addEventListener('compositionend', () => { composing = false; commit(); });
       input.addEventListener('input', event => {
         if (composing || event.isComposing) return;
-        if (event.inputType === 'deleteContentBackward') sendKey('BackSpace', '', 0xff08);
-        else commit();
+        commit(event.inputType || '');
+      });
+      input.addEventListener('paste', event => {
+        event.preventDefault();
+        const fallback = event.clipboardData?.getData('text/plain') || '';
+        const pasted = navigator.clipboard?.readText().catch(() => fallback) || Promise.resolve(fallback);
+        const held = [...modifiers];
+        resetInput();
+        enqueueInput(async () => { await sendTextNow(await pasted, held); });
       });
       input.addEventListener('keydown', event => {
         if (composing || event.isComposing || event.keyCode === 229) return;
-        const special = {Backspace: ['BackSpace', 0xff08], Enter: ['Return', 0xff0d], Tab: ['Tab', 0xff09]};
+        const special = {Backspace: ['BackSpace', 0xff08], Delete: ['Delete', 0xffff], Enter: ['Return', 0xff0d], Tab: ['Tab', 0xff09], Escape: ['Escape', 0xff1b], ArrowUp: ['Up', 0xff52], ArrowDown: ['Down', 0xff54], ArrowLeft: ['Left', 0xff51], ArrowRight: ['Right', 0xff53], Home: ['Home', 0xff50], End: ['End', 0xff57], PageUp: ['Prior', 0xff55], PageDown: ['Next', 0xff56], Insert: ['Insert', 0xff63], F1: ['F1', 0xffbe], F2: ['F2', 0xffbf], F3: ['F3', 0xffc0], F4: ['F4', 0xffc1], F5: ['F5', 0xffc2], F6: ['F6', 0xffc3], F7: ['F7', 0xffc4], F8: ['F8', 0xffc5], F9: ['F9', 0xffc6], F10: ['F10', 0xffc7], F11: ['F11', 0xffc8], F12: ['F12', 0xffc9]};
+        const held = [];
+        if (event.ctrlKey) held.push('control');
+        if (event.altKey) held.push('mod1');
+        if (event.shiftKey) held.push('shift');
+        if (event.metaKey) held.push('mod4');
         if (special[event.key]) {
           event.preventDefault();
-          sendKey(special[event.key][0], '', special[event.key][1]);
+          sendKey(special[event.key][0], '', special[event.key][1], held);
+          resetInput();
+        } else if ((event.ctrlKey || event.altKey || event.metaKey) && Array.from(event.key).length === 1) {
+          // Let the local paste event supply text, including Chinese and emoji.
+          if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === 'v') return;
+          event.preventDefault();
+          sendText(event.key, held);
+          resetInput();
         }
+      });
+      document.querySelector('nav').addEventListener('pointerdown', event => {
+        if (input.classList.contains('active') && event.target.closest('button')) event.preventDefault();
       });
       function wheel(x, y, dx, dy) {
         const remote = frame.contentWindow;
@@ -270,37 +333,31 @@
           deltaX: dx, deltaY: dy, deltaMode: 0,
         }));
       }
-      let last = null;
-      layer.onpointerdown = event => {
-        last = [event.clientX, event.clientY];
-        layer.setPointerCapture(event.pointerId);
-      };
-      layer.onpointermove = event => {
-        if (!last) return;
-        if (scrolling) {
-          const rect = frame.getBoundingClientRect();
-          const scale = rect.width / width;
-          wheel((event.clientX - rect.left) / scale, (event.clientY - rect.top) / scale,
-            (last[0] - event.clientX) / scale, (last[1] - event.clientY) / scale);
-        } else viewport.scrollBy(last[0] - event.clientX, last[1] - event.clientY);
-        last = [event.clientX, event.clientY];
-      };
-      layer.onpointerup = layer.onpointercancel = () => { last = null; };
       new ResizeObserver(layout).observe(viewport);
       layout();
       frame.onload = () => {
         // Xpra prevents the default pointer action. Explicitly focus the frame
         // so a touch still routes hardware keys and clipboard events to Xpra.
         const doc = frame.contentDocument;
+        doc.addEventListener('keydown', event => {
+          if ((event.ctrlKey || event.metaKey) && ['c', 'x'].includes(event.key.toLowerCase())) {
+            clipboardCopyUntil = Date.now() + 5000;
+            bridgeClipboard(frame.contentWindow.client);
+          }
+        }, true);
+        bridgeClipboard(frame.contentWindow.client);
         let gesture = null;
         let hold = null;
+        let mouseTarget = null;
         const cancelHold = () => { clearTimeout(hold); hold = null; };
         function mouse(type, x, y, pressed = false, button = 0) {
-          const target = doc.elementFromPoint(x, y);
+          const target = doc.elementFromPoint(x, y) || mouseTarget;
+          if (type === 'mousedown') mouseTarget = target;
           target?.dispatchEvent(new frame.contentWindow.MouseEvent(type, {
             bubbles: true, cancelable: true, clientX: x, clientY: y,
             button, buttons: pressed ? (button === 2 ? 2 : 1) : 0,
           }));
+          if (type === 'mouseup') mouseTarget = null;
         }
         let lastTap = null;
         cleanupGesture = () => {
@@ -318,22 +375,24 @@
         doc.addEventListener('pointerdown', event => {
           if (event.pointerType === 'touch') event.stopImmediatePropagation();
         }, true);
-        doc.addEventListener('touchstart', event => {
+        function touchStart(event) {
           event.preventDefault();
           event.stopImmediatePropagation();
           stopCoast();
           cancelHold();
           if (gesture?.dragging) mouse('mouseup', gesture.x, gesture.y);
-          if (event.touches.length === 2) {
-            const p = pair(event.touches);
-            gesture = {two: true, ...p, initialDistance: p.distance,
+          const points = event.touches;
+          if (points.length === 2) {
+            const p = pair(points);
+            gesture = {two: true, ...p, initialDistance: Math.max(1, p.distance),
               initialScale: displayScale, anchorX: p.x, anchorY: p.y,
               localX: p.x * displayScale - viewport.scrollLeft, localY: p.y * displayScale - viewport.scrollTop,
               initialSX: p.sx, initialSY: p.sy, mode: null, started: performance.now()};
             return;
           }
-          if (event.touches.length !== 1) { gesture = null; return; }
-          const point = event.touches[0];
+          if (points.length !== 1) { gesture = null; return; }
+          if (!input.classList.contains('active')) frame.contentWindow.focus();
+          const point = points[0];
           gesture = {x: point.clientX, y: point.clientY,
             startX: point.clientX, startY: point.clientY, sx: point.screenX, sy: point.screenY,
             startSX: point.screenX, startSY: point.screenY, moved: false, time: performance.now(), vx: 0, vy: 0};
@@ -343,14 +402,15 @@
             mouse('mousemove', gesture.x, gesture.y);
             mouse('mousedown', gesture.x, gesture.y, true);
           }, 450);
-        }, {capture: true, passive: false});
-        doc.addEventListener('touchmove', event => {
+        }
+        function touchMove(event) {
           event.preventDefault();
           event.stopImmediatePropagation();
           if (!gesture) return;
+          const points = event.touches;
           if (gesture.two) {
-            if (event.touches.length !== 2) return;
-            const p = pair(event.touches);
+            if (points.length !== 2) return;
+            const p = pair(points);
             if (!gesture.mode) {
               if (Math.abs(p.distance / gesture.initialDistance - 1) > 0.08) gesture.mode = 'zoom';
               else if (Math.hypot(p.sx - gesture.sx, p.sy - gesture.sy) > 8) gesture.mode = 'scroll';
@@ -370,8 +430,8 @@
             gesture.sx = p.sx; gesture.sy = p.sy;
             return;
           }
-          if (event.touches.length !== 1) return;
-          const point = event.touches[0];
+          if (points.length !== 1) return;
+          const point = points[0];
           if (Math.hypot(point.screenX - gesture.startSX, point.screenY - gesture.startSY) > 8) {
             gesture.moved = true;
             cancelHold();
@@ -388,7 +448,7 @@
           gesture.x = point.clientX;
           gesture.y = point.clientY;
           gesture.sx = point.screenX; gesture.sy = point.screenY;
-        }, {capture: true, passive: false});
+        }
         function end(event) {
           cancelHold();
           event.preventDefault();
@@ -412,11 +472,18 @@
             anchor = {x: gesture.startX, y: gesture.startY};
             keyboardDismissed = false;
             focusChecksUntil = Date.now() + 5000;
+            resetInput();
+            if (input.classList.contains('active')) {
+              input.focus({preventScroll: true});
+              window.DesktopKeyboard?.postMessage('show');
+            }
             void checkInputFocus();
           }
           if (gesture.panned && event.type !== 'touchcancel' && performance.now() - gesture.time < 80) inertia(gesture.vx, gesture.vy);
           gesture = null;
         }
+        doc.addEventListener('touchstart', touchStart, {capture: true, passive: false});
+        doc.addEventListener('touchmove', touchMove, {capture: true, passive: false});
         doc.addEventListener('touchend', end, {capture: true, passive: false});
         doc.addEventListener('touchcancel', end, {capture: true, passive: false});
 
@@ -425,6 +492,8 @@
       url.searchParams.set('path', new URL('./', location.href).pathname);
       url.searchParams.set('autoconnect', 'true');
       url.searchParams.set('keyboard', 'false');
+      url.searchParams.set('clipboard_preferred_format', 'UTF8_STRING');
+      url.searchParams.set('clipboard_poll', 'false');
       url.searchParams.set('reconnect', 'true');
       url.searchParams.set('floating_menu', 'false');
       frame.src = url.href;

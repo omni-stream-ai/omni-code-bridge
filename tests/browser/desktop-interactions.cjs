@@ -13,18 +13,24 @@ const {chromium} = require('playwright');
     if (req.url === '/input-focus') {res.setHeader('Content-Type','application/json');res.end(JSON.stringify({focused}));return;}
     res.setHeader('Content-Type', 'text/html');
     res.end(req.url.startsWith('/index.html') ? `<!doctype html><style>html,body{margin:0;width:100%;height:100%}</style>
-      <script>window.events=[];for(const type of ['mousedown','mouseup','dblclick','contextmenu'])document.addEventListener(type,e=>events.push([type,e.button]));window.packets=[];window.wheels=[];window.client={connected:true,focused_wid:7,send:p=>packets.push(p)};
+      <script>window.events=[];for(const type of ['mousedown','mouseup','dblclick','contextmenu'])document.addEventListener(type,e=>events.push([type,e.button]));window.packets=[];window.commits=[];window.wheels=[];window.client={connected:true,focused_wid:7,send:p=>packets.push(p),send_clipboard_token:text=>commits.push(text),packet_handlers:{'clipboard-token':function(p){if(p.length>=8)this.clipboard_buffer=p[7]}}};
       document.addEventListener('wheel',e=>wheels.push([e.clientX,e.clientY,e.deltaX,e.deltaY]));</script>` : html);
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-  const browser = await chromium.launch({executablePath: process.env.X11BOX_BROWSER_EXECUTABLE || undefined, headless: true, args: ['--no-sandbox']});
+  let browser;
   try {
+    browser = await chromium.launch({executablePath: process.env.X11BOX_BROWSER_EXECUTABLE || undefined, headless: true, args: ['--no-sandbox']});
     const page = await browser.newPage({viewport: {width: 390, height: 844}, isMobile: true, hasTouch: true, locale: 'zh-CN'});
+    await page.addInitScript(() => {
+      window.copied = [];
+      window.DesktopClipboard = {postMessage: text => copied.push(text)};
+    });
     const errors = [];
     page.on('pageerror', e => errors.push(e.message));
     await page.goto(`http://127.0.0.1:${server.address().port}/viewer`);
     const remote = await (await page.locator('#desktop').elementHandle()).contentFrame();
     await remote.waitForFunction(() => window.client?.connected);
+    assert.deepEqual(await page.locator('nav button').allTextContents(), ['适应屏幕', '手机键盘']);
     const rectBeforeTap = await page.locator('#desktop').boundingBox();
     await page.touchscreen.tap(rectBeforeTap.x + 40, rectBeforeTap.y + 40);
     assert.equal(await page.locator('#native-input').isVisible(), false, 'ordinary tap must not open keyboard');
@@ -50,12 +56,58 @@ const {chromium} = require('playwright');
       el.dispatchEvent(new CompositionEvent('compositionend'));
       el.dispatchEvent(new InputEvent('input'));
     });
-    assert.deepEqual(await remote.evaluate(() => packets.map(p => [p[2],p[3],p[6]])),
-      [['U4E2D',true,'中'],['U4E2D',false,'中'],['U6587',true,'文'],['U6587',false,'文']]);
+    await remote.waitForFunction(() => commits.length === 1);
+    assert.deepEqual(await remote.evaluate(() => commits), ['中文']);
+    assert.deepEqual(await remote.evaluate(() => packets.map(p => [p[2],p[3],p[4]])),
+      [['v',true,['control']],['v',false,['control']]]);
     await page.keyboard.press('Backspace');
     await page.keyboard.press('Enter');
     await page.locator('#native-input').evaluate(el => el.dispatchEvent(new InputEvent('input', {inputType:'deleteContentBackward'})));
-    assert.deepEqual(await remote.evaluate(() => packets.slice(4).map(p => p[2])), ['BackSpace','BackSpace','Return','Return','BackSpace','BackSpace']);
+    await remote.waitForFunction(() => packets.length === 8);
+    assert.deepEqual(await remote.evaluate(() => packets.slice(2).map(p => p[2])), ['BackSpace','BackSpace','Return','Return','BackSpace','BackSpace']);
+    await remote.evaluate(() => packets.length = 0);
+    await page.keyboard.press('ArrowLeft');
+    await page.keyboard.press('Shift+ArrowRight');
+    await page.keyboard.press('Control+a');
+    await page.keyboard.press('Delete');
+    assert.deepEqual(await remote.evaluate(() => packets.filter(p => p[3]).map(p => [p[2], p[4]])),
+      [['Left', []], ['Right', ['shift']], ['a', ['control']], ['Delete', []]], 'hardware navigation and shortcuts reach the remote caret');
+    await remote.evaluate(() => packets.length = 0);
+    await page.locator('#native-input').evaluate(el => {
+      el.value = '';
+      el.dispatchEvent(new InputEvent('input', {inputType:'deleteContentBackward'}));
+    });
+    assert.deepEqual(await remote.evaluate(() => packets.map(p => p[2])), ['BackSpace', 'BackSpace'], 'Android can backspace with no locally typed text');
+    assert.equal(await page.locator('#native-input').inputValue(), '\u200b');
+    await remote.evaluate(() => packets.length = 0);
+    await page.keyboard.insertText('teh');
+    await page.locator('#native-input').evaluate(el => {
+      el.value = '\u200bthe';
+      el.dispatchEvent(new InputEvent('input', {inputType:'insertReplacementText'}));
+    });
+    assert.deepEqual(await remote.evaluate(() => packets.filter(p => p[3]).map(p => p[2])),
+      ['t', 'e', 'h', 'BackSpace', 'BackSpace', 'h', 'e'], 'IME suggestions replace committed text once');
+    await page.keyboard.press('End');
+    await remote.evaluate(() => { packets.length = 0; commits.length = 0; });
+    const ime = await page.context().newCDPSession(page);
+    await ime.send('Input.imeSetComposition', {text:'中文', selectionStart:2, selectionEnd:2});
+    assert.equal(await remote.evaluate(() => packets.length), 0, 'actual browser composition stays local until committed');
+    await ime.send('Input.insertText', {text:'中文'});
+    await remote.waitForFunction(() => commits.length === 1);
+    assert.deepEqual(await remote.evaluate(() => commits), ['中文'], 'actual IME commit is forwarded once');
+    await ime.detach();
+    await page.keyboard.press('Control+c');
+    await remote.waitForFunction(() => packets.some(p => p[2] === 'c' && p[4].includes('control')));
+    await remote.evaluate(() => client.packet_handlers['clipboard-token'].call(client, ['clipboard-token', 'CLIPBOARD', []]));
+    assert.deepEqual(await page.evaluate(() => copied), [], 'clipboard advertisements must not copy stale buffered text');
+    await remote.evaluate(() => client.packet_handlers['clipboard-token'].call(client, ['clipboard-token', 'CLIPBOARD', ['UTF8_STRING'], 'UTF8_STRING', 'UTF8_STRING', 8, 'bytes', '复制内容']));
+    assert.deepEqual(await page.evaluate(() => copied), ['复制内容'], 'remote copy reaches the native clipboard bridge');
+    await remote.evaluate(() => {
+      client.packet_handlers['clipboard-token'] = function(packet) { if (packet.length >= 8) this.clipboard_buffer = packet[7]; };
+    });
+    await page.keyboard.press('Control+c');
+    await remote.evaluate(() => client.packet_handlers['clipboard-token'].call(client, ['clipboard-token', 'CLIPBOARD', ['UTF8_STRING'], 'UTF8_STRING', 'UTF8_STRING', 8, 'bytes', '重连后复制']));
+    assert.deepEqual(await page.evaluate(() => copied), ['复制内容', '重连后复制'], 'clipboard bridge survives Xpra handler initialization and reconnect');
     await page.locator('#keyboard').click();
     assert.equal(await page.locator('#native-input').isVisible(), false);
     const cdp = await page.context().newCDPSession(page);
@@ -66,16 +118,13 @@ const {chromium} = require('playwright');
     await cdp.send('Input.dispatchTouchEvent', {type:'touchEnd',touchPoints:[]});
     assert.equal(await remote.evaluate(() => wheels.length), 0, 'single finger never scrolls remote content');
     assert.equal(await page.locator('#native-input').isVisible(), false);
-    await page.locator('#scroll').click();
-    const box = await page.locator('#desktop').boundingBox();
-    await page.mouse.move(box.x + 150, box.y + 160);
-    await page.mouse.down();
-    await page.mouse.move(box.x + 150, box.y + 60, {steps:4});
-    await page.mouse.up();
-    assert(await remote.evaluate(() => wheels.some(w => w[3] > 0)));
-    assert.equal(await page.locator('#viewport').evaluate(el => el.scrollTop), 0);
-    await page.locator('#scroll').click();
-    await page.locator('#actual').click();
+    const initialViewport = await page.locator('#viewport').boundingBox();
+    const initialPair = spread => [{x:195-spread,y:initialViewport.y+120},{x:195+spread,y:initialViewport.y+120}];
+    const initialScale = await page.locator('#zoom').textContent();
+    await cdp.send('Input.dispatchTouchEvent', {type:'touchStart',touchPoints:initialPair(35)});
+    await cdp.send('Input.dispatchTouchEvent', {type:'touchMove',touchPoints:initialPair(110)});
+    await cdp.send('Input.dispatchTouchEvent', {type:'touchEnd',touchPoints:[]});
+    assert(parseFloat(await page.locator('#zoom').textContent()) > parseFloat(initialScale), 'pinch enlarges the fitted desktop');
     const enlarged = await page.locator('#viewport').boundingBox();
     const dragFinger = x => [{x, y: enlarged.y + 100}];
     await cdp.send('Input.dispatchTouchEvent', {type:'touchStart',touchPoints:dragFinger(330)});
@@ -119,22 +168,15 @@ const {chromium} = require('playwright');
     await page.waitForFunction(() => document.querySelector('#connection').textContent.includes('重连'));
     await remote.evaluate(() => client.connected=true);
     await page.waitForFunction(() => document.querySelector('#connection').textContent==='已连接');
-    await page.locator('#pan').click();
-    await page.mouse.move(330, box.y + 100);
-    await page.mouse.down();
-    await page.mouse.move(30, box.y + 100, {steps:4});
-    await page.mouse.up();
-    assert(await page.locator('#viewport').evaluate(el => el.scrollLeft > 0));
-    assert.equal(await page.locator('#scroll').getAttribute('aria-pressed'), 'false');
     await page.locator('#fit').click();
     await page.setViewportSize({width:844,height:390});
     await page.waitForTimeout(100);
     const rect = await page.locator('#desktop').boundingBox();
     assert(rect.x + rect.width <= 845 && rect.y + rect.height <= 391);
     assert.deepEqual(errors, []);
-    console.log('PASS: focus/dismissal, IME, keys/modifier release, pan/scroll, pinch, right/double click, drag cancel, connection status, landscape fit');
+    console.log('PASS: simplified toolbar, focus/dismissal, actual IME commit and replacement, empty-buffer deletion, hardware shortcuts/navigation, modifier release, single-finger pan, two-finger scroll, pinch zoom, right/double click, drag cancel, connection status, landscape fit');
   } finally {
-    await browser.close();
+    await browser?.close();
     await new Promise(resolve => server.close(resolve));
   }
 })().catch(e => {console.error(e);process.exitCode=1;});

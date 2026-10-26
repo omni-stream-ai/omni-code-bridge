@@ -678,6 +678,22 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires X11BOX_TEST_IMAGE, Playwright and a Chromium executable"]
     async fn real_mobile_gateway_touch_input_and_revocation() {
+        real_mobile_gateway_input("browser").await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires X11BOX_TEST_IMAGE with GTK, Playwright and a Chromium executable"]
+    async fn real_native_mobile_gateway_touch_input_and_revocation() {
+        real_mobile_gateway_input("gtk").await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires X11BOX_TEST_IMAGE with WebKitGTK, Playwright and Chromium"]
+    async fn real_webkit_mobile_gateway_auto_keyboard_and_revocation() {
+        real_mobile_gateway_input("webkit").await;
+    }
+
+    async fn real_mobile_gateway_input(kind: &str) {
         use crate::{
             acceptance::{AcceptanceStore, CreateAcceptance},
             runtime_plugin::{
@@ -685,6 +701,7 @@ mod tests {
             },
         };
         use std::path::Path as FsPath;
+        let native = kind != "browser";
         let mut fixture = crate::acceptance_test_support::Fixture::new().await;
         let runtime = Arc::new(RuntimePluginStore::new(
             fixture.root.join("browser-runtime"),
@@ -712,10 +729,19 @@ mod tests {
         .unwrap();
         let project = fixture.root.join("project");
         std::fs::create_dir_all(&project).unwrap();
-        std::fs::write(project.join("index.html"),r#"<!doctype html><meta charset="utf-8"><title>Mobile fixture</title><style>body{margin:0}input{box-sizing:border-box;width:100%;height:80vh;font-size:24px;background:#e4f7ff}</style><input autofocus placeholder="点击并输入中文" onclick="document.title='Touched'" oninput="document.title='Input:'+this.value">"#).unwrap();
+        std::fs::write(project.join("index.html"),r#"<!doctype html><meta charset="utf-8"><title>Mobile fixture</title><style>body{margin:0}button{height:60px}textarea{box-sizing:border-box;width:100%;height:80vh;font-size:24px;background:#e4f7ff}</style><button autofocus>Tap the editor below to focus it</button><textarea placeholder="点击并输入中文" onclick="document.title='Touched'" oninput="document.title='Input:'+this.value"></textarea>"#).unwrap();
+        std::fs::write(
+            project.join("native.py"),
+            if kind == "webkit" {
+                include_str!("../tests/fixtures/desktop_webkit.py")
+            } else {
+                include_str!("../tests/fixtures/desktop_input.py")
+            },
+        )
+        .unwrap();
         for args in [
             vec!["init", "--quiet"],
-            vec!["add", "index.html"],
+            vec!["add", "index.html", "native.py"],
             vec![
                 "-c",
                 "user.name=Acceptance Test",
@@ -762,8 +788,11 @@ mod tests {
                     id: id.clone(),
                     project_id: "browser-fixture".into(),
                     session_id: None,
-                    command: "chromium --no-sandbox --new-window file:///workspace/index.html"
-                        .into(),
+                    command: if native {
+                        "python3 /workspace/native.py".into()
+                    } else {
+                        "chromium --no-sandbox --app=file:///workspace/index.html".into()
+                    },
                     size: "pc".into(),
                     automatic: false,
                     requirements: None,
@@ -798,7 +827,7 @@ mod tests {
         atomic_json(
             &config,
             &json!({"origin":origin,"base":format!("{origin}/v2/acceptance/{id}"),
-            "headers":headers,"screenshot":"/tmp/omni-acceptance-mobile-proof.png"}),
+            "headers":headers,"native":native,"webkit":kind == "webkit","screenshot":format!("/tmp/omni-acceptance-mobile-{kind}-proof.png")}),
         )
         .unwrap();
         let result = run_bounded(

@@ -16,7 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && apt-get update && apt-get install -y --no-install-recommends \
        xpra xpra-x11 xpra-html5 x11-utils xauth x11-xserver-utils \
        wmctrl xdotool scrot imagemagick openbox ffmpeg chromium \
-       fonts-noto-cjk procps iproute2 dbus-x11 \
+       fonts-noto-cjk procps iproute2 dbus-x11 at-spi2-core python3-gi gir1.2-atspi-2.0 \
     && rm -rf /var/lib/apt/lists/*
 RUN groupadd --gid 1000 x11box && useradd --uid 1000 --gid 1000 --create-home x11box \
     && mkdir -p /run/user/1000 /var/lib/x11box/state /artifacts /workspace \
