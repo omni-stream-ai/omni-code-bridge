@@ -3075,41 +3075,6 @@ impl AppState {
         );
     }
 
-    /// Ends the current turn when the provider lost its completion signal.
-    /// This deliberately does not send a provider cancellation: without a live
-    /// process handle, the bridge cannot safely claim ownership of external work.
-    pub async fn interrupt_turn_for_recovery(&self, session_id: &str, message: String) {
-        if !self.bound_domain_turn_is_active(session_id) {
-            return;
-        }
-        self.update_runtime_state(session_id, |entry| {
-            entry.interrupted = true;
-            entry.interruption_reason = Some("worker_abort".to_string());
-            entry.approval_tx = None;
-            entry.pending_approval = None;
-        })
-        .await;
-        let preview = self
-            .latest_assistant_preview(session_id)
-            .await
-            .or(Some(message));
-        self.patch_session(session_id, SessionStatus::Interrupted, preview)
-            .await;
-        self.clear_pending_approval(session_id).await;
-        self.publish_event(SessionEvent::SessionStatus(SessionStatusEvent {
-            session_id: session_id.to_string(),
-            status: SessionStatus::Interrupted,
-            error_message: None,
-        }));
-        self.project_agent_event(
-            session_id,
-            AgentProjection::TurnStatus {
-                status: TurnStatus::Cancelled,
-                error: None,
-            },
-        );
-    }
-
     pub async fn fail_domain_turn(&self, session_id: &str, turn_id: &str, message: String) {
         DOMAIN_TURN_ID
             .scope(turn_id.to_string(), self.fail_session(session_id, message))
@@ -6548,70 +6513,6 @@ mod tests {
             .unwrap();
         assert_eq!(legacy.session.unread_count, 0);
         assert_eq!(domain.session.unread_count, 0);
-    }
-
-    #[tokio::test]
-    async fn recovery_interrupt_stops_the_active_turn_without_marking_it_failed() {
-        let state = test_state("watchdog-recovery-interrupt").await;
-        let project = state
-            .create_project(CreateProjectInput {
-                name: "Project".to_string(),
-                root_path: std::env::temp_dir().to_string_lossy().to_string(),
-            })
-            .await;
-        let session = state
-            .create_session(CreateSessionInput {
-                client_session_id: Uuid::new_v4().to_string(),
-                project_id: project.id,
-                title: Some("Session".to_string()),
-                agent: AgentKind::Codex,
-                brief_reply_mode: false,
-                provider_id: None,
-                reasoning_effort: None,
-                model: None,
-            })
-            .await
-            .unwrap();
-        let turn_id = Uuid::new_v4().to_string();
-        state
-            .create_domain_turn(
-                &session.id,
-                &CreateTurnCommand {
-                    command_id: Uuid::new_v4().to_string(),
-                    turn_id: turn_id.clone(),
-                    user_message_id: Uuid::new_v4().to_string(),
-                    content: "wait for a tool".to_string(),
-                    attachments: Vec::new(),
-                    input_mode: InputMode::Text,
-                    system_prompt: None,
-                    expected_session_version: None,
-                    provider_id: None,
-                    reasoning_effort: None,
-                    model: None,
-                },
-            )
-            .await
-            .unwrap();
-
-        DOMAIN_TURN_ID
-            .scope(
-                turn_id,
-                state.interrupt_turn_for_recovery(
-                    &session.id,
-                    "Codex lost the completion event".to_string(),
-                ),
-            )
-            .await;
-
-        let detail = state.get_session(&session.id).await.unwrap();
-        assert!(matches!(detail.session.status, SessionStatus::Interrupted));
-        let domain = state
-            .domain_session_state(&session.id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(domain.turns[0].status, TurnStatus::Cancelled);
-        assert!(domain.session.active_turn_id.is_none());
     }
 
     #[tokio::test]

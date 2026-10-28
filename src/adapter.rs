@@ -203,72 +203,22 @@ mod provider_activity_kind_tests {
 const CODEX_IDLE_TICK_SECONDS: u64 = 15;
 const CODEX_COMMAND_SOFT_RECOVERY_IDLE_TICKS: u32 = 8;
 const CODEX_COMMAND_STALLED_IDLE_TICKS: u32 = 20;
-// `thread/read` can retain an in-progress command after its completion event was
-// lost. A process id in the read response is our only generic evidence that the
-// command is still live; without it, stop after a few observation windows.
-const CODEX_COMMAND_MAX_UNVERIFIED_PROBES: u32 = 3;
-const CODEX_RESPONSE_STALLED_IDLE_TICKS: u32 = 20;
-const CODEX_BACKGROUND_TASK_MAX_SECONDS: u64 = 30 * 60;
 const ACP_JSON_RPC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const ACP_READINESS_TIMEOUT: Duration = Duration::from_secs(5);
 const CODEX_JSON_RPC_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 
-fn response_wait_timed_out(
-    idle_ticks: &mut u32,
-    has_running_command: bool,
-    has_pending_approval: bool,
-    has_background_processes: bool,
-) -> bool {
-    if has_running_command || has_pending_approval || has_background_processes {
-        *idle_ticks = 0;
-        return false;
-    }
-    *idle_ticks += 1;
-    *idle_ticks >= CODEX_RESPONSE_STALLED_IDLE_TICKS
-}
-
 #[cfg(test)]
-mod codex_response_watchdog_tests {
-    use super::{CODEX_RESPONSE_STALLED_IDLE_TICKS, response_wait_timed_out};
+static CODEX_IDLE_TICK_TEST_MS: AtomicU64 = AtomicU64::new(0);
 
-    #[test]
-    fn times_out_only_while_waiting_for_a_response_without_other_work() {
-        let mut idle_ticks = 0;
-        for _ in 1..CODEX_RESPONSE_STALLED_IDLE_TICKS {
-            assert!(!response_wait_timed_out(
-                &mut idle_ticks,
-                false,
-                false,
-                false
-            ));
+fn codex_idle_tick_duration() -> Duration {
+    #[cfg(test)]
+    {
+        let milliseconds = CODEX_IDLE_TICK_TEST_MS.load(Ordering::SeqCst);
+        if milliseconds > 0 {
+            return Duration::from_millis(milliseconds);
         }
-        assert!(response_wait_timed_out(
-            &mut idle_ticks,
-            false,
-            false,
-            false
-        ));
-
-        assert!(!response_wait_timed_out(
-            &mut idle_ticks,
-            true,
-            false,
-            false
-        ));
-        assert_eq!(idle_ticks, 0);
-        assert!(!response_wait_timed_out(
-            &mut idle_ticks,
-            false,
-            true,
-            false
-        ));
-        assert!(!response_wait_timed_out(
-            &mut idle_ticks,
-            false,
-            false,
-            true
-        ));
     }
+    Duration::from_secs(CODEX_IDLE_TICK_SECONDS)
 }
 const AGENT_READINESS_CACHE_TTL: Duration = Duration::from_secs(5);
 #[cfg(test)]
@@ -2716,7 +2666,7 @@ export default function init(pi) {
     }
 
     #[test]
-    fn codex_command_watchdog_only_stops_unverified_commands() {
+    fn codex_command_watchdog_keeps_waiting_across_repeated_observation_windows() {
         let mut state = CodexAppServerStreamingState::default();
         let _ = state.ingest_value(&serde_json::json!({
             "method": "item/started",
@@ -2730,14 +2680,36 @@ export default function init(pi) {
             }
         }));
 
-        assert_eq!(state.record_unverified_command_probe("cmd-1"), Some(1));
+        let mut probes = 0;
+        for _ in 0..(CODEX_COMMAND_STALLED_IDLE_TICKS * 10) {
+            if matches!(
+                state.mark_idle_waiting(false),
+                Some(CommandWatchdogAction::Probe { .. })
+            ) {
+                probes += 1;
+            }
+            assert!(state.running_command.is_some());
+        }
+        assert_eq!(probes, 10);
+        assert_eq!(state.running_command.as_ref().unwrap().process_id, None);
         assert!(state.confirm_running_command("cmd-1", "pty-42".to_string()));
-        assert_eq!(state.record_unverified_command_probe("cmd-1"), Some(1));
-        assert_eq!(state.record_unverified_command_probe("cmd-1"), Some(2));
-        assert_eq!(
-            state.record_unverified_command_probe("cmd-1"),
-            Some(CODEX_COMMAND_MAX_UNVERIFIED_PROBES)
-        );
+    }
+
+    #[test]
+    fn codex_watchdog_keeps_waiting_for_silent_responses_and_approvals() {
+        let mut state = CodexAppServerStreamingState::default();
+        for _ in 0..(CODEX_COMMAND_STALLED_IDLE_TICKS * 10) {
+            assert!(state.mark_idle_waiting(false).is_none());
+            assert_eq!(
+                state.current_status(),
+                Some("[status] waiting for Codex response")
+            );
+            assert!(state.mark_idle_waiting(true).is_none());
+            assert_eq!(
+                state.current_status(),
+                Some("[status] waiting for approval")
+            );
+        }
     }
 
     #[test]
@@ -4350,6 +4322,7 @@ for line in sys.stdin:
         previous_scenario: Option<std::ffi::OsString>,
         previous_log: Option<std::ffi::OsString>,
         previous_codex_home: Option<std::ffi::OsString>,
+        previous_idle_tick_ms: u64,
         pub log_path: PathBuf,
     }
 
@@ -4392,8 +4365,13 @@ for line in sys.stdin:
                 previous_scenario,
                 previous_log,
                 previous_codex_home,
+                previous_idle_tick_ms: CODEX_IDLE_TICK_TEST_MS.load(Ordering::SeqCst),
                 log_path,
             }
+        }
+
+        fn accelerate_watchdog(&self) {
+            CODEX_IDLE_TICK_TEST_MS.store(10, Ordering::SeqCst);
         }
     }
 
@@ -4417,6 +4395,7 @@ for line in sys.stdin:
             );
             restore("OMNI_CODE_MOCK_CODEX_LOG", self.previous_log.as_ref());
             restore("CODEX_HOME", self.previous_codex_home.as_ref());
+            CODEX_IDLE_TICK_TEST_MS.store(self.previous_idle_tick_ms, Ordering::SeqCst);
         }
     }
 
@@ -4425,10 +4404,12 @@ for line in sys.stdin:
 import json
 import os
 import sys
+import threading
 
 scenario = os.environ.get("OMNI_CODE_MOCK_CODEX_SCENARIO", "success")
 log_path = os.environ.get("OMNI_CODE_MOCK_CODEX_LOG")
 turn_request_id = None
+probe_count = 0
 
 def write(value):
     sys.stdout.write(json.dumps(value, separators=(",", ":")) + "\n")
@@ -4474,11 +4455,27 @@ for line in sys.stdin:
             write({"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"itemId":"assistant-1","delta":"partial before cancel"}})
         elif scenario == "approval":
             write({"jsonrpc":"2.0","id":77,"method":"item/commandExecution/requestApproval","params":{"command":"rm -rf /","reason":"run tests","availableDecisions":["accept","acceptForSession","cancel"]}})
+        elif scenario == "watchdog-silent-response":
+            threading.Timer(0.75, complete).start()
+        elif scenario.startswith("watchdog-"):
+            write({"jsonrpc":"2.0","method":"item/started","params":{"item":{"id":"cmd-1","type":"commandExecution","command":"cargo test","status":"inProgress"}}})
         else:
             write({"jsonrpc":"2.0","method":"item/started","params":{"item":{"id":"cmd-1","type":"commandExecution","command":"cargo test","status":"inProgress"}}})
             write({"jsonrpc":"2.0","method":"item/commandExecution/outputDelta","params":{"itemId":"cmd-1","delta":"tests running"}})
             write({"jsonrpc":"2.0","method":"item/completed","params":{"item":{"id":"cmd-1","type":"commandExecution","command":"cargo test","status":"completed","exitCode":0}}})
             write({"jsonrpc":"2.0","method":"turn/diff/updated","params":{"turnId":"mock-turn","diff":"diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1 +1 @@\n-old\n+new"}})
+            complete()
+    elif method == "thread/turns/list" and scenario.startswith("watchdog-"):
+        probe_count += 1
+        if probe_count < 4 and scenario == "watchdog-unanswered-probes":
+            continue
+        if probe_count < 4 and scenario == "watchdog-probe-errors":
+            write({"jsonrpc":"2.0","id":request_id,"error":{"code":-32601,"message":"status checks unavailable"}})
+            continue
+        items = [] if scenario == "watchdog-missing-command" else [{"id":"cmd-1","type":"commandExecution","command":"cargo test","status":"unknown" if scenario == "watchdog-unknown-status" else "inProgress"}]
+        write({"jsonrpc":"2.0","id":request_id,"result":{"data":[{"id":"mock-turn","status":"inProgress","items":items}]}})
+        if probe_count >= 4:
+            write({"jsonrpc":"2.0","method":"item/completed","params":{"item":{"id":"cmd-1","type":"commandExecution","command":"cargo test","status":"completed","exitCode":0}}})
             complete()
     elif method == "turn/interrupt":
         write({"jsonrpc":"2.0","id":request_id,"result":{}})
@@ -4936,6 +4933,74 @@ for line in sys.stdin:
             .unwrap();
         assert_eq!(domain.turns[0].status, TurnStatus::Completed);
         assert!(domain.session.pending_approval_id.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_provider_accepts_late_results_after_repeated_unverified_probes() {
+        let _lock = codex_test_lock().await;
+        for scenario in [
+            "watchdog-no-process-id",
+            "watchdog-missing-command",
+            "watchdog-probe-errors",
+            "watchdog-unanswered-probes",
+            "watchdog-unknown-status",
+        ] {
+            let mock = MockCodexEnvironment::new(scenario);
+            mock.accelerate_watchdog();
+            let state = Arc::new(test_state(scenario).await);
+            let session = create_mock_codex_session(&state, scenario).await;
+
+            start_mock_codex_turn(&state, &session, 1).await;
+            wait_for_turn_completion(&state, &session.id)
+                .await
+                .unwrap_or_else(|error| panic!("{scenario}: {error}"));
+
+            let domain = state
+                .domain_session_state(&session.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(domain.turns[0].status, TurnStatus::Completed, "{scenario}");
+            assert!(domain.session.active_turn_id.is_none(), "{scenario}");
+            wait_for_assistant_message_text(
+                &state,
+                &session.id,
+                "Complete reply with the final tail",
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{scenario}: {error}"));
+            let methods = std::fs::read_to_string(&mock.log_path).unwrap();
+            assert_eq!(
+                methods.matches("thread/turns/list\n").count(),
+                4,
+                "{scenario}"
+            );
+            assert!(!methods.contains("turn/interrupt\n"), "{scenario}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_provider_keeps_waiting_for_a_silent_response() {
+        let _lock = codex_test_lock().await;
+        let mock = MockCodexEnvironment::new("watchdog-silent-response");
+        mock.accelerate_watchdog();
+        let state = Arc::new(test_state("codex-silent-response").await);
+        let session = create_mock_codex_session(&state, "silent-response").await;
+
+        start_mock_codex_turn(&state, &session, 1).await;
+        wait_for_turn_completion(&state, &session.id).await.unwrap();
+
+        let domain = state
+            .domain_session_state(&session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(domain.turns[0].status, TurnStatus::Completed);
+        wait_for_assistant_message_text(&state, &session.id, "Complete reply with the final tail")
+            .await
+            .unwrap();
     }
 
     #[cfg(unix)]
@@ -8151,20 +8216,16 @@ async fn run_codex(
         state.emit_progress(&session.id, status_message).await;
     }
 
-    let idle_deadline = Duration::from_secs(CODEX_IDLE_TICK_SECONDS);
+    let idle_deadline = codex_idle_tick_duration();
     let idle_sleep = tokio::time::sleep(idle_deadline);
     tokio::pin!(idle_sleep);
     let mut pending_approval: Option<PendingApproval> = None;
     let mut queued_approvals: VecDeque<PendingApproval> = VecDeque::new();
     let mut command_status_probe: Option<CommandStatusProbe> = None;
-    let mut response_idle_ticks = 0_u32;
     let mut turn_finished = false;
     let mut active_turn_id: Option<String> = None;
     let mut interrupt_requested = false;
     let mut last_rendered = String::new();
-    let background_deadline =
-        tokio::time::sleep(Duration::from_secs(CODEX_BACKGROUND_TASK_MAX_SECONDS));
-    tokio::pin!(background_deadline);
     let mut background_waiting = false;
     let goal_mode = matches!(
         classify_codex_slash_command(&input.content),
@@ -8182,7 +8243,6 @@ async fn run_codex(
                 };
                 let line = line.map_err(anyhow::Error::msg)?;
                 debug_log!("[codex:stdout] {line}");
-                response_idle_ticks = 0;
                 idle_sleep.as_mut().reset(tokio::time::Instant::now() + idle_deadline);
                 if !raw_stdout.is_empty() {
                     raw_stdout.push('\n');
@@ -8208,9 +8268,14 @@ async fn run_codex(
                     let probe = command_status_probe
                         .take()
                         .context("command status probe disappeared unexpectedly")?;
+                    if parsed.running_command.as_ref().map(|command| &command.item_id)
+                        != Some(&probe.item_id)
+                    {
+                        continue;
+                    }
                     if let Some(error) = value.get("error") {
                         debug_log!(
-                            "[codex:watchdog] session={} thread/read failed for command {}: {}",
+                            "[codex:watchdog] session={} command status check failed; continuing to wait for {}: {}",
                             session.id,
                             probe.command,
                             error
@@ -8218,15 +8283,10 @@ async fn run_codex(
                                 .and_then(Value::as_str)
                                 .unwrap_or("unknown error")
                         );
-                        if parsed.record_unverified_command_probe(&probe.item_id)
-                            == Some(CODEX_COMMAND_MAX_UNVERIFIED_PROBES)
-                        {
-                            let message = "Codex did not confirm a live process or report completion for a stalled command; waiting was stopped and this turn can be resumed.";
-                            state
-                                .interrupt_turn_for_recovery(&session.id, message.to_string())
-                                .await;
-                            return Ok(());
-                        }
+                        parsed.latest_status = Some(render_command_stalled_summary(
+                            &probe.command,
+                            "status check failed; continuing to wait",
+                        ));
                     } else {
                         let snapshot = command_status_snapshot(
                             value.get("result").unwrap_or(&Value::Null),
@@ -8264,7 +8324,7 @@ async fn run_codex(
                                     }
                                 }
                                 Some(status) => {
-                                    if status != "inProgress" {
+                                    if matches!(status, "completed" | "failed" | "declined") {
                                         debug_log!(
                                             "[codex:watchdog] session={} recovered terminal command status={}: {}",
                                             session.id, status, probe.command
@@ -8277,24 +8337,25 @@ async fn run_codex(
                                         ));
                                     } else {
                                         debug_log!(
-                                            "[codex:watchdog] session={} command remains in progress without a process id: {}",
+                                            "[codex:watchdog] session={} command status={status} does not confirm completion; continuing to wait: {}",
                                             session.id, probe.command
                                         );
+                                        parsed.latest_status = Some(render_command_stalled_summary(
+                                            &probe.command,
+                                            "completion is unconfirmed; continuing to wait",
+                                        ));
                                     }
                                 }
-                                None => debug_log!(
-                                    "[codex:watchdog] session={} thread/read did not contain command item={}",
-                                    session.id, probe.item_id
-                                ),
-                            }
-                            if parsed.record_unverified_command_probe(&probe.item_id)
-                                == Some(CODEX_COMMAND_MAX_UNVERIFIED_PROBES)
-                            {
-                                let message = "Codex did not confirm a live process or report completion for a stalled command; waiting was stopped and this turn can be resumed.";
-                                state
-                                    .interrupt_turn_for_recovery(&session.id, message.to_string())
-                                    .await;
-                                return Ok(());
+                                None => {
+                                    debug_log!(
+                                        "[codex:watchdog] session={} command status check did not contain item={}; continuing to wait",
+                                        session.id, probe.item_id
+                                    );
+                                    parsed.latest_status = Some(render_command_stalled_summary(
+                                        &probe.command,
+                                        "command status is unavailable; continuing to wait",
+                                    ));
+                                }
                             }
                         }
                     }
@@ -8512,17 +8573,9 @@ async fn run_codex(
             _ = &mut idle_sleep => {
                 let previous_status = parsed.current_status().map(ToString::to_string);
                 let watchdog_action = parsed.mark_idle_waiting(pending_approval.is_some());
-                if response_wait_timed_out(
-                    &mut response_idle_ticks,
-                    parsed.running_command.is_some(),
-                    pending_approval.is_some(),
-                    parsed.has_background_processes(),
-                ) {
-                    bail!(
-                        "codex produced no events for {} minutes while waiting for turn completion",
-                        CODEX_IDLE_TICK_SECONDS * u64::from(response_idle_ticks) / 60
-                    );
-                }
+                // Silence and unsuccessful probes are diagnostic only. Codex
+                // owns the work; only a terminal event or user cancellation
+                // can end the turn.
                 match watchdog_action {
                     Some(CommandWatchdogAction::SoftRecovery { command }) => {
                         debug_log!(
@@ -8531,48 +8584,38 @@ async fn run_codex(
                         );
                     }
                     Some(CommandWatchdogAction::Probe { item_id, command }) => {
-                        if command_status_probe.is_some() {
+                        if command_status_probe.take().is_some() {
                             debug_log!(
-                                "[codex:watchdog] session={} command status probe is still unanswered: {}",
+                                "[codex:watchdog] session={} command status probe is still unanswered; retrying: {}",
                                 session.id, command
                             );
-                            if parsed.record_unverified_command_probe(&item_id)
-                                == Some(CODEX_COMMAND_MAX_UNVERIFIED_PROBES)
-                            {
-                                let message = "Codex did not confirm a live process or report completion for a stalled command; waiting was stopped and this turn can be resumed.";
-                                state
-                                    .interrupt_turn_for_recovery(&session.id, message.to_string())
-                                    .await;
-                                return Ok(());
-                            }
                             parsed.latest_status = Some(render_command_stalled_summary(
                                 &command,
                                 "waiting for Codex to confirm whether the task is still running",
                             ));
-                        } else {
-                            let request_id = send_json_rpc_request(
-                                &mut stdin,
-                                &mut next_request_id,
-                                "thread/turns/list",
-                                serde_json::json!({
-                                    "threadId": thread_id,
-                                    "cursor": null,
-                                    "limit": 1,
-                                    "sortDirection": "desc",
-                                    "itemsView": "full",
-                                }),
-                            )
-                            .await?;
-                            command_status_probe = Some(CommandStatusProbe {
-                                request_id,
-                                item_id,
-                                command: command.clone(),
-                            });
-                            debug_log!(
-                                "[codex:watchdog] session={} checking command status after missing completion event: {}",
-                                session.id, command
-                            );
                         }
+                        let request_id = send_json_rpc_request(
+                            &mut stdin,
+                            &mut next_request_id,
+                            "thread/turns/list",
+                            serde_json::json!({
+                                "threadId": thread_id,
+                                "cursor": null,
+                                "limit": 1,
+                                "sortDirection": "desc",
+                                "itemsView": "full",
+                            }),
+                        )
+                        .await?;
+                        command_status_probe = Some(CommandStatusProbe {
+                            request_id,
+                            item_id,
+                            command: command.clone(),
+                        });
+                        debug_log!(
+                            "[codex:watchdog] session={} checking command status after missing completion event: {}",
+                            session.id, command
+                        );
                     }
                     None => {}
                 }
@@ -8583,9 +8626,6 @@ async fn run_codex(
                     }
                 }
                 idle_sleep.as_mut().reset(tokio::time::Instant::now() + idle_deadline);
-            }
-            _ = &mut background_deadline, if background_waiting && parsed.has_background_processes() => {
-                bail!("codex background tasks did not exit within {} minutes", CODEX_BACKGROUND_TASK_MAX_SECONDS / 60);
             }
         }
     }
@@ -10535,7 +10575,6 @@ struct RunningCommand {
     process_id: Option<String>,
     idle_ticks: u32,
     recovery_requested: bool,
-    unverified_probe_count: u32,
 }
 
 struct CommandStatusProbe {
@@ -11050,7 +11089,6 @@ impl CodexAppServerStreamingState {
                                 .map(ToString::to_string),
                             idle_ticks: 0,
                             recovery_requested: false,
-                            unverified_probe_count: 0,
                         });
                     }
                 } else if method == "item/completed" {
@@ -11150,6 +11188,8 @@ impl CodexAppServerStreamingState {
             } else {
                 "[status] command still running"
             }
+        } else if self.has_background_processes() {
+            "[status] waiting for background tasks"
         } else {
             "[status] waiting for Codex response"
         };
@@ -11161,15 +11201,6 @@ impl CodexAppServerStreamingState {
         }
     }
 
-    fn record_unverified_command_probe(&mut self, item_id: &str) -> Option<u32> {
-        let running = self
-            .running_command
-            .as_mut()
-            .filter(|running| running.item_id == item_id)?;
-        running.unverified_probe_count += 1;
-        Some(running.unverified_probe_count)
-    }
-
     fn confirm_running_command(&mut self, item_id: &str, process_id: String) -> bool {
         let Some(running) = self
             .running_command
@@ -11179,7 +11210,6 @@ impl CodexAppServerStreamingState {
             return false;
         };
         running.process_id = Some(process_id);
-        running.unverified_probe_count = 0;
         true
     }
 
