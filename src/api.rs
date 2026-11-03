@@ -49,6 +49,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .merge(crate::desktop_gateway::router())
         .route("/health", get(health))
         .route("/files", get(get_file_by_path))
+        .route("/files/info", get(get_file_info))
         .route("/files/completions", get(list_file_completions))
         .route("/uploads", post(upload_file))
         .route("/uploads/{id}", get(download_uploaded_file))
@@ -386,9 +387,14 @@ async fn get_file_by_path(
 ) -> Result<impl IntoResponse, ApiError> {
     authorize_request(&headers, &state).await?;
     let file_path = resolve_authorized_file_path(&state, &query).await?;
-    let bytes = tokio::fs::read(&file_path)
+    let file = tokio::fs::File::open(&file_path)
         .await
         .map_err(|error| map_file_resolution_error(&query.path, error))?;
+    let length = file
+        .metadata()
+        .await
+        .map_err(|error| map_file_resolution_error(&query.path, error))?
+        .len();
 
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -397,7 +403,37 @@ async fn get_file_by_path(
     );
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
 
-    Ok((StatusCode::OK, headers, Body::from(bytes)))
+    headers.insert(header::CONTENT_LENGTH, HeaderValue::from(length));
+    let chunks = stream::try_unfold(file, |mut file| async move {
+        use tokio::io::AsyncReadExt;
+        let mut bytes = vec![0u8; 64 * 1024];
+        let count = file.read(&mut bytes).await?;
+        if count == 0 {
+            return Ok::<_, io::Error>(None);
+        }
+        bytes.truncate(count);
+        Ok(Some((bytes, file)))
+    });
+    Ok((StatusCode::OK, headers, Body::from_stream(chunks)))
+}
+
+async fn get_file_info(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<FileQuery>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
+    authorize_request(&headers, &state).await?;
+    let path = resolve_authorized_file_path(&state, &query).await?;
+    let metadata = tokio::fs::metadata(&path)
+        .await
+        .map_err(|error| map_file_resolution_error(&query.path, error))?;
+    Ok(Json(ApiResponse {
+        data: serde_json::json!({
+            "name":path.file_name().and_then(|name|name.to_str()),
+            "path":path, "size":metadata.len(), "content_type":content_type_for_path(&path),
+            "modified":metadata.modified().ok().map(chrono::DateTime::<chrono::Utc>::from),
+        }),
+    }))
 }
 
 async fn list_file_completions(
@@ -2616,6 +2652,7 @@ fn content_type_for_path(path: &StdPath) -> &'static str {
         Some("toml") => "application/toml; charset=utf-8",
         Some("xml") => "application/xml; charset=utf-8",
         Some("js") | Some("mjs") | Some("cjs") => "application/javascript; charset=utf-8",
+        Some("apk") => "application/vnd.android.package-archive",
         Some("zip") => "application/zip",
         Some("gz") => "application/gzip",
         Some("tar") => "application/x-tar",
@@ -2742,10 +2779,11 @@ fn sanitize_upload_lookup_id(id: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AcpDiagnosticQuery, absolute_url_from_headers, agent_commands_summary, agent_summary,
-        all_session_events, cancel_session_reply, completion_search_scope, content_type_for_path,
-        content_type_for_upload_name, create_domain_turn, domain_session_events,
-        domain_session_state, encode_session_event, get_acp_agent_diagnostic, global_session_event,
+        AcpDiagnosticQuery, FileQuery, absolute_url_from_headers, agent_commands_summary,
+        agent_summary, all_session_events, cancel_session_reply, completion_search_scope,
+        content_type_for_path, content_type_for_upload_name, create_domain_turn,
+        domain_session_events, domain_session_state, encode_session_event,
+        get_acp_agent_diagnostic, get_file_by_path, get_file_info, global_session_event,
         hydrate_domain_sse_event_or_reset, list_completion_items, list_domain_sessions,
         mark_domain_session_read, normalize_completion_prefix, paginate_messages,
         preferred_language, resolve_approval, resolve_path_within_root, resolve_pi_extension_ui,
@@ -2826,6 +2864,54 @@ mod tests {
             .await
             .expect("response body should load");
         serde_json::from_slice(&body).expect("response should be JSON")
+    }
+
+    #[tokio::test]
+    async fn file_metadata_and_binary_download_require_auth_and_keep_bytes() {
+        let state = test_state("file-info").await;
+        let session_id = create_api_test_session(&state, "file-info").await;
+        let path = std::env::temp_dir().join(format!("omni-{}.apk", uuid::Uuid::new_v4()));
+        let bytes = vec![0, 255, 1, 128, 42];
+        tokio::fs::write(&path, &bytes).await.unwrap();
+        let query = || FileQuery {
+            path: path.to_string_lossy().to_string(),
+            project_id: None,
+            session_id: Some(session_id.clone()),
+        };
+        assert!(
+            get_file_info(HeaderMap::new(), State(state.clone()), Query(query()))
+                .await
+                .is_err()
+        );
+        let headers = authorized_headers(&state).await;
+        let Json(metadata) = get_file_info(headers.clone(), State(state.clone()), Query(query()))
+            .await
+            .unwrap();
+        assert_eq!(metadata.data["size"], bytes.len());
+        assert_eq!(
+            metadata.data["content_type"],
+            "application/vnd.android.package-archive"
+        );
+        assert_eq!(
+            metadata.data["name"],
+            path.file_name().unwrap().to_str().unwrap()
+        );
+        let response = get_file_by_path(headers, State(state), Query(query()))
+            .await
+            .unwrap()
+            .into_response();
+        assert_eq!(
+            response.headers()[header::CONTENT_LENGTH],
+            bytes.len().to_string()
+        );
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .as_ref(),
+            bytes.as_slice()
+        );
+        tokio::fs::remove_file(path).await.unwrap();
     }
 
     #[test]
