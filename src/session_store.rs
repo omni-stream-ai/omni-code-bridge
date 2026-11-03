@@ -2242,3 +2242,28 @@ mod tests {
         path
     }
 }
+
+pub fn codex_profile_config(id: &str) -> Result<toml::Table, String> {
+    if !codex_profile_summaries()
+        .iter()
+        .any(|profile| profile.id == id)
+    {
+        return Err(format!("unknown Codex profile: {id}"));
+    }
+    let home = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
+        .unwrap_or_else(|| PathBuf::from(".codex"));
+    let path = home.join(if id == "default" {
+        "config.toml".to_string()
+    } else {
+        format!("{id}.config.toml")
+    });
+    if id == "default" && !path.exists() {
+        return Ok(toml::Table::new());
+    }
+    fs::read_to_string(path)
+        .map_err(|error| error.to_string())?
+        .parse::<toml::Table>()
+        .map_err(|error| error.to_string())
+}

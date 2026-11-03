@@ -3759,6 +3759,33 @@ impl AppState {
         last_message.created_at >= expected_message.created_at
     }
 
+    pub async fn update_session_profile(
+        &self,
+        session_id: &str,
+        profile_id: &str,
+    ) -> Result<(), String> {
+        crate::session_store::codex_profile_config(profile_id)?;
+        let mut session = self
+            .find_session(session_id)
+            .await
+            .ok_or_else(|| format!("unknown session: {session_id}"))?;
+        if session.agent != AgentKind::Codex {
+            return Err("Profiles are only supported for Codex".to_string());
+        }
+        session.provider_id = None;
+        session.profile_id = Some(profile_id.to_string());
+        session.profile_name = Some(profile_id.to_string());
+        session.updated_at = Utc::now();
+        self.sessions
+            .write()
+            .await
+            .insert(session.id.clone(), session.clone());
+        self.persist_canonical_session(&session).await?;
+        self.session_domain.sync_session_metadata(&session)?;
+        self.invalidate_list_cache().await;
+        Ok(())
+    }
+
     pub async fn update_session_settings(
         &self,
         session_id: &str,

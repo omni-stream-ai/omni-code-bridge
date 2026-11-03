@@ -332,6 +332,8 @@ pub struct CreateSessionInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateSessionInput {
+    #[serde(default)]
+    pub profile_id: Option<String>,
     /// Update the session-level provider selection.
     /// `Some(id)` uses a specific provider, `Some("AUTO")` enables auto-selection,
     /// and `None` clears provider resolution.

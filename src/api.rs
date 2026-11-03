@@ -905,6 +905,15 @@ async fn update_session(
     Json(input): Json<UpdateSessionInput>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize_request(&headers, &state).await?;
+    if let Some(profile_id) = input.profile_id {
+        state
+            .update_session_profile(&id, &profile_id)
+            .await
+            .map_err(|message| ApiError {
+                status: StatusCode::BAD_REQUEST,
+                message,
+            })?;
+    }
     let session = state
         .update_session_settings(&id, input.provider_id, input.reasoning_effort, input.model)
         .await

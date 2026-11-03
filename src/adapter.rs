@@ -6881,18 +6881,41 @@ impl AgentProvider for AcpProvider {
 }
 
 fn spawn_codex_app_server(cwd: &Path) -> Result<Child> {
-    spawn_codex_app_server_with_config(cwd, None, None, None)
+    spawn_codex_app_server_with_config(cwd, None, None, None, None)
 }
 
 // Some Codex-compatible providers accept app-server traffic only when Codex
 // reports one of its official client originators.
 const CODEX_APP_SERVER_CLIENT_NAME: &str = "codex-tui";
 
+fn codex_profile_overrides(config: &toml::Table) -> Vec<String> {
+    fn visit(prefix: &str, value: &toml::Value, output: &mut Vec<String>) {
+        if let toml::Value::Table(table) = value {
+            for (key, child) in table {
+                let key = serde_json::to_string(key).expect("string serializes");
+                visit(&format!("{prefix}.{key}"), child, output);
+            }
+        } else {
+            output.push(format!("{prefix}={value}"));
+        }
+    }
+    let mut output = Vec::new();
+    for (key, value) in config {
+        visit(
+            &serde_json::to_string(key).expect("string serializes"),
+            value,
+            &mut output,
+        );
+    }
+    output
+}
+
 fn spawn_codex_app_server_with_config(
     cwd: &Path,
     provider_config: Option<&ResolvedProviderConfig>,
     codex_provider_name: Option<&str>,
     _reasoning_effort: Option<ReasoningEffort>,
+    profile_config: Option<&toml::Table>,
 ) -> Result<Child> {
     let binary = codex_binary_path();
     let mut command = Command::new(&binary);
@@ -6911,6 +6934,11 @@ fn spawn_codex_app_server_with_config(
     };
     let toml_string = |value: &str| serde_json::to_string(value).expect("string serializes");
 
+    if let Some(config) = profile_config {
+        for argument in codex_profile_overrides(config) {
+            command.args(["-c", &argument]);
+        }
+    }
     // Force manual approval routing for app-server clients. `approval_policy`
     // alone is not enough when Codex config enables an automatic reviewer.
     push_arg(
@@ -7787,6 +7815,12 @@ async fn run_codex(
         .await
         .map(PathBuf::from)
         .map_err(anyhow::Error::msg)?;
+    let profile_config = session
+        .profile_id
+        .as_deref()
+        .map(crate::session_store::codex_profile_config)
+        .transpose()
+        .map_err(anyhow::Error::msg)?;
     // Resolve the codex provider name for this session.
     // When the bridge explicitly resolved a provider_id (message-level or session-level),
     // use it directly as the codex provider name — the -c overrides will create the
@@ -7799,13 +7833,21 @@ async fn run_codex(
     // 3. No override
     let codex_provider_name = match provider_config.as_ref().and_then(|c| c.provider_id.clone()) {
         Some(id) => Some(id),
-        None => read_codex_session_provider(&session.id).or_else(find_codex_provider_name),
+        None => profile_config
+            .as_ref()
+            .and_then(|config| config.get("model_provider"))
+            .and_then(toml::Value::as_str)
+            .map(str::to_string)
+            .or_else(|| profile_config.as_ref().map(|_| "openai".to_string()))
+            .or_else(|| read_codex_session_provider(&session.id))
+            .or_else(find_codex_provider_name),
     };
     let mut child = spawn_codex_app_server_with_config(
         &project_root,
         provider_config.as_ref(),
         codex_provider_name.as_deref(),
         reasoning_effort,
+        profile_config.as_ref(),
     )
     .context("failed to spawn `codex app-server`")?;
 
@@ -7881,7 +7923,16 @@ async fn run_codex(
     wait_for_json_rpc_response(&mut stdout_rx, &mut raw_stdout, next_request_id - 1).await?;
     send_json_rpc_notification(&mut stdin, "initialized", None).await?;
 
-    let current_model = provider_config.as_ref().and_then(|c| c.model.clone());
+    let current_model = provider_config
+        .as_ref()
+        .and_then(|c| c.model.clone())
+        .or_else(|| {
+            profile_config
+                .as_ref()
+                .and_then(|config| config.get("model"))
+                .and_then(toml::Value::as_str)
+                .map(str::to_string)
+        });
     let stored_model = state.codex_model(&session.id).await;
     let existing_runtime_ref = state.provider_session_ref(&session.id).await;
     let stored_provider_name = state.codex_provider_name(&session.id).await;
@@ -15401,5 +15452,29 @@ pub async fn install_agent(agent: AgentKind) -> crate::models::AgentInstallResul
         success: false,
         message: Some(manual_install_hint(agent)),
         installed_path: None,
+    }
+}
+
+#[cfg(test)]
+mod profile_override_tests {
+    #[test]
+    fn profile_config_preserves_nested_provider_keys() {
+        let config: toml::Table = r#"
+model_provider = "work.api"
+[model_providers."work.api"]
+base_url = "https://example.test/v1"
+"#
+        .parse()
+        .unwrap();
+        let arguments = super::codex_profile_overrides(&config);
+        assert!(arguments.contains(&r#""model_provider"="work.api""#.to_string()));
+        assert!(arguments.contains(
+            &r#""model_providers"."work.api"."base_url"="https://example.test/v1""#.to_string()
+        ));
+        for argument in arguments {
+            argument
+                .parse::<toml::Table>()
+                .expect("valid TOML override");
+        }
     }
 }
