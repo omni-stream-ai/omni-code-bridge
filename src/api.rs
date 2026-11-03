@@ -44,6 +44,7 @@ use crate::{
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
+        .merge(crate::mcp_api::router())
         .merge(crate::acceptance_api::router())
         .merge(crate::desktop_gateway::router())
         .route("/health", get(health))

@@ -16,6 +16,8 @@ mod client_auth_store;
 mod desktop_gateway;
 mod device_store;
 mod logging;
+mod mcp;
+mod mcp_api;
 mod message_projection;
 mod models;
 mod pi_plugin_store;

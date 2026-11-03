@@ -6929,6 +6929,11 @@ impl AgentProvider for AcpProvider {
     }
 }
 
+pub(crate) fn spawn_codex_mcp_server(profile: &str, cwd: &Path) -> Result<Child> {
+    let config = crate::session_store::codex_profile_config(profile).map_err(anyhow::Error::msg)?;
+    spawn_codex_app_server_with_config(cwd, None, None, None, Some(&config))
+}
+
 fn spawn_codex_app_server(cwd: &Path) -> Result<Child> {
     spawn_codex_app_server_with_config(cwd, None, None, None, None)
 }
@@ -6959,6 +6964,18 @@ fn codex_profile_overrides(config: &toml::Table) -> Vec<String> {
     output
 }
 
+fn codex_mcp_startup_grace_override(profile_config: Option<&toml::Table>) -> Option<String> {
+    // Codex's default one-second grace can omit slow HTTP MCP servers from
+    // the model's first-turn tool catalog. Bridge starts a process per turn.
+    let configured = profile_config
+        .and_then(|c| c.get("mcp_optional_startup_grace_ms"))
+        .is_some()
+        || crate::session_store::codex_profile_config("default")
+            .ok()
+            .is_some_and(|c| c.contains_key("mcp_optional_startup_grace_ms"));
+    (!configured).then(|| "mcp_optional_startup_grace_ms=30000".to_owned())
+}
+
 fn spawn_codex_app_server_with_config(
     cwd: &Path,
     provider_config: Option<&ResolvedProviderConfig>,
@@ -6987,6 +7004,9 @@ fn spawn_codex_app_server_with_config(
         for argument in codex_profile_overrides(config) {
             command.args(["-c", &argument]);
         }
+    }
+    if let Some(argument) = codex_mcp_startup_grace_override(profile_config) {
+        command.args(["-c", &argument]);
     }
     // Force manual approval routing for app-server clients. `approval_policy`
     // alone is not enough when Codex config enables an automatic reviewer.
@@ -8316,6 +8336,17 @@ async fn run_codex(
         state.emit_progress(&session.id, status_message).await;
     }
 
+    // Query the same runtime that receives turn/start. Do not block the turn
+    // on inventory or substitute a management peer's connection state.
+    let mcp_status_request = send_json_rpc_request(
+        &mut stdin,
+        &mut next_request_id,
+        "mcpServerStatus/list",
+        serde_json::json!({"threadId": thread_id, "detail": "toolsAndAuthOnly"}),
+    )
+    .await?;
+    crate::mcp::record_session_runtime(&session.id, Value::Null);
+
     let idle_deadline = codex_idle_tick_duration();
     let idle_sleep = tokio::time::sleep(idle_deadline);
     tokio::pin!(idle_sleep);
@@ -8351,6 +8382,12 @@ async fn run_codex(
 
                 let value = serde_json::from_str::<Value>(&line)
                     .unwrap_or_else(|_| serde_json::json!({ "raw_line": line }));
+                if is_json_rpc_response_for(&value, mcp_status_request) {
+                    if let Some(servers) = value.pointer("/result/data").filter(|v| v.is_array()) {
+                        crate::mcp::record_session_runtime(&session.id, servers.clone());
+                    }
+                    continue;
+                }
                 let previous_status = parsed.current_status().map(ToString::to_string);
                 if value.get("method").and_then(Value::as_str) == Some("turn/started") {
                     turn_finished = false;
@@ -8518,12 +8555,25 @@ async fn run_codex(
                                 let user_input_tx = user_input_tx.clone();
                                 tokio::spawn(async move {
                                     let response = receiver.await.ok();
-                                    let _ = user_input_tx.send((request_id, response));
+                                    let _ = user_input_tx.send((request_id, response, false));
                                 });
                             }
                             Err(error) => {
                                 send_json_rpc_error(&mut stdin, &request_id, -32603, &error).await?;
                             }
+                        }
+                    }
+                    CodexAppServerEvent::McpElicitationRequested { request_id, params } => {
+                        let request = crate::models::PiExtensionUiRequest {
+                            request_id: request_id.clone(), method: "mcp_elicitation".into(),
+                            payload: params, extension_id: Some("codex-mcp".into()), timeout_ms: None,
+                        };
+                        match state.request_pi_extension_ui(&session.id, request).await {
+                            Ok(receiver) => {
+                                let user_input_tx = user_input_tx.clone();
+                                tokio::spawn(async move { let _ = user_input_tx.send((request_id, receiver.await.ok(), true)); });
+                            }
+                            Err(error) => { send_json_rpc_error(&mut stdin, &request_id, -32603, &error).await?; }
                         }
                     }
                     CodexAppServerEvent::UnsupportedServerRequest { request_id, method } => {
@@ -8632,7 +8682,14 @@ async fn run_codex(
                 )
                 .await?;
             }
-            Some((request_id, response)) = user_input_rx.recv() => {
+            Some((request_id, response, is_mcp)) = user_input_rx.recv() => {
+                if is_mcp {
+                    let value = response.filter(|response| !response.cancelled).and_then(|response| response.value)
+                        .filter(|value| crate::mcp::validate_elicitation_response(value).is_ok())
+                        .unwrap_or_else(|| serde_json::json!({"action":"cancel","content":null,"_meta":null}));
+                    send_json_rpc_response(&mut stdin, &request_id, value).await?;
+                    continue;
+                }
                 match response {
                     Some(response) if !response.cancelled => {
                         send_json_rpc_response(
@@ -10633,6 +10690,7 @@ struct CodexAppServerStreamingState {
     completed_agent_message_ids: HashSet<String>,
     latest_status: Option<String>,
     latest_activity_key: Option<String>,
+    latest_mcp_activity: Option<ProviderActivity>,
     session_id: Option<String>,
     running_command: Option<RunningCommand>,
     background_processes: HashSet<String>,
@@ -10646,6 +10704,7 @@ enum CodexAppServerEvent {
     Diff(CodexDiff),
     ApprovalRequested(PendingApproval),
     UserInputRequested { request_id: String, params: Value },
+    McpElicitationRequested { request_id: String, params: Value },
     UnsupportedServerRequest { request_id: String, method: String },
     ApprovalResolved { request_id: String },
     TurnCompleted,
@@ -10731,6 +10790,11 @@ impl CodexAppServerStreamingState {
     }
 
     fn current_activity(&self) -> Option<ProviderActivity> {
+        if let Some(activity) = &self.latest_mcp_activity {
+            if self.latest_status.as_ref() == Some(&activity.title) {
+                return Some(activity.clone());
+            }
+        }
         let mut activity = provider_activity_from_status(self.latest_status.clone()?);
         if matches!(
             activity.kind,
@@ -10793,6 +10857,35 @@ impl CodexAppServerStreamingState {
                 "thread/status/changed" => render_codex_thread_status(params)
                     .map(CodexAppServerEvent::Status)
                     .unwrap_or(CodexAppServerEvent::None),
+                "item/mcpToolCall/progress" => {
+                    let id = params
+                        .get("itemId")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let message = params
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let title = format!("[mcp:running] {message}");
+                    self.latest_activity_key = Some(format!("codex:item:{id}"));
+                    let previous = self
+                        .latest_mcp_activity
+                        .as_ref()
+                        .filter(|activity| activity.payload["item_id"] == id);
+                    let mut payload = previous
+                        .map(|activity| activity.payload.clone())
+                        .unwrap_or_else(|| serde_json::json!({"source":"codex_mcp","item_id":id}));
+                    payload["progress"] = serde_json::json!(message);
+                    self.latest_mcp_activity = Some(ProviderActivity {
+                        correlation_key: self.latest_activity_key.clone(),
+                        kind: ActivityKind::ToolCall,
+                        state: EntityState::Running,
+                        title: title.clone(),
+                        payload,
+                    });
+                    self.latest_status = Some(title);
+                    CodexAppServerEvent::None
+                }
                 "item/commandExecution/outputDelta" => {
                     let item_id = params.get("itemId").and_then(Value::as_str);
                     self.mark_command_activity(item_id);
@@ -11083,6 +11176,12 @@ impl CodexAppServerStreamingState {
                 last_choice: None,
                 protocol_payload: params.get("permissions").cloned(),
             }),
+            "mcpServer/elicitation/request" => {
+                return CodexAppServerEvent::McpElicitationRequested {
+                    request_id,
+                    params: params.clone(),
+                };
+            }
             "item/tool/requestUserInput" => {
                 return CodexAppServerEvent::UserInputRequested {
                     request_id,
@@ -11202,6 +11301,45 @@ impl CodexAppServerStreamingState {
                     },
                     item.get("exitCode").and_then(Value::as_i64),
                 ));
+                CodexAppServerEvent::None
+            }
+            "mcpToolCall" => {
+                let id = item.get("id").and_then(Value::as_str).unwrap_or_default();
+                let server = item.get("server").and_then(Value::as_str).unwrap_or("MCP");
+                let tool = item.get("tool").and_then(Value::as_str).unwrap_or("tool");
+                let completed = method == "item/completed";
+                let failed = item.get("error").is_some_and(|value| !value.is_null())
+                    || item.get("status").and_then(Value::as_str) == Some("failed")
+                    || item.pointer("/result/isError").and_then(Value::as_bool) == Some(true);
+                let phase = if failed {
+                    "failed"
+                } else if completed {
+                    "completed"
+                } else {
+                    "running"
+                };
+                let title = format!("[mcp:{phase}] {server} / {tool}");
+                self.latest_status = Some(title.clone());
+                self.latest_activity_key = Some(format!("codex:item:{id}"));
+                self.latest_mcp_activity = Some(ProviderActivity {
+                    correlation_key: self.latest_activity_key.clone(),
+                    kind: if completed {
+                        ActivityKind::ToolResult
+                    } else {
+                        ActivityKind::ToolCall
+                    },
+                    state: if failed {
+                        EntityState::Failed
+                    } else if completed {
+                        EntityState::Completed
+                    } else {
+                        EntityState::Running
+                    },
+                    title,
+                    payload: serde_json::json!({"source":"codex_mcp", "item_id":id, "server":server,
+                        "tool_name":tool, "args":item.get("arguments"), "result":item.get("result"),
+                        "error":item.get("error"), "is_error":failed, "duration_ms":item.get("durationMs")}),
+                });
                 CodexAppServerEvent::None
             }
             "webSearch" => {
@@ -11961,7 +12099,24 @@ fn render_codex_startup_status(params: &Value) -> Option<String> {
         .and_then(Value::as_str)?;
     match status {
         "ready" | "completed" => None,
-        other => Some(format!("[mcp] startup {other}")),
+        other => {
+            let name = params
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("server");
+            let error = params
+                .get("error")
+                .and_then(extract_display_text)
+                .unwrap_or_default();
+            Some(format!(
+                "[mcp] {name}: startup {other}{}",
+                if error.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {error}")
+                }
+            ))
+        }
     }
 }
 
@@ -12146,7 +12301,26 @@ fn render_codex_status_notification(method: &str, params: &Value) -> Option<Stri
         "item/autoApprovalReview/started" => Some("[approval] auto review started".to_string()),
         "item/autoApprovalReview/completed" => Some("[approval] auto review completed".to_string()),
         "rawResponseItem/completed" => None,
-        "mcpServer/oauthLogin/completed" => Some("[mcp] oauth login completed".to_string()),
+        "mcpServer/oauthLogin/completed" => {
+            let name = params
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("server");
+            let success = params.get("success").and_then(Value::as_bool) == Some(true);
+            let error = params
+                .get("error")
+                .and_then(extract_display_text)
+                .unwrap_or_default();
+            Some(format!(
+                "[mcp] {name}: oauth login {}{}",
+                if success { "completed" } else { "failed" },
+                if error.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {error}")
+                }
+            ))
+        }
         "account/updated" => render_codex_account_updated(params),
         "app/list/updated" => render_codex_app_list_updated(params),
         "remoteControl/status/changed" => render_codex_remote_control_status(params),
@@ -15523,6 +15697,48 @@ base_url = "https://example.test/v1"
             argument
                 .parse::<toml::Table>()
                 .expect("valid TOML override");
+        }
+    }
+}
+
+#[cfg(test)]
+mod mcp_protocol_tests {
+    use super::*;
+    #[test]
+    fn explicit_mcp_startup_grace_is_preserved() {
+        let config: toml::Table = toml::from_str("mcp_optional_startup_grace_ms = 7500").unwrap();
+        assert_eq!(codex_mcp_startup_grace_override(Some(&config)), None);
+    }
+    #[test]
+    fn mcp_elicitation_is_a_supported_server_request() {
+        let mut state = CodexAppServerStreamingState::default();
+        let event=state.ingest_value(&serde_json::json!({"id":42,"method":"mcpServer/elicitation/request","params":{"serverName":"fixture","mode":"form","message":"Confirm","requestedSchema":{"type":"object","properties":{}}}}));
+        assert!(matches!(
+            event,
+            CodexAppServerEvent::McpElicitationRequested { .. }
+        ));
+    }
+    #[test]
+    fn mcp_tool_payload_preserves_arguments_results_and_failure() {
+        let mut state = CodexAppServerStreamingState::default();
+        for (method, status, failed) in [
+            ("item/started", "inProgress", false),
+            ("item/completed", "failed", true),
+        ] {
+            state.ingest_value(&serde_json::json!({"method":method,"params":{"item":{"id":"mcp-1","type":"mcpToolCall","server":"fixture","tool":"echo","status":status,"arguments":{"text":"hello"},"result":{"content":[{"type":"text","text":"hello"}],"structuredContent":{"value":3}},"error":if failed {serde_json::json!({"message":"failed"})}else{Value::Null}}}}));
+            let activity = state.current_activity().unwrap();
+            assert_eq!(activity.payload["source"], "codex_mcp");
+            assert_eq!(activity.payload["args"]["text"], "hello");
+            assert_eq!(activity.payload["result"]["structuredContent"]["value"], 3);
+            assert_eq!(activity.payload["is_error"], failed);
+            assert_eq!(
+                activity.correlation_key.as_deref(),
+                Some("codex:item:mcp-1")
+            );
+            if failed {
+                assert_eq!(activity.state, EntityState::Failed);
+                assert_eq!(activity.kind, ActivityKind::ToolResult);
+            }
         }
     }
 }
