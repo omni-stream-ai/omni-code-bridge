@@ -4453,8 +4453,9 @@ for line in sys.stdin:
             write({"jsonrpc":"2.0","method":"turn/completed","params":{"turn":{"id":"mock-turn","status":"failed","error":{"message":"mock provider failed"}}}})
         elif scenario == "cancel":
             write({"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"itemId":"assistant-1","delta":"partial before cancel"}})
-        elif scenario == "approval":
-            write({"jsonrpc":"2.0","id":77,"method":"item/commandExecution/requestApproval","params":{"command":"rm -rf /","reason":"run tests","availableDecisions":["accept","acceptForSession","cancel"]}})
+        elif scenario in ("approval", "approval-id-collision"):
+            approval_id = turn_request_id if scenario == "approval-id-collision" else 77
+            write({"jsonrpc":"2.0","id":approval_id,"method":"item/commandExecution/requestApproval","params":{"command":"rm -rf /","reason":"run tests","availableDecisions":["accept","acceptForSession","cancel"]}})
         elif scenario == "watchdog-silent-response":
             threading.Timer(0.75, complete).start()
         elif scenario.startswith("watchdog-"):
@@ -4480,11 +4481,11 @@ for line in sys.stdin:
     elif method == "turn/interrupt":
         write({"jsonrpc":"2.0","id":request_id,"result":{}})
         write({"jsonrpc":"2.0","method":"turn/completed","params":{"turn":{"id":"mock-turn","status":"interrupted"}}})
-    elif request_id == 77:
+    elif not method and request_id == (turn_request_id if scenario == "approval-id-collision" else 77):
         if value.get("result", {}).get("decision") != "accept":
             sys.stderr.write("unexpected approval response: " + json.dumps(value) + "\n")
             sys.exit(2)
-        write({"jsonrpc":"2.0","method":"serverRequest/resolved","params":{"requestId":77}})
+        write({"jsonrpc":"2.0","method":"serverRequest/resolved","params":{"requestId":request_id}})
         complete("Approved reply with the final tail")
     else:
         write({"jsonrpc":"2.0","id":request_id,"error":{"code":-32601,"message":"unsupported mock method: " + method}})
@@ -4933,6 +4934,54 @@ for line in sys.stdin:
             .unwrap();
         assert_eq!(domain.turns[0].status, TurnStatus::Completed);
         assert!(domain.session.pending_approval_id.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_approval_with_turn_request_id_is_not_swallowed() {
+        let _lock = codex_test_lock().await;
+        let _mock = MockCodexEnvironment::new("approval-id-collision");
+        let state = Arc::new(test_state("approval-id-collision").await);
+        let session = create_mock_codex_session(&state, "approval-id-collision").await;
+        start_mock_codex_turn(&state, &session, 1).await;
+        let approval = wait_for_pending_approval(&state, &session.id).await;
+        assert_eq!(approval.request_id, "3");
+        state
+            .submit_approval(&session.id, &approval.request_id, ApprovalChoice::Accept)
+            .await
+            .unwrap();
+        wait_for_turn_completion(&state, &session.id).await.unwrap();
+        assert!(
+            state
+                .get_session(&session.id)
+                .await
+                .unwrap()
+                .session
+                .pending_approval
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn json_rpc_response_matching_rejects_server_requests() {
+        for id in [3, 77] {
+            assert!(!is_json_rpc_response_for(
+                &serde_json::json!({"id": id, "method": "item/commandExecution/requestApproval", "params": {}}),
+                id
+            ));
+            assert!(!is_json_rpc_response_for(
+                &serde_json::json!({"id": id}),
+                id
+            ));
+            assert!(is_json_rpc_response_for(
+                &serde_json::json!({"id": id, "result": {}}),
+                id
+            ));
+            assert!(is_json_rpc_response_for(
+                &serde_json::json!({"id": id, "error": {"code": -1}}),
+                id
+            ));
+        }
     }
 
     #[cfg(unix)]
@@ -8312,8 +8361,7 @@ async fn run_codex(
                         .or(active_turn_id);
                 }
                 let probe_response = command_status_probe.as_ref().is_some_and(|probe| {
-                    value.get("id").and_then(jsonrpc_id_to_string).as_deref()
-                        == Some(&probe.request_id.to_string())
+                    is_json_rpc_response_for(&value, probe.request_id)
                 });
                 if probe_response {
                     let probe = command_status_probe
@@ -8411,9 +8459,7 @@ async fn run_codex(
                         }
                     }
                 }
-                if value.get("id").and_then(jsonrpc_id_to_string).as_deref()
-                    == Some(&turn_request_id.to_string())
-                {
+                if is_json_rpc_response_for(&value, turn_request_id) {
                     if let Some(error) = value.get("error") {
                         let message = error
                             .get("message")
@@ -9854,9 +9900,7 @@ async fn run_stdio_acp(
 
                 let value = serde_json::from_str::<Value>(&line)
                     .unwrap_or_else(|_| serde_json::json!({ "raw_line": line }));
-                if value.get("id").and_then(jsonrpc_id_to_string).as_deref()
-                    == Some(&prompt_request_id.to_string())
-                {
+                if is_json_rpc_response_for(&value, prompt_request_id) {
                     if let Some(error) = value.get("error") {
                         let message = error
                             .get("message")
@@ -10155,9 +10199,7 @@ async fn summarize_with_codex(
 
         let value = serde_json::from_str::<Value>(&line)
             .unwrap_or_else(|_| serde_json::json!({ "raw_line": line }));
-        if value.get("id").and_then(jsonrpc_id_to_string).as_deref()
-            == Some(&turn_request_id.to_string())
-        {
+        if is_json_rpc_response_for(&value, turn_request_id) {
             if let Some(error) = value.get("error") {
                 let message = error
                     .get("message")
@@ -11611,6 +11653,14 @@ async fn write_json_line(writer: &mut (impl AsyncWrite + Unpin), value: &Value) 
     Ok(())
 }
 
+// Server requests use an independent ID sequence. Match response envelopes only.
+fn is_json_rpc_response_for(value: &Value, request_id: u64) -> bool {
+    value.get("method").is_none()
+        && (value.get("result").is_some() || value.get("error").is_some())
+        && value.get("id").and_then(jsonrpc_id_to_string).as_deref()
+            == Some(&request_id.to_string())
+}
+
 async fn wait_for_json_rpc_response(
     stdout_rx: &mut mpsc::UnboundedReceiver<std::result::Result<String, String>>,
     raw_stdout: &mut String,
@@ -11647,9 +11697,7 @@ async fn wait_for_json_rpc_response_unbounded(
         debug_log!("[codex:jsonrpc:recv] {line}");
         let value: Value = serde_json::from_str(&line)
             .with_context(|| "JSON-RPC runtime produced invalid JSON")?;
-        if value.get("id").and_then(jsonrpc_id_to_string).as_deref()
-            == Some(&request_id.to_string())
-        {
+        if is_json_rpc_response_for(&value, request_id) {
             if let Some(error) = value.get("error") {
                 let message = error
                     .get("message")
