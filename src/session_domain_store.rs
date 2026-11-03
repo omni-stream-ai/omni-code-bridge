@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 
 use crate::{
+    execution_health::ExecutionHealth,
     models::{ChatMessage, MessageRole, SessionDiffEvent, SessionSummary},
     session_domain::{
         AgentProjection, CreateTurnCommand, CreateTurnResult, DomainMessage, DomainSession,
@@ -246,6 +247,7 @@ impl SessionDomainStore {
                     sequence,
                     version: previous.map_or(1, |turn| turn.version + 1),
                     status: TurnStatus::Completed,
+                    execution: None,
                     input_mode: crate::models::InputMode::Text,
                     user_message: DomainMessage {
                         id: if is_user {
@@ -765,6 +767,7 @@ impl SessionDomainStore {
             sequence: turn_sequence,
             version: 1,
             status: TurnStatus::Accepted,
+            execution: Some(ExecutionHealth::new(now)),
             input_mode: command.input_mode.clone(),
             user_message,
             segments: Vec::new(),
@@ -874,7 +877,45 @@ impl SessionDomainStore {
         let mut turn = read_turn(&transaction, &turn_id)?
             .ok_or_else(|| "active turn not found".to_string())?;
         let now = Utc::now();
+        turn.execution = Some(ExecutionHealth::observe(&turn, &projection, now));
         let (event_type, entity_id, entity_revision) = match projection {
+            AgentProjection::ExecutionProgress { phase } => {
+                let execution = turn.execution.as_mut().expect("execution initialized");
+                execution.last_progress_at = now;
+                execution.check_error = None;
+                execution.set_phase(phase, now);
+                (
+                    "turn.execution_changed",
+                    Some(turn.id.clone()),
+                    Some(turn.version + 1),
+                )
+            }
+            AgentProjection::ExecutionCheck {
+                phase,
+                checking,
+                error,
+            } => {
+                let execution = turn.execution.as_mut().expect("execution initialized");
+                if checking {
+                    execution.check_started_at = Some(now);
+                    execution.check_error = None;
+                } else {
+                    let superseded = execution
+                        .check_started_at
+                        .is_some_and(|started| execution.last_progress_at > started);
+                    execution.check_started_at = None;
+                    execution.last_checked_at = Some(now);
+                    execution.check_error = error;
+                    if let Some(phase) = phase.filter(|_| !superseded) {
+                        execution.set_phase(phase, now);
+                    }
+                }
+                (
+                    "turn.execution_changed",
+                    Some(turn.id.clone()),
+                    Some(turn.version + 1),
+                )
+            }
             AgentProjection::AssistantMessage {
                 message_id,
                 purpose,
@@ -1089,6 +1130,7 @@ impl SessionDomainStore {
                     turn.started_at = Some(now);
                 }
                 if status.is_terminal() {
+                    turn.execution = None;
                     turn.completed_at = Some(now);
                     session.active_turn_id = None;
                     session.pending_approval_id = None;
@@ -1690,6 +1732,146 @@ mod tests {
     fn test_store() -> SessionDomainStore {
         let path = std::env::temp_dir().join(format!("omni-domain-{}.sqlite3", Uuid::new_v4()));
         SessionDomainStore::open(&path).expect("domain store should open")
+    }
+
+    #[test]
+    fn execution_health_persists_without_counting_checks_as_progress() {
+        use crate::execution_health::ExecutionPhase;
+        let store = test_store();
+        store.ensure_session(&session("health-session")).unwrap();
+        store
+            .create_turn(
+                "health-session",
+                &CreateTurnCommand {
+                    command_id: "health-command".to_string(),
+                    turn_id: "health-turn".to_string(),
+                    user_message_id: "health-user".to_string(),
+                    content: "Build APK".to_string(),
+                    attachments: vec![],
+                    input_mode: InputMode::Text,
+                    system_prompt: None,
+                    expected_session_version: None,
+                    provider_id: None,
+                    reasoning_effort: None,
+                    model: None,
+                },
+            )
+            .unwrap();
+        let activity = || AgentProjection::Activity {
+            activity_id: "health-tool".to_string(),
+            kind: crate::session_domain::ActivityKind::ToolCall,
+            state: EntityState::Running,
+            title: "[command:running] curl".to_string(),
+            primary: None,
+            secondary: vec![],
+            payload: json!({}),
+        };
+        store
+            .project_agent_event("health-session", "health-turn", activity())
+            .unwrap();
+        let before = store
+            .session_state("health-session")
+            .unwrap()
+            .unwrap()
+            .turns[0]
+            .execution
+            .clone()
+            .unwrap();
+        assert_eq!(before.phase, ExecutionPhase::WaitingForTool);
+        for checking in [true, false] {
+            store
+                .project_agent_event(
+                    "health-session",
+                    "health-turn",
+                    AgentProjection::ExecutionCheck {
+                        checking,
+                        phase: Some(ExecutionPhase::Unconfirmed),
+                        error: None,
+                    },
+                )
+                .unwrap();
+        }
+        store
+            .project_agent_event("health-session", "health-turn", activity())
+            .unwrap();
+        let state = store.session_state("health-session").unwrap().unwrap();
+        let health = state.turns[0].execution.as_ref().unwrap();
+        assert_eq!(health.last_progress_at, before.last_progress_at);
+        assert!(health.last_checked_at.is_some());
+        assert!(health.check_started_at.is_none());
+        assert_eq!(
+            state.turns[0]
+                .segments
+                .iter()
+                .flat_map(|segment| &segment.activities)
+                .count(),
+            1
+        );
+        store
+            .project_agent_event(
+                "health-session",
+                "health-turn",
+                AgentProjection::ExecutionCheck {
+                    checking: true,
+                    phase: None,
+                    error: None,
+                },
+            )
+            .unwrap();
+        store
+            .project_agent_event(
+                "health-session",
+                "health-turn",
+                AgentProjection::AssistantMessage {
+                    message_id: "health-reply".to_string(),
+                    purpose: MessagePurpose::Commentary,
+                    state: EntityState::Running,
+                    content: "Download finished".to_string(),
+                },
+            )
+            .unwrap();
+        store
+            .project_agent_event(
+                "health-session",
+                "health-turn",
+                AgentProjection::ExecutionProgress {
+                    phase: ExecutionPhase::RunningCommand,
+                },
+            )
+            .unwrap();
+        store
+            .project_agent_event(
+                "health-session",
+                "health-turn",
+                AgentProjection::ExecutionCheck {
+                    checking: false,
+                    phase: Some(ExecutionPhase::Unconfirmed),
+                    error: None,
+                },
+            )
+            .unwrap();
+        let latest = store.session_state("health-session").unwrap().unwrap();
+        assert_eq!(
+            latest.turns[0].execution.as_ref().unwrap().phase,
+            ExecutionPhase::RunningCommand
+        );
+        assert!(
+            latest.turns[0].execution.as_ref().unwrap().last_progress_at > before.last_progress_at
+        );
+        store
+            .project_agent_event(
+                "health-session",
+                "health-turn",
+                AgentProjection::TurnStatus {
+                    status: TurnStatus::Cancelled,
+                    error: None,
+                },
+            )
+            .unwrap();
+        let state = store.session_state("health-session").unwrap().unwrap();
+        assert!(state.turns[0].execution.is_none());
+        assert!(state.session.active_turn_id.is_none());
+        assert_eq!(state.turns[0].segments[0].activities.len(), 1);
     }
 
     fn session(id: &str) -> SessionSummary {

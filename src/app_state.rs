@@ -73,6 +73,7 @@ struct SessionRuntimeState {
     last_resolved_approval_request_id: Option<String>,
     approval_tx: Option<mpsc::UnboundedSender<ApprovalChoice>>,
     cancel_tx: Option<mpsc::UnboundedSender<()>>,
+    execution_check_tx: Option<mpsc::UnboundedSender<()>>,
     turn_abort: Option<AbortHandle>,
     turn_in_flight: bool,
     interrupted: bool,
@@ -156,6 +157,7 @@ impl SessionRuntimeState {
             last_resolved_approval_request_id: None,
             approval_tx: None,
             cancel_tx: None,
+            execution_check_tx: None,
             turn_abort: None,
             turn_in_flight: false,
             interrupted: value.interrupted,
@@ -1240,6 +1242,40 @@ impl AppState {
         if !no_message_progress {
             return false;
         }
+        let no_tool_progress =
+            self.session_domain
+                .session_state(session_id)
+                .ok()
+                .flatten()
+                .and_then(|state| {
+                    let turn = state
+                        .turns
+                        .iter()
+                        .find(|turn| turn.user_message.id == message_id)
+                        .or_else(|| {
+                            state.session.active_turn_id.as_ref().and_then(|turn_id| {
+                                state.turns.iter().find(|turn| &turn.id == turn_id)
+                            })
+                        })?;
+                    Some(
+                        !turn
+                            .segments
+                            .iter()
+                            .flat_map(|segment| &segment.activities)
+                            .any(|activity| {
+                                matches!(
+                                    activity.kind,
+                                    ActivityKind::ToolCall
+                                        | ActivityKind::ToolResult
+                                        | ActivityKind::Approval
+                                )
+                            }),
+                    )
+                })
+                .unwrap_or(false);
+        if !no_tool_progress {
+            return false;
+        }
         self.runtime
             .lock()
             .await
@@ -1368,6 +1404,7 @@ impl AppState {
                 last_resolved_approval_request_id: None,
                 approval_tx: None,
                 cancel_tx: None,
+                execution_check_tx: None,
                 turn_abort: None,
                 turn_in_flight: false,
                 interrupted: false,
@@ -2414,6 +2451,14 @@ impl AppState {
     }
 
     pub async fn cancel_turn(&self, session_id: &str) -> Result<bool, String> {
+        self.cancel_turn_if_current(session_id, None).await
+    }
+
+    pub async fn cancel_turn_if_current(
+        &self,
+        session_id: &str,
+        expected_turn_id: Option<&str>,
+    ) -> Result<bool, String> {
         let canonical_session_id = self.resolve_session_id(session_id).await;
         let session_snapshot = self
             .find_session(&canonical_session_id)
@@ -2430,15 +2475,30 @@ impl AppState {
         );
         let (abort_handle, cancel_tx, should_interrupt, should_try_provider_cancel) = {
             let mut runtime = self.runtime.lock().await;
+            if let Some(expected) = expected_turn_id {
+                let current = self
+                    .session_domain
+                    .session_state(&canonical_session_id)?
+                    .and_then(|snapshot| snapshot.session.active_turn_id);
+                if current.as_deref() != Some(expected) {
+                    return Err(
+                        "The active turn changed. Refresh the session before recovering it."
+                            .to_string(),
+                    );
+                }
+            }
             let entry = runtime
                 .entry(canonical_session_id.clone())
                 .or_insert_with(SessionRuntimeState::default);
             let abort_handle = entry.turn_abort.take();
             let cancel_tx = entry.cancel_tx.take();
+            entry.execution_check_tx = None;
             let had_active_turn = entry.turn_in_flight || abort_handle.is_some();
             let had_detached_running = Self::is_detached_running(entry);
-            let should_interrupt =
-                had_active_turn || had_detached_running || stale_running_without_runtime;
+            let should_interrupt = had_active_turn
+                || had_detached_running
+                || stale_running_without_runtime
+                || cancelled_domain_turn_id.is_some();
             let should_try_provider_cancel = runtime_session_ref.is_some() && !had_active_turn;
             entry.turn_in_flight = false;
             entry.approval_tx = None;
@@ -2480,11 +2540,26 @@ impl AppState {
         }
         if let Some(cancel_tx) = cancel_tx {
             let _ = cancel_tx.send(());
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            if let Some(handle) = abort_handle.as_ref() {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                while !handle.is_finished() && tokio::time::Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            } else {
+                // Legacy runtimes have no join handle. Let the cancellation
+                // receiver observe the signal before publishing final status.
+                tokio::task::yield_now().await;
+            }
         }
 
         if let Some(abort_handle) = abort_handle {
-            abort_handle.abort();
+            if !abort_handle.is_finished() {
+                abort_handle.abort();
+            }
+            // Abort is asynchronous; recovery must wait for the old task to exit.
+            while !abort_handle.is_finished() {
+                tokio::task::yield_now().await;
+            }
         }
 
         let provider_cancelled = if should_try_provider_cancel {
@@ -3266,6 +3341,7 @@ impl AppState {
                 entry.turn_in_flight = false;
                 entry.turn_abort = None;
                 entry.cancel_tx = None;
+                entry.execution_check_tx = None;
                 entry.current_turn_id = None;
             }
         })
@@ -3284,6 +3360,110 @@ impl AppState {
         if allowed {
             entry.cancel_tx = Some(sender);
         }
+    }
+
+    pub async fn set_execution_check_sender(
+        &self,
+        session_id: &str,
+        sender: mpsc::UnboundedSender<()>,
+    ) {
+        let mut runtime = self.runtime.lock().await;
+        let entry = runtime.entry(session_id.to_string()).or_default();
+        if DOMAIN_TURN_ID.try_with(Clone::clone).ok().as_deref() == entry.current_turn_id.as_deref()
+        {
+            entry.execution_check_tx = Some(sender);
+        }
+    }
+
+    pub async fn request_execution_check(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+    ) -> Result<bool, String> {
+        let session_id = self.resolve_session_id(session_id).await;
+        let runtime = self.runtime.lock().await;
+        let snapshot = self.session_domain.session_state(&session_id)?;
+        if snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.session.active_turn_id.as_deref())
+            != Some(turn_id)
+        {
+            return Err(
+                "The active turn changed. Refresh the session before checking it.".to_string(),
+            );
+        }
+        let sender = runtime
+            .get(&session_id)
+            .filter(|entry| entry.current_turn_id.as_deref() == Some(turn_id))
+            .and_then(|entry| entry.execution_check_tx.as_ref());
+        let Some(sender) = sender else {
+            return Ok(false);
+        };
+        let already_checking = snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.turns.iter().find(|turn| turn.id == turn_id))
+            .and_then(|turn| turn.execution.as_ref())
+            .and_then(|health| health.check_started_at)
+            .is_some_and(|started| Utc::now().signed_duration_since(started).num_seconds() < 30);
+        if already_checking {
+            return Ok(true);
+        }
+        let requested = sender.send(()).is_ok();
+        if requested {
+            self.session_domain.project_agent_event(
+                &session_id,
+                turn_id,
+                AgentProjection::ExecutionCheck {
+                    phase: None,
+                    checking: true,
+                    error: None,
+                },
+            )?;
+        }
+        Ok(requested)
+    }
+
+    pub fn execution_health(
+        &self,
+        session_id: &str,
+    ) -> Option<crate::execution_health::ExecutionHealth> {
+        let snapshot = self
+            .session_domain
+            .session_state(session_id)
+            .ok()
+            .flatten()?;
+        let turn_id = snapshot.session.active_turn_id?;
+        snapshot
+            .turns
+            .iter()
+            .find(|turn| turn.id == turn_id)?
+            .execution
+            .clone()
+    }
+
+    pub fn emit_execution_check(
+        &self,
+        session_id: &str,
+        checking: bool,
+        phase: Option<crate::execution_health::ExecutionPhase>,
+        error: Option<String>,
+    ) {
+        self.project_agent_event(
+            session_id,
+            AgentProjection::ExecutionCheck {
+                phase,
+                checking,
+                error,
+            },
+        );
+    }
+
+    pub fn emit_execution_progress(
+        &self,
+        session_id: &str,
+        phase: crate::execution_health::ExecutionPhase,
+    ) {
+        self.project_agent_event(session_id, AgentProjection::ExecutionProgress { phase });
     }
 
     #[cfg(test)]

@@ -104,6 +104,18 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/v2/sessions/events", get(all_domain_session_events))
         .route("/v2/sessions/{id}", get(get_session).patch(update_session))
         .route("/v2/sessions/{id}/cancel", post(cancel_session_reply))
+        .route(
+            "/v2/sessions/{id}/turns/{turn_id}/check",
+            post(check_session_execution),
+        )
+        .route(
+            "/v2/sessions/{id}/turns/{turn_id}/cancel",
+            post(cancel_domain_turn),
+        )
+        .route(
+            "/v2/sessions/{id}/turns/{turn_id}/recover",
+            post(recover_domain_turn),
+        )
         .route("/v2/sessions/{id}/messages", get(list_messages))
         .route("/v2/sessions/{id}/summary", post(summarize_reply))
         .route(
@@ -958,6 +970,63 @@ async fn cancel_session_reply(
         .cancel_turn(&id)
         .await
         .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    Ok(Json(ApiResponse {
+        data: CancelSessionReplyResult { cancelled },
+    }))
+}
+
+async fn check_session_execution(
+    Path((id, turn_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, ApiError> {
+    authorize_request(&headers, &state).await?;
+    let requested = state
+        .request_execution_check(&id, &turn_id)
+        .await
+        .map_err(|error| (StatusCode::CONFLICT, error))?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(ApiResponse {
+            data: serde_json::json!({ "requested": requested }),
+        }),
+    ))
+}
+
+async fn recover_domain_turn(
+    Path((id, turn_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Json(command): Json<CreateTurnCommand>,
+) -> Result<impl IntoResponse, ApiError> {
+    authorize_request(&headers, &state).await?;
+    // A retry of an accepted command must not interrupt its replacement turn.
+    let snapshot = state
+        .domain_session_state(&id)
+        .await
+        .map_err(|error| (StatusCode::CONFLICT, error))?;
+    let already_created = snapshot
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.turns.iter().any(|turn| turn.id == command.turn_id));
+    if !already_created {
+        state
+            .cancel_turn_if_current(&id, Some(&turn_id))
+            .await
+            .map_err(|error| (StatusCode::CONFLICT, error))?;
+    }
+    create_domain_turn(Path(id), headers, State(state), Json(command)).await
+}
+
+async fn cancel_domain_turn(
+    Path((id, turn_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, ApiError> {
+    authorize_request(&headers, &state).await?;
+    let cancelled = state
+        .cancel_turn_if_current(&id, Some(&turn_id))
+        .await
+        .map_err(|error| (StatusCode::CONFLICT, error))?;
     Ok(Json(ApiResponse {
         data: CancelSessionReplyResult { cancelled },
     }))
@@ -2869,7 +2938,7 @@ mod tests {
 
         let duplicate_response = create_domain_turn(
             axum::extract::Path(session_id.clone()),
-            headers,
+            headers.clone(),
             State(Arc::clone(&state)),
             Json(command.clone()),
         )
@@ -2880,6 +2949,84 @@ mod tests {
         let duplicate_json = response_json(duplicate_response).await;
         assert_eq!(duplicate_json["data"]["created"], false);
         assert_eq!(duplicate_json["data"]["turn"]["id"], command.turn_id);
+
+        // Retrying an already accepted recovery must return its turn rather
+        // than cancelling the replacement or creating another continuation.
+        let retried = super::recover_domain_turn(
+            axum::extract::Path((session_id.clone(), "old-turn".to_string())),
+            headers,
+            State(Arc::clone(&state)),
+            Json(command.clone()),
+        )
+        .await
+        .expect("accepted recovery retry must be idempotent")
+        .into_response();
+        assert_eq!(retried.status(), StatusCode::OK);
+        let retried_json = response_json(retried).await;
+        assert_eq!(retried_json["data"]["created"], false);
+        assert_eq!(retried_json["data"]["turn"]["id"], command.turn_id);
+    }
+
+    #[tokio::test]
+    async fn recovery_handler_replaces_only_the_expected_turn() {
+        let state = test_state("recovery-handler").await;
+        let session_id = create_api_test_session(&state, "recovery").await;
+        let headers = authorized_headers(&state).await;
+        let command = CreateTurnCommand {
+            command_id: uuid::Uuid::new_v4().to_string(),
+            turn_id: uuid::Uuid::new_v4().to_string(),
+            user_message_id: uuid::Uuid::new_v4().to_string(),
+            content: "build".to_string(),
+            attachments: vec![],
+            input_mode: InputMode::Text,
+            system_prompt: None,
+            expected_session_version: None,
+            provider_id: None,
+            reasoning_effort: None,
+            model: None,
+        };
+        state
+            .create_domain_turn(&session_id, &command)
+            .await
+            .unwrap();
+        let continuation = CreateTurnCommand {
+            command_id: uuid::Uuid::new_v4().to_string(),
+            turn_id: uuid::Uuid::new_v4().to_string(),
+            user_message_id: uuid::Uuid::new_v4().to_string(),
+            content: "Check artifacts before continuing remaining work".to_string(),
+            ..command.clone()
+        };
+        assert!(
+            super::recover_domain_turn(
+                axum::extract::Path((session_id.clone(), "stale-turn".into())),
+                headers.clone(),
+                State(Arc::clone(&state)),
+                Json(continuation.clone()),
+            )
+            .await
+            .is_err()
+        );
+        let response = super::recover_domain_turn(
+            axum::extract::Path((session_id.clone(), command.turn_id.clone())),
+            headers,
+            State(Arc::clone(&state)),
+            Json(continuation.clone()),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let snapshot = state
+            .domain_session_state(&session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.turns.len(), 2);
+        assert_eq!(
+            snapshot.turns[0].status,
+            crate::session_domain::TurnStatus::Cancelled
+        );
+        assert_eq!(snapshot.turns[1].id, continuation.turn_id);
     }
 
     #[tokio::test]

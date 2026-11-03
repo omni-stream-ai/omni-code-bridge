@@ -15,6 +15,7 @@ mod claude_store;
 mod client_auth_store;
 mod desktop_gateway;
 mod device_store;
+mod execution_health;
 mod logging;
 mod mcp;
 mod mcp_api;

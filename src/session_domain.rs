@@ -1,3 +1,4 @@
+use crate::execution_health::{ExecutionHealth, ExecutionPhase};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -164,6 +165,8 @@ pub struct Turn {
     pub sequence: i64,
     pub version: i64,
     pub status: TurnStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<ExecutionHealth>,
     pub input_mode: InputMode,
     pub user_message: DomainMessage,
     #[serde(default)]
@@ -276,6 +279,14 @@ pub struct CreateTurnResult {
 
 #[derive(Debug, Clone)]
 pub enum AgentProjection {
+    ExecutionProgress {
+        phase: ExecutionPhase,
+    },
+    ExecutionCheck {
+        phase: Option<ExecutionPhase>,
+        checking: bool,
+        error: Option<String>,
+    },
     AssistantMessage {
         message_id: String,
         purpose: MessagePurpose,

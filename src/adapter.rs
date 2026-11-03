@@ -203,6 +203,14 @@ mod provider_activity_kind_tests {
 const CODEX_IDLE_TICK_SECONDS: u64 = 15;
 const CODEX_COMMAND_SOFT_RECOVERY_IDLE_TICKS: u32 = 8;
 const CODEX_COMMAND_STALLED_IDLE_TICKS: u32 = 20;
+// Missing command items can reflect incomplete provider snapshots. Repeated
+// observations request more status information; they cannot cancel the turn.
+const CODEX_COMMAND_MISSING_ITEM_CONFIRMATIONS: u32 = 4;
+const CODEX_MAX_NETWORK_RETRIES: usize = 7;
+// Internal tool hosts may still be active after their visible work items
+// finish. These probes only reconcile status and never interrupt work.
+const CODEX_ORPHAN_PROBE_IDLE_TICKS: u32 = 4;
+const CODEX_ORPHAN_PROBE_CONFIRMATIONS: u32 = 4;
 const ACP_JSON_RPC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const ACP_READINESS_TIMEOUT: Duration = Duration::from_secs(5);
 const CODEX_JSON_RPC_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1995,6 +2003,80 @@ export default function init(pi) {
     }
 
     #[test]
+    fn execution_health_counts_actual_output_and_ignores_watchdog_traffic() {
+        use crate::execution_health::ExecutionPhase;
+        for (method, expected) in [
+            (
+                "item/commandExecution/outputDelta",
+                Some(ExecutionPhase::RunningCommand),
+            ),
+            ("process/outputDelta", Some(ExecutionPhase::Background)),
+            ("item/reasoning/textDelta", Some(ExecutionPhase::Thinking)),
+            ("thread/status/changed", None),
+        ] {
+            assert_eq!(
+                codex_execution_progress(
+                    &serde_json::json!({ "method": method, "params": { "delta": "new output" } })
+                ),
+                expected
+            );
+        }
+        assert_eq!(
+            codex_execution_progress(
+                &serde_json::json!({ "method": "item/commandExecution/outputDelta", "params": { "delta": "" } })
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn codex_streaming_state_preserves_provider_retry_notifications() {
+        let mut state = CodexAppServerStreamingState::default();
+        let event = state.ingest_value(&serde_json::json!({
+            "method": "error",
+            "params": {
+                "willRetry": true,
+                "error": {
+                    "message": "Reconnecting... 1/5",
+                    "additionalDetails": "stream disconnected before completion: Upstream request failed"
+                }
+            }
+        }));
+        match event {
+            CodexAppServerEvent::Status(status) => assert_eq!(
+                status,
+                "[codex:retry] Reconnecting... 1/5: stream disconnected before completion: Upstream request failed"
+            ),
+            _ => panic!("a provider retry must keep the turn alive"),
+        }
+    }
+
+    #[test]
+    fn codex_streaming_state_keeps_non_retrying_errors_terminal() {
+        for will_retry in [Some(false), None] {
+            let mut state = CodexAppServerStreamingState::default();
+            let mut notification = serde_json::json!({
+                "method": "error",
+                "params": {
+                    "error": {
+                        "message": "Reconnecting... 1/5",
+                        "additionalDetails": "upstream unavailable"
+                    }
+                }
+            });
+            if let Some(will_retry) = will_retry {
+                notification["params"]["willRetry"] = will_retry.into();
+            }
+            match state.ingest_value(&notification) {
+                CodexAppServerEvent::TurnFailed(message) => {
+                    assert_eq!(message, "Reconnecting... 1/5: upstream unavailable");
+                }
+                _ => panic!("errors without a provider retry must remain terminal"),
+            }
+        }
+    }
+
+    #[test]
     fn codex_skill_response_and_explicit_input_use_app_server_metadata() {
         let skills = parse_codex_skills_response(&serde_json::json!({
             "data": [{
@@ -2713,6 +2795,50 @@ export default function init(pi) {
     }
 
     #[test]
+    fn codex_watchdog_keeps_waiting_for_active_generic_items() {
+        let mut state = CodexAppServerStreamingState::default();
+        let _ = state.ingest_value(&serde_json::json!({
+            "method": "item/started",
+            "params": {
+                "item": {
+                    "id": "tool-1",
+                    "type": "customToolCall",
+                    "status": "inProgress"
+                }
+            }
+        }));
+
+        for _ in 0..(CODEX_ORPHAN_PROBE_IDLE_TICKS * 3) {
+            assert!(state.mark_idle_waiting(false).is_none());
+            assert_eq!(
+                state.current_status(),
+                Some("[status] waiting for Codex task")
+            );
+        }
+        assert!(!state.orphan_recovery_ready());
+    }
+
+    #[test]
+    fn codex_watchdog_does_not_recover_after_a_final_answer() {
+        let mut state = CodexAppServerStreamingState::default();
+        let _ = state.ingest_value(&serde_json::json!({
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "id": "assistant-1",
+                    "type": "agentMessage",
+                    "phase": "final_answer",
+                    "text": "done"
+                }
+            }
+        }));
+        for _ in 0..(CODEX_ORPHAN_PROBE_IDLE_TICKS * 6) {
+            assert!(state.mark_idle_waiting(false).is_none());
+        }
+        assert!(!state.orphan_recovery_ready());
+    }
+
+    #[test]
     fn codex_command_status_snapshot_reads_live_command_and_latest_turn() {
         let response = serde_json::json!({
             "thread": {
@@ -2733,6 +2859,7 @@ export default function init(pi) {
         assert_eq!(
             command_status_snapshot(&response, "cmd-1"),
             CommandStatusSnapshot {
+                item_found: true,
                 command_status: Some("inProgress".to_string()),
                 process_id: Some("pty-42".to_string()),
                 turn_status: Some("inProgress".to_string()),
@@ -2761,6 +2888,43 @@ export default function init(pi) {
         let snapshot = command_status_snapshot(&response, "cmd-1");
         assert_eq!(snapshot.command_status.as_deref(), Some("completed"));
         assert_eq!(snapshot.turn_status.as_deref(), Some("completed"));
+    }
+
+    #[test]
+    fn codex_watchdog_marks_a_command_missing_from_repeated_turn_snapshots_for_recovery() {
+        let mut state = CodexAppServerStreamingState::default();
+        let _ = state.ingest_value(&serde_json::json!({
+            "method": "item/started",
+            "params": {
+                "item": {
+                    "id": "cmd-1",
+                    "type": "commandExecution",
+                    "command": "adb reverse tcp:8787 tcp:8787",
+                    "status": "inProgress"
+                }
+            }
+        }));
+        let missing = CommandStatusSnapshot {
+            item_found: false,
+            command_status: None,
+            process_id: None,
+            turn_status: Some("inProgress".to_string()),
+            turn_error: None,
+        };
+
+        for _ in 0..CODEX_COMMAND_MISSING_ITEM_CONFIRMATIONS - 1 {
+            state.observe_command_status_snapshot("cmd-1", &missing);
+            assert!(!state.command_recovery_ready);
+        }
+        state.observe_command_status_snapshot("cmd-1", &missing);
+        assert!(state.command_recovery_ready);
+        for _ in 1..CODEX_ORPHAN_PROBE_IDLE_TICKS {
+            assert!(state.mark_idle_waiting(false).is_none());
+        }
+        assert!(matches!(
+            state.mark_idle_waiting(false),
+            Some(CommandWatchdogAction::ProbeTurn)
+        ));
     }
 
     #[test]
@@ -3100,16 +3264,30 @@ export default function init(pi) {
     }
 
     #[test]
-    fn codex_stream_retry_is_limited_to_empty_transient_failures() {
+    fn codex_stream_retry_accepts_network_failures_only_before_progress() {
         let transient =
             anyhow::anyhow!("stream disconnected before completion: Upstream request failed");
+        let connect_failure = anyhow::anyhow!(
+            "codex exited with status 1: Reconnecting... waiting for network: Connection failed: error sending request"
+        );
         let permanent = anyhow::anyhow!("codex exited with status 1: invalid request");
+        let forbidden = anyhow::anyhow!("codex exited with status 1: 403 Forbidden");
 
         assert!(should_retry_codex_stream(&transient, true, 0));
-        assert!(should_retry_codex_stream(&transient, true, 1));
-        assert!(!should_retry_codex_stream(&transient, true, 2));
+        assert!(should_retry_codex_stream(&connect_failure, true, 6));
+        assert!(!should_retry_codex_stream(&connect_failure, true, 7));
         assert!(!should_retry_codex_stream(&transient, false, 0));
         assert!(!should_retry_codex_stream(&permanent, true, 0));
+        assert!(!should_retry_codex_stream(&forbidden, true, 0));
+    }
+
+    #[test]
+    fn codex_retry_delay_uses_bounded_backoff() {
+        assert_eq!(codex_retry_delay(1), Duration::from_secs(2));
+        assert_eq!(codex_retry_delay(2), Duration::from_secs(5));
+        assert_eq!(codex_retry_delay(3), Duration::from_secs(10));
+        assert_eq!(codex_retry_delay(4), Duration::from_secs(30));
+        assert_eq!(codex_retry_delay(7), Duration::from_secs(30));
     }
 
     #[test]
@@ -4453,12 +4631,23 @@ for line in sys.stdin:
             write({"jsonrpc":"2.0","method":"turn/completed","params":{"turn":{"id":"mock-turn","status":"failed","error":{"message":"mock provider failed"}}}})
         elif scenario == "cancel":
             write({"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"itemId":"assistant-1","delta":"partial before cancel"}})
+        elif scenario == "retry-then-success":
+            write({"jsonrpc":"2.0","method":"item/completed","params":{"item":{"id":"commentary-1","type":"agentMessage","phase":"commentary","text":"Checking build dependencies"}}})
+            write({"jsonrpc":"2.0","method":"item/completed","params":{"item":{"id":"cmd-1","type":"commandExecution","command":"cargo test","status":"completed","exitCode":0}}})
+            for attempt in (1, 2):
+                write({"jsonrpc":"2.0","method":"error","params":{"threadId":"mock-thread","turnId":"mock-turn","willRetry":True,"error":{"message":f"Reconnecting... {attempt}/5","additionalDetails":"stream disconnected before completion: Upstream request failed"}}})
+            threading.Timer(0.05, lambda: complete("Recovered reply after reconnecting")).start()
         elif scenario in ("approval", "approval-id-collision"):
             approval_id = turn_request_id if scenario == "approval-id-collision" else 77
             write({"jsonrpc":"2.0","id":approval_id,"method":"item/commandExecution/requestApproval","params":{"command":"rm -rf /","reason":"run tests","availableDecisions":["accept","acceptForSession","cancel"]}})
         elif scenario == "watchdog-silent-response":
             threading.Timer(0.75, complete).start()
-        elif scenario.startswith("watchdog-"):
+        elif scenario == "watchdog-orphaned-tool":
+            write({"jsonrpc":"2.0","method":"item/started","params":{"item":{"id":"tool-1","type":"customToolCall","status":"inProgress"}}})
+            write({"jsonrpc":"2.0","method":"item/completed","params":{"item":{"id":"tool-1","type":"customToolCall","status":"completed"}}})
+        elif scenario == "watchdog-stale-command":
+            write({"jsonrpc":"2.0","method":"item/started","params":{"item":{"id":"cmd-1","type":"commandExecution","command":"adb reverse tcp:8787 tcp:8787","status":"inProgress"}}})
+        elif scenario.startswith(("watchdog-", "health-")):
             write({"jsonrpc":"2.0","method":"item/started","params":{"item":{"id":"cmd-1","type":"commandExecution","command":"cargo test","status":"inProgress"}}})
         else:
             write({"jsonrpc":"2.0","method":"item/started","params":{"item":{"id":"cmd-1","type":"commandExecution","command":"cargo test","status":"inProgress"}}})
@@ -4466,6 +4655,12 @@ for line in sys.stdin:
             write({"jsonrpc":"2.0","method":"item/completed","params":{"item":{"id":"cmd-1","type":"commandExecution","command":"cargo test","status":"completed","exitCode":0}}})
             write({"jsonrpc":"2.0","method":"turn/diff/updated","params":{"turnId":"mock-turn","diff":"diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1 +1 @@\n-old\n+new"}})
             complete()
+    elif method == "thread/read" and scenario.startswith(("health-", "watchdog-")):
+        write({"jsonrpc":"2.0","id":request_id,"result":{"thread":{"id":"mock-thread","status":{"type":"active","activeFlags":[]}}}})
+    elif method == "thread/turns/list" and scenario.startswith("health-"):
+        if scenario == "health-timeout":
+            continue
+        write({"jsonrpc":"2.0","id":request_id,"result":{"data":[{"id":"mock-turn","status":"inProgress","items":[{"id":"cmd-1","type":"commandExecution","command":"cargo test","status":"inProgress","processId":"process-1"}]}]}})
     elif method == "thread/turns/list" and scenario.startswith("watchdog-"):
         probe_count += 1
         if probe_count < 4 and scenario == "watchdog-unanswered-probes":
@@ -4473,9 +4668,13 @@ for line in sys.stdin:
         if probe_count < 4 and scenario == "watchdog-probe-errors":
             write({"jsonrpc":"2.0","id":request_id,"error":{"code":-32601,"message":"status checks unavailable"}})
             continue
-        items = [] if scenario == "watchdog-missing-command" else [{"id":"cmd-1","type":"commandExecution","command":"cargo test","status":"unknown" if scenario == "watchdog-unknown-status" else "inProgress"}]
+        items = (
+            [{"id":"tool-1","type":"customToolCall","status":"completed"}]
+            if scenario == "watchdog-orphaned-tool"
+            else ([] if scenario in ("watchdog-missing-command", "watchdog-stale-command") else [{"id":"cmd-1","type":"commandExecution","command":"cargo test","status":"unknown" if scenario == "watchdog-unknown-status" else "inProgress"}])
+        )
         write({"jsonrpc":"2.0","id":request_id,"result":{"data":[{"id":"mock-turn","status":"inProgress","items":items}]}})
-        if probe_count >= 4:
+        if probe_count >= (6 if scenario in ("watchdog-orphaned-tool", "watchdog-stale-command") else 4):
             write({"jsonrpc":"2.0","method":"item/completed","params":{"item":{"id":"cmd-1","type":"commandExecution","command":"cargo test","status":"completed","exitCode":0}}})
             complete()
     elif method == "turn/interrupt":
@@ -4904,6 +5103,161 @@ for line in sys.stdin:
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn codex_provider_waits_for_retries_after_message_and_tool_progress() {
+        let _lock = codex_test_lock().await;
+        let mock = MockCodexEnvironment::new("retry-then-success");
+        let state = Arc::new(test_state("codex-provider-retries").await);
+        let session = create_mock_codex_session(&state, "provider-retries").await;
+
+        start_mock_codex_turn(&state, &session, 1).await;
+        wait_for_turn_completion(&state, &session.id)
+            .await
+            .expect("the provider must finish its own retries");
+
+        let domain = state
+            .domain_session_state(&session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(domain.turns[0].status, TurnStatus::Completed);
+        let activities = domain.turns[0]
+            .segments
+            .iter()
+            .flat_map(|segment| &segment.activities)
+            .collect::<Vec<_>>();
+        for attempt in [1, 2] {
+            assert!(activities.iter().any(|activity| {
+                activity
+                    .title
+                    .contains(&format!("[codex:retry] Reconnecting... {attempt}/5"))
+            }));
+        }
+        assert_eq!(
+            activities
+                .iter()
+                .filter(|activity| activity.title.contains("cargo test"))
+                .count(),
+            1
+        );
+        wait_for_assistant_message_text(&state, &session.id, "Recovered reply after reconnecting")
+            .await
+            .expect("the recovered final reply must be retained");
+        let methods = std::fs::read_to_string(&mock.log_path).unwrap();
+        assert_eq!(methods.matches("turn/start\n").count(), 1);
+        assert!(!methods.contains("turn/interrupt\n"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn execution_health_checks_live_provider_and_rejects_stale_recovery() {
+        use crate::execution_health::ExecutionPhase;
+        let _lock = codex_test_lock().await;
+        let mock = MockCodexEnvironment::new("health-live");
+        let state = Arc::new(test_state("execution-health-live").await);
+        let session = create_mock_codex_session(&state, "health-live").await;
+        let turn_id = start_mock_codex_turn(&state, &session, 1).await;
+        for _ in 0..100 {
+            if state
+                .execution_health(&session.id)
+                .is_some_and(|health| health.phase == ExecutionPhase::WaitingForTool)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            state.execution_health(&session.id).unwrap().phase,
+            ExecutionPhase::WaitingForTool
+        );
+        for _ in 0..100 {
+            if state
+                .request_execution_check(&session.id, &turn_id)
+                .await
+                .unwrap()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        for _ in 0..100 {
+            if state
+                .execution_health(&session.id)
+                .is_some_and(|health| health.last_checked_at.is_some())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let health = state.execution_health(&session.id).unwrap();
+        assert_eq!(health.phase, ExecutionPhase::RunningCommand);
+        assert!(health.last_checked_at.is_some());
+        assert!(health.check_started_at.is_none());
+        assert!(
+            state
+                .request_execution_check(&session.id, "old-turn")
+                .await
+                .is_err()
+        );
+        assert!(
+            state
+                .cancel_turn_if_current(&session.id, Some("old-turn"))
+                .await
+                .is_err()
+        );
+        assert!(state.turn_in_flight_for_test(&session.id).await);
+        let methods = std::fs::read_to_string(&mock.log_path).unwrap();
+        assert!(methods.contains("thread/turns/list\n"));
+        assert!(!methods.contains("turn/interrupt\n"));
+        state
+            .cancel_turn_if_current(&session.id, Some(&turn_id))
+            .await
+            .unwrap();
+        wait_for_turn_completion(&state, &session.id).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn execution_health_probe_timeout_preserves_the_active_turn() {
+        let _lock = codex_test_lock().await;
+        let mock = MockCodexEnvironment::new("health-timeout");
+        mock.accelerate_watchdog();
+        let state = Arc::new(test_state("execution-health-timeout").await);
+        let session = create_mock_codex_session(&state, "health-timeout").await;
+        let turn_id = start_mock_codex_turn(&state, &session, 1).await;
+        for _ in 0..100 {
+            if state
+                .request_execution_check(&session.id, &turn_id)
+                .await
+                .unwrap()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let mut saw_timeout = false;
+        for _ in 0..200 {
+            if state
+                .execution_health(&session.id)
+                .is_some_and(|health| health.check_error.as_deref() == Some("timeout"))
+            {
+                saw_timeout = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            saw_timeout,
+            "a missing status response needs a visible timeout"
+        );
+        assert!(state.turn_in_flight_for_test(&session.id).await);
+        let methods = std::fs::read_to_string(&mock.log_path).unwrap();
+        assert!(!methods.contains("turn/interrupt\n"));
+        state.cancel_turn(&session.id).await.unwrap();
+        wait_for_turn_completion(&state, &session.id).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn codex_provider_completes_approval_round_trip() {
         let _lock = codex_test_lock().await;
         let _mock = MockCodexEnvironment::new("approval");
@@ -5050,6 +5404,56 @@ for line in sys.stdin:
         wait_for_assistant_message_text(&state, &session.id, "Complete reply with the final tail")
             .await
             .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_provider_keeps_waiting_after_visible_internal_items_finish() {
+        let _lock = codex_test_lock().await;
+        let mock = MockCodexEnvironment::new("watchdog-orphaned-tool");
+        mock.accelerate_watchdog();
+        let state = Arc::new(test_state("codex-orphaned-tool").await);
+        let session = create_mock_codex_session(&state, "orphaned-tool").await;
+
+        start_mock_codex_turn(&state, &session, 1).await;
+        wait_for_turn_completion(&state, &session.id)
+            .await
+            .expect("quiet provider turn should accept its late completion");
+
+        let domain = state
+            .domain_session_state(&session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(domain.turns[0].status, TurnStatus::Completed);
+        let methods = std::fs::read_to_string(&mock.log_path).unwrap();
+        assert_eq!(methods.matches("thread/turns/list\n").count(), 6);
+        assert!(!methods.contains("turn/interrupt\n"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_provider_keeps_waiting_when_command_disappears_from_turn_snapshots() {
+        let _lock = codex_test_lock().await;
+        let mock = MockCodexEnvironment::new("watchdog-stale-command");
+        mock.accelerate_watchdog();
+        let state = Arc::new(test_state("codex-stale-command").await);
+        let session = create_mock_codex_session(&state, "stale-command").await;
+
+        start_mock_codex_turn(&state, &session, 1).await;
+        wait_for_turn_completion(&state, &session.id)
+            .await
+            .expect("missing command snapshots must not cancel the turn");
+
+        let domain = state
+            .domain_session_state(&session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(domain.turns[0].status, TurnStatus::Completed);
+        let methods = std::fs::read_to_string(&mock.log_path).unwrap();
+        assert_eq!(methods.matches("thread/turns/list\n").count(), 6);
+        assert!(!methods.contains("turn/interrupt\n"));
     }
 
     #[cfg(unix)]
@@ -6212,7 +6616,7 @@ impl AgentProvider for CodexProvider {
         reasoning_effort: Option<ReasoningEffort>,
     ) -> Result<()> {
         let mut last_error = None;
-        for attempt in 0..=2 {
+        for attempt in 0..=CODEX_MAX_NETWORK_RETRIES {
             match run_codex(
                 state.clone(),
                 &session,
@@ -6230,10 +6634,19 @@ impl AgentProvider for CodexProvider {
                     if !should_retry_codex_stream(&error, turn_can_retry, attempt) {
                         return Err(error);
                     }
-                    let delay = Duration::from_secs(1 << attempt);
+                    let retry_number = attempt + 1;
+                    let delay = codex_retry_delay(retry_number);
+                    state
+                        .emit_progress(
+                            &session.id,
+                            format!(
+                                "[codex:retry] network request failed; retrying in {}s ({retry_number}/{CODEX_MAX_NETWORK_RETRIES})",
+                                delay.as_secs()
+                            ),
+                        )
+                        .await;
                     debug_log!(
-                        "[codex] transient upstream stream failure; retrying attempt {}/2 after {:?}: {}",
-                        attempt + 1,
+                        "[codex] transient upstream stream failure; retrying attempt {retry_number}/{CODEX_MAX_NETWORK_RETRIES} after {:?}: {}",
                         delay,
                         error
                     );
@@ -6257,19 +6670,51 @@ impl AgentProvider for CodexProvider {
 
 fn is_retryable_codex_stream_error(error: &anyhow::Error) -> bool {
     let message = error.to_string().to_ascii_lowercase();
+    if [
+        "401",
+        "403",
+        "404",
+        "422",
+        "429",
+        "unauthorized",
+        "forbidden",
+        "quota",
+        "rate limit",
+        "invalid request",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
+    {
+        return false;
+    }
+
     [
-        "stream disconnected before completion",
-        "upstream request failed",
+        "error sending request",
+        "failed to connect",
+        "connection refused",
         "connection reset",
         "connection closed",
+        "network is unreachable",
+        "dns",
+        "timed out",
         "broken pipe",
+        "stream disconnected before completion",
     ]
     .iter()
     .any(|marker| message.contains(marker))
 }
 
 fn should_retry_codex_stream(error: &anyhow::Error, turn_can_retry: bool, attempt: usize) -> bool {
-    attempt < 2 && turn_can_retry && is_retryable_codex_stream_error(error)
+    attempt < CODEX_MAX_NETWORK_RETRIES && turn_can_retry && is_retryable_codex_stream_error(error)
+}
+
+fn codex_retry_delay(retry_number: usize) -> Duration {
+    match retry_number {
+        0 | 1 => Duration::from_secs(2),
+        2 => Duration::from_secs(5),
+        3 => Duration::from_secs(10),
+        _ => Duration::from_secs(30),
+    }
 }
 
 #[derive(Clone)]
@@ -7967,6 +8412,10 @@ async fn run_codex(
     state.set_approval_sender(&session.id, approval_tx).await;
     let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
     state.set_cancel_sender(&session.id, cancel_tx).await;
+    let (execution_check_tx, mut execution_check_rx) = mpsc::unbounded_channel();
+    state
+        .set_execution_check_sender(&session.id, execution_check_tx)
+        .await;
     let (user_input_tx, mut user_input_rx) = mpsc::unbounded_channel();
 
     let mut next_request_id = 1_u64;
@@ -8156,6 +8605,13 @@ async fn run_codex(
             }
         }
     } else {
+        let developer_instructions = combine_developer_instructions(
+            developer_instructions,
+            state
+                .list_messages(&session.id)
+                .await
+                .and_then(|messages| build_context_migration_instructions(&messages, input, reply)),
+        );
         start_codex_thread(
             &mut stdin,
             &mut next_request_id,
@@ -8353,6 +8809,11 @@ async fn run_codex(
     let mut pending_approval: Option<PendingApproval> = None;
     let mut queued_approvals: VecDeque<PendingApproval> = VecDeque::new();
     let mut command_status_probe: Option<CommandStatusProbe> = None;
+    let mut turn_status_probe: Option<TurnStatusProbe> = None;
+    let mut thread_status_probe: Option<TurnStatusProbe> = None;
+    let mut last_execution_progress: Option<Instant> = None;
+    let mut execution_tick = tokio::time::interval(codex_idle_tick_duration());
+    execution_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut turn_finished = false;
     let mut active_turn_id: Option<String> = None;
     let mut interrupt_requested = false;
@@ -8387,6 +8848,12 @@ async fn run_codex(
                         crate::mcp::record_session_runtime(&session.id, servers.clone());
                     }
                     continue;
+                }
+                if let Some(phase) = codex_execution_progress(&value) {
+                    if last_execution_progress.is_none_or(|at| at.elapsed() >= Duration::from_secs(2)) {
+                        state.emit_execution_progress(&session.id, phase);
+                        last_execution_progress = Some(Instant::now());
+                    }
                 }
                 let previous_status = parsed.current_status().map(ToString::to_string);
                 if value.get("method").and_then(Value::as_str) == Some("turn/started") {
@@ -8428,6 +8895,7 @@ async fn run_codex(
                             value.get("result").unwrap_or(&Value::Null),
                             &probe.item_id,
                         );
+                        parsed.observe_command_status_snapshot(&probe.item_id, &snapshot);
                         match snapshot.turn_status.as_deref() {
                             Some("completed" | "interrupted") => {
                                 parsed.running_command = None;
@@ -8494,6 +8962,70 @@ async fn run_codex(
                                 }
                             }
                         }
+                    }
+                    if !turn_finished {
+                        state.emit_execution_check(
+                            &session.id, false,
+                            Some(execution_phase_from_snapshot(&turn_items_snapshot(value.get("result").unwrap_or(&Value::Null)), pending_approval.is_some())),
+                            value.get("error").map(|_| "unavailable".to_string()),
+                        );
+                    }
+                }
+                if thread_status_probe.as_ref().is_some_and(|probe| {
+                    is_json_rpc_response_for(&value, probe.request_id)
+                }) {
+                    thread_status_probe = None;
+                    let (phase, error) = execution_thread_status(&value, pending_approval.is_some());
+                    state.emit_execution_check(&session.id, false, phase, error);
+                    continue;
+                }
+                let orphan_probe_response = turn_status_probe.as_ref().is_some_and(|request_id| {
+                    is_json_rpc_response_for(&value, request_id.request_id)
+                });
+                if orphan_probe_response {
+                    turn_status_probe = None;
+                    if thread_status_probe.is_none() {
+                        let request_id = send_json_rpc_request(
+                            &mut stdin, &mut next_request_id, "thread/read",
+                            serde_json::json!({ "threadId": thread_id, "includeTurns": false }),
+                        ).await?;
+                        thread_status_probe = Some(TurnStatusProbe { request_id, started_at: Instant::now() });
+                    }
+                    let result = value.get("result").unwrap_or(&Value::Null);
+                    let snapshot = turn_items_snapshot_for_turn(result, active_turn_id.as_deref());
+                    if let Some(items) = snapshot.items.as_deref() {
+                        parsed.reconcile_turn_items(items);
+                    }
+                    match snapshot.turn_status.as_deref() {
+                        Some("completed" | "interrupted") => {
+                            turn_finished = true;
+                        }
+                        Some("failed") => {
+                            bail!(
+                                "{}",
+                                snapshot
+                                    .turn_error
+                                    .as_deref()
+                                    .unwrap_or("codex turn failed")
+                            );
+                        }
+                        Some("inProgress")
+                            if (parsed.orphan_recovery_ready()
+                                || parsed.command_recovery_ready)
+                                && !interrupt_requested =>
+                        {
+                            debug_log!(
+                                "[codex:watchdog] session={} visible work items are unconfirmed but turn is still in progress; continuing to wait",
+                                session.id
+                            );
+                            parsed.latest_status = Some("[status] waiting for Codex response".to_string());
+                        }
+                        _ => {}
+                    }
+                    if !turn_finished {
+                        state.emit_execution_check(&session.id, false,
+                            Some(execution_phase_from_snapshot(&snapshot, pending_approval.is_some())),
+                            value.get("error").map(|_| "unavailable".to_string()));
                     }
                 }
                 if is_json_rpc_response_for(&value, turn_request_id) {
@@ -8654,6 +9186,9 @@ async fn run_codex(
                         }
                     }
                     CodexAppServerEvent::TurnFailed(message) => {
+                        if message.contains("tool call output is missing") {
+                            state.set_provider_session_ref(&session.id, None).await;
+                        }
                         bail!("{message}");
                     }
                 }
@@ -8709,6 +9244,37 @@ async fn run_codex(
                     }
                 }
             }
+            requested = async {
+                tokio::select! {
+                    Some(()) = execution_check_rx.recv() => true,
+                    _ = execution_tick.tick() => false,
+                }
+            }, if !interrupt_requested => {
+                let probe_timeout = codex_idle_tick_duration().saturating_mul(2).max(Duration::from_millis(500));
+                let timed_out = turn_status_probe.as_ref().is_some_and(|probe| probe.started_at.elapsed() >= probe_timeout)
+                    || command_status_probe.as_ref().is_some_and(|probe| probe.started_at.elapsed() >= probe_timeout)
+                    || thread_status_probe.as_ref().is_some_and(|probe| probe.started_at.elapsed() >= probe_timeout);
+                if timed_out {
+                    thread_status_probe = None;
+                    turn_status_probe = None;
+                    command_status_probe = None;
+                    let phase = if pending_approval.is_some() { crate::execution_health::ExecutionPhase::AwaitingApproval } else { crate::execution_health::ExecutionPhase::Unconfirmed };
+                    state.emit_execution_check(&session.id, false, Some(phase), Some("timeout".to_string()));
+                }
+                let health = state.execution_health(&session.id);
+                let automatic = health.as_ref().is_some_and(|health| {
+                    health.needs_attention(chrono::Utc::now())
+                        && health.last_checked_at.is_none_or(|at| chrono::Utc::now().signed_duration_since(at).num_seconds() >= 60)
+                });
+                if (requested || automatic) && turn_status_probe.is_none() && command_status_probe.is_none() {
+                    let request_id = send_json_rpc_request(
+                        &mut stdin, &mut next_request_id, "thread/turns/list",
+                        serde_json::json!({ "threadId": thread_id, "cursor": null, "limit": 1, "sortDirection": "desc", "itemsView": "full" }),
+                    ).await?;
+                    turn_status_probe = Some(TurnStatusProbe { request_id, started_at: Instant::now() });
+                    state.emit_execution_check(&session.id, true, None, None);
+                }
+            }
             Some(()) = cancel_rx.recv(), if !interrupt_requested => {
                 interrupt_requested = true;
                 if let Some(turn_id) = active_turn_id.as_deref() {
@@ -8737,7 +9303,7 @@ async fn run_codex(
                             session.id, command
                         );
                     }
-                    Some(CommandWatchdogAction::Probe { item_id, command }) => {
+                    Some(CommandWatchdogAction::Probe { item_id, command }) if command_status_probe.is_none() && turn_status_probe.is_none() => {
                         if command_status_probe.take().is_some() {
                             debug_log!(
                                 "[codex:watchdog] session={} command status probe is still unanswered; retrying: {}",
@@ -8765,13 +9331,42 @@ async fn run_codex(
                             request_id,
                             item_id,
                             command: command.clone(),
+                            started_at: Instant::now(),
                         });
+                        state.emit_execution_check(&session.id, true, None, None);
                         debug_log!(
                             "[codex:watchdog] session={} checking command status after missing completion event: {}",
                             session.id, command
                         );
                     }
-                    None => {}
+                    Some(CommandWatchdogAction::ProbeTurn) if command_status_probe.is_none() && turn_status_probe.is_none() => {
+                        if turn_status_probe.take().is_some() {
+                            debug_log!(
+                                "[codex:watchdog] session={} turn status probe is still unanswered; retrying orphan check",
+                                session.id
+                            );
+                        }
+                        let request_id = send_json_rpc_request(
+                            &mut stdin,
+                            &mut next_request_id,
+                            "thread/turns/list",
+                            serde_json::json!({
+                                "threadId": thread_id,
+                                "cursor": null,
+                                "limit": 1,
+                                "sortDirection": "desc",
+                                "itemsView": "full",
+                            }),
+                        )
+                        .await?;
+                        turn_status_probe = Some(TurnStatusProbe { request_id, started_at: Instant::now() });
+                        state.emit_execution_check(&session.id, true, None, None);
+                        debug_log!(
+                            "[codex:watchdog] session={} checking turn status for an orphaned internal task",
+                            session.id
+                        );
+                    }
+                    _ => {}
                 }
                 let next_status = parsed.current_status().map(ToString::to_string);
                 if next_status.is_some() && next_status != previous_status {
@@ -10695,6 +11290,13 @@ struct CodexAppServerStreamingState {
     running_command: Option<RunningCommand>,
     background_processes: HashSet<String>,
     goal_status: Option<String>,
+    command_missing_item_confirmations: u32,
+    command_recovery_ready: bool,
+    observed_items: bool,
+    active_items: HashSet<String>,
+    orphan_idle_ticks: u32,
+    orphan_probe_confirmations: u32,
+    final_answer_received: bool,
 }
 
 enum CodexAppServerEvent {
@@ -10733,10 +11335,17 @@ struct CommandStatusProbe {
     request_id: u64,
     item_id: String,
     command: String,
+    started_at: Instant,
+}
+
+struct TurnStatusProbe {
+    request_id: u64,
+    started_at: Instant,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 struct CommandStatusSnapshot {
+    item_found: bool,
     command_status: Option<String>,
     process_id: Option<String>,
     turn_status: Option<String>,
@@ -10995,7 +11604,13 @@ impl CodexAppServerStreamingState {
                     } else {
                         format!("{message}: {details}")
                     };
-                    CodexAppServerEvent::TurnFailed(full)
+                    if params.get("willRetry").and_then(Value::as_bool) == Some(true) {
+                        // The provider owns this retry within the active turn.
+                        // Treating its warning as terminal would abort recovery.
+                        CodexAppServerEvent::Status(format!("[codex:retry] {full}"))
+                    } else {
+                        CodexAppServerEvent::TurnFailed(full)
+                    }
                 }
                 _ => render_codex_status_notification(method, params)
                     .map(CodexAppServerEvent::Status)
@@ -11204,6 +11819,7 @@ impl CodexAppServerStreamingState {
 
     fn ingest_app_server_item(&mut self, item: &Value, method: &str) -> CodexAppServerEvent {
         let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+        self.observe_item_lifecycle(item, method);
         match item_type {
             "agentMessage" if method == "item/completed" => {
                 let item_id = item.get("id").and_then(Value::as_str).unwrap_or_default();
@@ -11223,6 +11839,9 @@ impl CodexAppServerStreamingState {
                     .get("phase")
                     .and_then(Value::as_str)
                     .is_some_and(|phase| phase == "final_answer");
+                if is_final {
+                    self.final_answer_received = true;
+                }
                 self.partial_agent_messages.remove(item_id);
                 self.last_agent_message_delta.remove(item_id);
                 if is_final {
@@ -11272,6 +11891,8 @@ impl CodexAppServerStreamingState {
                 }
                 if method == "item/started" || status == "inProgress" {
                     if !item_id.is_empty() {
+                        self.command_missing_item_confirmations = 0;
+                        self.command_recovery_ready = false;
                         self.running_command = Some(RunningCommand {
                             item_id: item_id.to_string(),
                             command: command.to_string(),
@@ -11291,6 +11912,8 @@ impl CodexAppServerStreamingState {
                         .unwrap_or(false);
                     if completed_running {
                         self.running_command = None;
+                        self.command_missing_item_confirmations = 0;
+                        self.command_recovery_ready = false;
                     }
                 }
                 self.latest_status = Some(render_command_summary(
@@ -11382,13 +12005,128 @@ impl CodexAppServerStreamingState {
         }
     }
 
+    fn observe_item_lifecycle(&mut self, item: &Value, method: &str) {
+        let Some(item_id) = item.get("id").and_then(Value::as_str) else {
+            return;
+        };
+        self.observed_items = true;
+        let status = item.get("status").and_then(Value::as_str);
+        let terminal = matches!(
+            status,
+            Some("completed" | "failed" | "declined" | "cancelled" | "interrupted")
+        );
+        if method == "item/completed" || terminal {
+            self.active_items.remove(item_id);
+        } else {
+            self.active_items.insert(item_id.to_string());
+        }
+        self.orphan_probe_confirmations = 0;
+        self.orphan_idle_ticks = 0;
+    }
+
+    fn reconcile_turn_items(&mut self, items: &[Value]) {
+        if self.command_recovery_ready {
+            let recovery_item_is_present = self.running_command.as_ref().is_some_and(|running| {
+                items.iter().any(|item| {
+                    item.get("id").and_then(Value::as_str) == Some(running.item_id.as_str())
+                })
+            });
+            if recovery_item_is_present {
+                self.command_missing_item_confirmations = 0;
+                self.command_recovery_ready = false;
+            }
+        }
+        if items.is_empty() {
+            if self.observed_items && self.active_items.is_empty() {
+                self.orphan_probe_confirmations = self.orphan_probe_confirmations.saturating_add(1);
+            }
+            return;
+        }
+        self.observed_items = true;
+        self.active_items.clear();
+        for item in items {
+            if item
+                .get("phase")
+                .and_then(Value::as_str)
+                .is_some_and(|phase| phase == "final_answer")
+            {
+                self.final_answer_received = true;
+            }
+            let Some(item_id) = item.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            let status = item.get("status").and_then(Value::as_str);
+            let terminal = matches!(
+                status,
+                Some("completed" | "failed" | "declined" | "cancelled" | "interrupted")
+            );
+            if !terminal {
+                self.active_items.insert(item_id.to_string());
+            }
+        }
+        if self.active_items.is_empty() {
+            self.orphan_probe_confirmations = self.orphan_probe_confirmations.saturating_add(1);
+        } else {
+            self.orphan_probe_confirmations = 0;
+        }
+    }
+
+    fn orphan_recovery_ready(&self) -> bool {
+        self.observed_items
+            && !self.final_answer_received
+            && self.active_items.is_empty()
+            && self.orphan_probe_confirmations >= CODEX_ORPHAN_PROBE_CONFIRMATIONS
+    }
+
+    fn observe_command_status_snapshot(&mut self, item_id: &str, snapshot: &CommandStatusSnapshot) {
+        let Some(running) = self
+            .running_command
+            .as_ref()
+            .filter(|running| running.item_id == item_id)
+        else {
+            return;
+        };
+        if snapshot.item_found || snapshot.turn_status.as_deref() != Some("inProgress") {
+            self.command_missing_item_confirmations = 0;
+            self.command_recovery_ready = false;
+            return;
+        }
+        let _ = running;
+        self.command_missing_item_confirmations =
+            self.command_missing_item_confirmations.saturating_add(1);
+        if self.command_missing_item_confirmations >= CODEX_COMMAND_MISSING_ITEM_CONFIRMATIONS {
+            self.command_recovery_ready = true;
+        }
+    }
+
     fn mark_idle_waiting(&mut self, pending_approval: bool) -> Option<CommandWatchdogAction> {
         let waiting = if pending_approval {
             "[status] waiting for approval"
+        } else if self.command_recovery_ready {
+            let command = self
+                .running_command
+                .as_ref()
+                .map(|running| running.command.clone())
+                .unwrap_or_else(|| "command".to_string());
+            self.latest_status = Some(render_command_stalled_summary(
+                &command,
+                "command status is unconfirmed; continuing to wait",
+            ));
+            self.orphan_idle_ticks = self.orphan_idle_ticks.saturating_add(1);
+            if self.orphan_idle_ticks >= CODEX_ORPHAN_PROBE_IDLE_TICKS {
+                self.orphan_idle_ticks = 0;
+                return Some(CommandWatchdogAction::ProbeTurn);
+            }
+            return None;
         } else if let Some(running) = self.running_command.as_mut() {
             running.idle_ticks += 1;
-            if running.idle_ticks == 1 {
+            let waiting = if running.process_id.is_some() {
                 "[status] command still running"
+            } else {
+                "[status] waiting for command result"
+            };
+            if running.idle_ticks == 1 {
+                waiting
             } else if running.idle_ticks >= CODEX_COMMAND_SOFT_RECOVERY_IDLE_TICKS
                 && !running.recovery_requested
             {
@@ -11417,10 +12155,23 @@ impl CodexAppServerStreamingState {
                     command: running.command.clone(),
                 });
             } else {
-                "[status] command still running"
+                waiting
             }
         } else if self.has_background_processes() {
             "[status] waiting for background tasks"
+        } else if !self.active_items.is_empty() {
+            self.orphan_idle_ticks = 0;
+            self.orphan_probe_confirmations = 0;
+            "[status] waiting for Codex task"
+        } else if self.final_answer_received {
+            "[status] waiting for Codex response"
+        } else if self.observed_items {
+            self.orphan_idle_ticks = self.orphan_idle_ticks.saturating_add(1);
+            if self.orphan_idle_ticks >= CODEX_ORPHAN_PROBE_IDLE_TICKS {
+                self.orphan_idle_ticks = 0;
+                return Some(CommandWatchdogAction::ProbeTurn);
+            }
+            "[status] waiting for Codex response"
         } else {
             "[status] waiting for Codex response"
         };
@@ -11493,6 +12244,201 @@ fn process_handle(value: &Value) -> Option<String> {
 enum CommandWatchdogAction {
     SoftRecovery { command: String },
     Probe { item_id: String, command: String },
+    ProbeTurn,
+}
+
+struct TurnItemsSnapshot {
+    turn_status: Option<String>,
+    turn_error: Option<String>,
+    items: Option<Vec<Value>>,
+}
+
+fn turn_items_snapshot_for_turn(value: &Value, turn_id: Option<&str>) -> TurnItemsSnapshot {
+    let Some(turn_id) = turn_id else {
+        return turn_items_snapshot(value);
+    };
+    let turn = value
+        .get("data")
+        .or_else(|| value.pointer("/thread/turns"))
+        .and_then(Value::as_array)
+        .and_then(|turns| {
+            turns
+                .iter()
+                .find(|turn| turn.get("id").and_then(Value::as_str) == Some(turn_id))
+        });
+    turn_items_snapshot(&serde_json::json!({"data": turn.into_iter().collect::<Vec<_>>()}))
+}
+
+#[cfg(test)]
+#[test]
+fn execution_health_ignores_terminal_snapshot_of_another_turn() {
+    let result = serde_json::json!({"data":[{"id":"old","status":"completed","items":[]}]});
+    assert!(
+        turn_items_snapshot_for_turn(&result, Some("current"))
+            .turn_status
+            .is_none()
+    );
+    assert_eq!(
+        turn_items_snapshot_for_turn(&result, Some("old"))
+            .turn_status
+            .as_deref(),
+        Some("completed")
+    );
+}
+
+fn execution_thread_status(
+    value: &Value,
+    pending_approval: bool,
+) -> (
+    Option<crate::execution_health::ExecutionPhase>,
+    Option<String>,
+) {
+    use crate::execution_health::ExecutionPhase;
+    if pending_approval {
+        return (Some(ExecutionPhase::AwaitingApproval), None);
+    }
+    let status = value.pointer("/result/thread/status");
+    let flags = status
+        .and_then(|s| s.get("activeFlags"))
+        .and_then(Value::as_array);
+    if flags.is_some_and(|flags| flags.iter().any(|f| f == "waitingOnApproval")) {
+        return (
+            Some(ExecutionPhase::AwaitingApproval),
+            Some("provider_waiting_on_approval".into()),
+        );
+    }
+    let reason = if flags.is_some_and(|flags| flags.iter().any(|f| f == "waitingOnUserInput")) {
+        Some("provider_waiting_on_user_input")
+    } else {
+        match status.and_then(|s| s.get("type")).and_then(Value::as_str) {
+            Some("systemError") => Some("provider_system_error"),
+            Some("idle") => Some("provider_idle_without_turn_completion"),
+            Some("notLoaded") => Some("provider_thread_not_loaded"),
+            Some("active") => None,
+            _ => Some("provider_status_unavailable"),
+        }
+    };
+    // Active thread metadata cannot confirm that a particular command is running.
+    (
+        reason.map(|_| ExecutionPhase::Unconfirmed),
+        reason.map(str::to_string),
+    )
+}
+
+#[cfg(test)]
+#[test]
+fn execution_health_thread_status_distinguishes_waits_and_errors() {
+    use crate::execution_health::ExecutionPhase;
+    for (status, expected) in [
+        (
+            serde_json::json!({"type":"active","activeFlags":["waitingOnApproval"]}),
+            "provider_waiting_on_approval",
+        ),
+        (
+            serde_json::json!({"type":"active","activeFlags":["waitingOnUserInput"]}),
+            "provider_waiting_on_user_input",
+        ),
+        (
+            serde_json::json!({"type":"systemError"}),
+            "provider_system_error",
+        ),
+        (
+            serde_json::json!({"type":"idle"}),
+            "provider_idle_without_turn_completion",
+        ),
+    ] {
+        let (_, error) = execution_thread_status(
+            &serde_json::json!({"result":{"thread":{"status":status}}}),
+            false,
+        );
+        assert_eq!(error.as_deref(), Some(expected));
+    }
+    assert_eq!(
+        execution_thread_status(&Value::Null, true).0,
+        Some(ExecutionPhase::AwaitingApproval)
+    );
+    assert_eq!(
+        execution_thread_status(
+            &serde_json::json!({"result":{"thread":{"status":{"type":"active","activeFlags":[]}}}}),
+            false
+        ),
+        (None, None)
+    );
+}
+
+fn execution_phase_from_snapshot(
+    snapshot: &TurnItemsSnapshot,
+    pending_approval: bool,
+) -> crate::execution_health::ExecutionPhase {
+    use crate::execution_health::ExecutionPhase;
+    if pending_approval {
+        return ExecutionPhase::AwaitingApproval;
+    }
+    let Some(items) = &snapshot.items else {
+        return ExecutionPhase::Unconfirmed;
+    };
+    for item in items {
+        if item.get("status").and_then(Value::as_str) != Some("inProgress") {
+            continue;
+        }
+        return match item.get("type").and_then(Value::as_str) {
+            Some("commandExecution") if item.get("processId").and_then(Value::as_str).is_some() => {
+                ExecutionPhase::RunningCommand
+            }
+            Some("commandExecution" | "customToolCall" | "mcpToolCall" | "dynamicToolCall") => {
+                ExecutionPhase::WaitingForTool
+            }
+            Some("reasoning" | "agentMessage") => ExecutionPhase::Thinking,
+            _ => ExecutionPhase::Unconfirmed,
+        };
+    }
+    ExecutionPhase::Unconfirmed
+}
+
+fn codex_execution_progress(value: &Value) -> Option<crate::execution_health::ExecutionPhase> {
+    use crate::execution_health::ExecutionPhase;
+    if !value
+        .pointer("/params/delta")
+        .and_then(Value::as_str)
+        .is_some_and(|delta| !delta.is_empty())
+    {
+        return None;
+    }
+    match value.get("method").and_then(Value::as_str) {
+        Some("item/commandExecution/outputDelta") => Some(ExecutionPhase::RunningCommand),
+        Some("process/outputDelta") => Some(ExecutionPhase::Background),
+        Some("item/reasoning/textDelta" | "item/reasoning/summaryTextDelta") => {
+            Some(ExecutionPhase::Thinking)
+        }
+        _ => None,
+    }
+}
+
+fn turn_items_snapshot(value: &Value) -> TurnItemsSnapshot {
+    let turns = value
+        .get("data")
+        .or_else(|| value.pointer("/thread/turns"))
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let Some(turn) = turns.iter().next_back() else {
+        return TurnItemsSnapshot {
+            turn_status: None,
+            turn_error: None,
+            items: None,
+        };
+    };
+    TurnItemsSnapshot {
+        turn_status: turn
+            .get("status")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        turn_error: turn
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        items: turn.get("items").and_then(Value::as_array).cloned(),
+    }
 }
 
 fn command_status_snapshot(value: &Value, item_id: &str) -> CommandStatusSnapshot {
@@ -11503,6 +12449,7 @@ fn command_status_snapshot(value: &Value, item_id: &str) -> CommandStatusSnapsho
         .map(Vec::as_slice)
         .unwrap_or_default();
     let mut snapshot = CommandStatusSnapshot {
+        item_found: false,
         command_status: None,
         process_id: None,
         turn_status: None,
@@ -11529,6 +12476,7 @@ fn command_status_snapshot(value: &Value, item_id: &str) -> CommandStatusSnapsho
         }) else {
             continue;
         };
+        snapshot.item_found = true;
         snapshot.command_status = item
             .get("status")
             .and_then(Value::as_str)
