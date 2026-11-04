@@ -4637,7 +4637,7 @@ for line in sys.stdin:
             for attempt in (1, 2):
                 write({"jsonrpc":"2.0","method":"error","params":{"threadId":"mock-thread","turnId":"mock-turn","willRetry":True,"error":{"message":f"Reconnecting... {attempt}/5","additionalDetails":"stream disconnected before completion: Upstream request failed"}}})
             threading.Timer(0.05, lambda: complete("Recovered reply after reconnecting")).start()
-        elif scenario in ("approval", "approval-id-collision"):
+        elif scenario in ("approval", "approval-id-collision", "approval-no-confirmation"):
             approval_id = turn_request_id if scenario == "approval-id-collision" else 77
             write({"jsonrpc":"2.0","id":approval_id,"method":"item/commandExecution/requestApproval","params":{"command":"rm -rf /","reason":"run tests","availableDecisions":["accept","acceptForSession","cancel"]}})
         elif scenario == "watchdog-silent-response":
@@ -4684,8 +4684,11 @@ for line in sys.stdin:
         if value.get("result", {}).get("decision") != "accept":
             sys.stderr.write("unexpected approval response: " + json.dumps(value) + "\n")
             sys.exit(2)
-        write({"jsonrpc":"2.0","method":"serverRequest/resolved","params":{"requestId":request_id}})
-        complete("Approved reply with the final tail")
+        if scenario == "approval-no-confirmation":
+            threading.Timer(1.0, lambda: complete("Approved reply with the final tail")).start()
+        else:
+            write({"jsonrpc":"2.0","method":"serverRequest/resolved","params":{"requestId":request_id}})
+            complete("Approved reply with the final tail")
     else:
         write({"jsonrpc":"2.0","id":request_id,"error":{"code":-32601,"message":"unsupported mock method: " + method}})
 "#;
@@ -5253,6 +5256,38 @@ for line in sys.stdin:
         let methods = std::fs::read_to_string(&mock.log_path).unwrap();
         assert!(!methods.contains("turn/interrupt\n"));
         state.cancel_turn(&session.id).await.unwrap();
+        wait_for_turn_completion(&state, &session.id).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_approval_clears_before_provider_confirmation() {
+        let _lock = codex_test_lock().await;
+        let _mock = MockCodexEnvironment::new("approval-no-confirmation");
+        let state = Arc::new(test_state("approval-no-confirmation").await);
+        let session = create_mock_codex_session(&state, "approval-no-confirmation").await;
+        start_mock_codex_turn(&state, &session, 1).await;
+        let approval = wait_for_pending_approval(&state, &session.id).await;
+        state
+            .submit_approval(&session.id, &approval.request_id, ApprovalChoice::Accept)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_millis(750), async {
+            loop {
+                let snapshot = state
+                    .domain_session_state(&session.id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if snapshot.session.pending_approval_id.is_none() {
+                    assert_eq!(snapshot.turns[0].status, TurnStatus::Running);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("approval must clear while the provider is still running");
         wait_for_turn_completion(&state, &session.id).await.unwrap();
     }
 
@@ -9132,8 +9167,6 @@ async fn run_codex(
                                 state.raise_approval(&session.id, next.request.clone()).await;
                                 pending_approval = Some(next);
                             }
-                        } else if pending_approval.is_none() {
-                            state.resolve_approval(&session.id, &request_id, ApprovalChoice::Accept).await;
                         } else {
                             eprintln!(
                                 "[approval] ignoring resolved request for non-current approval session={} request={}",
@@ -9207,15 +9240,19 @@ async fn run_codex(
             }
             Some(choice) = approval_rx.recv(), if pending_approval.is_some() => {
                 let request = pending_approval
-                    .as_mut()
+                    .take()
                     .context("approval state disappeared unexpectedly")?;
-                request.last_choice = Some(choice.clone());
                 send_json_rpc_response(
                     &mut stdin,
                     &request.request.request_id,
-                    approval_result_for_pending(&choice, request),
+                    approval_result_for_pending(&choice, &request),
                 )
                 .await?;
+                state.resolve_approval(&session.id, &request.request.request_id, choice).await;
+                if let Some(next) = queued_approvals.pop_front() {
+                    state.raise_approval(&session.id, next.request.clone()).await;
+                    pending_approval = Some(next);
+                }
             }
             Some((request_id, response, is_mcp)) = user_input_rx.recv() => {
                 if is_mcp {
@@ -9932,7 +9969,8 @@ async fn run_opencode(
                             .get("requestID")
                             .and_then(Value::as_str)
                             .unwrap_or_default();
-                        if let Some(pending) = pending_approval.take() {
+                        if pending_approval.as_ref().is_some_and(|pending| pending.request.request_id == request_id)
+                            && let Some(pending) = pending_approval.take() {
                             let choice = pending.last_choice.unwrap_or(ApprovalChoice::Accept);
                             state.resolve_approval(&session.id, request_id, choice).await;
                         }
@@ -9973,10 +10011,10 @@ async fn run_opencode(
             }
             Some(choice) = approval_rx.recv(), if pending_approval.is_some() => {
                 let request = pending_approval
-                    .as_mut()
+                    .take()
                     .context("approval state disappeared unexpectedly")?;
-                request.last_choice = Some(choice.clone());
                 client.reply_permission(&request.request.request_id, &choice).await?;
+                state.resolve_approval(&session.id, &request.request.request_id, choice).await;
             }
         }
     }

@@ -124,6 +124,20 @@ impl PushService {
         })
         .to_string();
 
+        let notification_tag = if notification_type == "approval_request" {
+            format!(
+                "{}::approval::{}",
+                session.id,
+                session
+                    .pending_approval
+                    .as_ref()
+                    .map(|request| request.request_id.as_str())
+                    .unwrap_or_default()
+            )
+        } else {
+            session.id.clone()
+        };
+
         self.client
             .post(format!(
                 "https://fcm.googleapis.com/v1/projects/{}/messages:send",
@@ -147,7 +161,7 @@ impl PushService {
                         "priority": "high",
                         "notification": {
                             "channel_id": "omni_code_replies",
-                            "tag": session.id,
+                            "tag": notification_tag,
                             "click_action": "FLUTTER_NOTIFICATION_CLICK",
                             "default_sound": true,
                             "default_vibrate_timings": true,

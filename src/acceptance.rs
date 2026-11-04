@@ -399,7 +399,6 @@ impl AcceptanceStore {
         {
             bail!("maximum of four active acceptance runs reached");
         }
-        let mut runs = self.runs.lock().await;
         let installation = self.runtime.status().await?;
         if installation.phase != InstallPhase::Ready {
             bail!("x11box plugin is not ready");
@@ -499,6 +498,9 @@ impl AcceptanceStore {
             test_plan: None,
             plan_messages: Vec::new(),
         };
+        // Source capture can take minutes; do not block list/snapshot requests
+        // on the registry lock while preparing the run.
+        let mut runs = self.runs.lock().await;
         self.persist(&run)?;
         let shared = Arc::new(Mutex::new(run.clone()));
         runs.insert(run.id.clone(), Arc::clone(&shared));

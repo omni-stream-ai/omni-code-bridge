@@ -3584,6 +3584,21 @@ mod tests {
             crate::models::SessionStatus::Running
         ));
         assert!(resolved.session.pending_approval.is_none());
+
+        // A late provider acknowledgement must not clear the next request.
+        let mut next_request = request.clone();
+        next_request.request_id = uuid::Uuid::new_v4().to_string();
+        state
+            .raise_approval(&session_id, next_request.clone())
+            .await;
+        state
+            .resolve_approval(&session_id, &request.request_id, ApprovalChoice::Accept)
+            .await;
+        let awaiting_next = state.get_session(&session_id).await.unwrap();
+        assert_eq!(
+            awaiting_next.session.pending_approval.unwrap().request_id,
+            next_request.request_id
+        );
     }
 
     #[tokio::test]

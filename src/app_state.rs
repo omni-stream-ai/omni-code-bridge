@@ -2723,6 +2723,14 @@ impl AppState {
 
         let snapshot = {
             let mut devices = self.devices.write().await;
+            // A regenerated client ID must not register the same physical
+            // push destination twice.
+            devices.retain(|existing_id, existing| {
+                existing_id == client_id
+                    || !(device.fcm_token.is_some() && device.fcm_token == existing.fcm_token
+                        || device.mi_push_reg_id.is_some()
+                            && device.mi_push_reg_id == existing.mi_push_reg_id)
+            });
             devices.insert(client_id.to_string(), device.clone());
             devices.clone()
         };
@@ -3685,12 +3693,25 @@ impl AppState {
             "[approval] resolved session={session_id} request={request_id} choice={choice:?}"
         );
         let preview = approval_choice_preview(&choice).to_string();
+        let mut resolved = false;
         self.update_runtime_state(session_id, |entry| {
+            if entry.last_resolved_approval_request_id.as_deref() == Some(request_id)
+                || entry
+                    .pending_approval
+                    .as_ref()
+                    .is_some_and(|pending| pending.request_id != request_id)
+            {
+                return;
+            }
+            resolved = true;
             entry.pending_approval = None;
             entry.last_resolved_approval_request_id = Some(request_id.to_string());
             entry.interrupted = false;
         })
         .await;
+        if !resolved {
+            return;
+        }
         self.patch_session(session_id, SessionStatus::Running, Some(preview.clone()))
             .await;
         self.emit_system_message(session_id, preview.clone()).await;
@@ -6720,6 +6741,32 @@ mod tests {
             .unwrap();
         assert_eq!(legacy.session.unread_count, 0);
         assert_eq!(domain.session.unread_count, 0);
+    }
+
+    #[tokio::test]
+    async fn push_registration_deduplicates_tokens_across_client_ids() {
+        let state = test_state("push-device-dedup").await;
+        let registration = |token: Option<&str>| RegisterPushDeviceInput {
+            platform: "android".to_string(),
+            manufacturer: None,
+            model: None,
+            app_version: None,
+            fcm_token: token.map(str::to_string),
+            mi_push_reg_id: None,
+        };
+        state
+            .register_push_device("old-client", registration(Some("token-a")))
+            .await;
+        state
+            .register_push_device("other-device", registration(Some("token-b")))
+            .await;
+        state
+            .register_push_device("new-client", registration(Some("token-a")))
+            .await;
+        let devices = state.devices.read().await;
+        assert!(!devices.contains_key("old-client"));
+        assert!(devices.contains_key("new-client"));
+        assert!(devices.contains_key("other-device"));
     }
 
     #[tokio::test]
