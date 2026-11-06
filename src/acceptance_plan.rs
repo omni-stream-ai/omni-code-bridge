@@ -106,7 +106,7 @@ impl AcceptanceStore {
     }
 
     async fn ask_test_plan(&self, state: &Arc<AppState>, run: &AcceptanceRun) -> Result<AgentPlan> {
-        let session_id = self.ensure_acceptance_agent(state, run).await?;
+        let session_id = self.ensure_acceptance_agent(state, run, true).await?;
         let mut recent_messages = run.plan_messages.iter().rev().take(12).collect::<Vec<_>>();
         recent_messages.reverse();
         let prompt = format!(
@@ -159,7 +159,7 @@ impl AcceptanceStore {
         id: &str,
     ) -> Result<()> {
         let run = self.snapshot(id).await?;
-        let session_id = self.ensure_acceptance_agent(state, &run).await?;
+        let session_id = self.ensure_acceptance_agent(state, &run, true).await?;
         if run.requirement_brief.is_none()
             && (run.session_id.is_some() || run.requirements.is_some())
         {

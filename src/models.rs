@@ -579,6 +579,8 @@ pub enum ApprovalChoice {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalRequest {
     pub request_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
     pub kind: ApprovalKind,
     pub command: Option<String>,
     pub reason: Option<String>,

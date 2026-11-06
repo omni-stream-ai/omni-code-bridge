@@ -3532,6 +3532,7 @@ mod tests {
         let headers = authorized_headers(&state).await;
         let request = ApprovalRequest {
             request_id: uuid::Uuid::new_v4().to_string(),
+            cwd: None,
             kind: ApprovalKind::CommandExecution,
             command: Some("cargo test".to_string()),
             reason: Some("run project tests".to_string()),

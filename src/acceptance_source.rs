@@ -11,6 +11,34 @@ use sha2::{Digest, Sha256};
 
 use crate::runtime_plugin::{path_str, run_bounded};
 
+const EXCLUDED_DIRECTORIES: &[&str] = &[
+    "node_modules",
+    ".dart_tool",
+    ".pub-cache",
+    ".gradle",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".cache",
+    "target",
+    "build",
+    ".omni-code",
+];
+
+/// Remove incomplete captures if preparing a run fails before it is persisted.
+pub(super) struct PendingSnapshot(pub Option<std::path::PathBuf>);
+
+impl Drop for PendingSnapshot {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
 pub(super) struct SourceSnapshot {
     pub revision: String,
     pub change_summary: String,
@@ -33,20 +61,23 @@ pub(super) async fn capture(project: &Path, archive: &Path) -> Result<SourceSnap
     .map(|text| text.trim().to_owned())
     .filter(|text| !text.is_empty());
     let (revision, provenance, files) = if let Some(commit) = commit {
-        run_bounded(
-            Path::new("git"),
-            &[
-                "-C",
-                path_str(project)?,
-                "archive",
-                "--format=tar",
-                "--output",
-                path_str(archive)?,
-                &commit,
-            ],
-            Duration::from_secs(120),
-        )
-        .await?;
+        let exclusions = EXCLUDED_DIRECTORIES
+            .iter()
+            .map(|name| format!(":(glob,exclude)**/{name}/**"))
+            .collect::<Vec<_>>();
+        let mut args = vec![
+            "-C",
+            path_str(project)?,
+            "archive",
+            "--format=tar",
+            "--output",
+            path_str(archive)?,
+            &commit,
+            "--",
+            ".",
+        ];
+        args.extend(exclusions.iter().map(String::as_str));
+        run_bounded(Path::new("git"), &args, Duration::from_secs(120)).await?;
         let status = run_bounded(
             Path::new("git"),
             &["-C", path_str(project)?, "status", "--short"],
@@ -225,22 +256,7 @@ fn excluded(name: &str, directory: bool) -> bool {
     {
         return true;
     }
-    directory
-        && matches!(
-            name,
-            "node_modules"
-                | ".dart_tool"
-                | ".pub-cache"
-                | ".gradle"
-                | ".venv"
-                | "venv"
-                | "__pycache__"
-                | ".pytest_cache"
-                | ".mypy_cache"
-                | ".ruff_cache"
-                | ".cache"
-                | "target"
-        )
+    directory && EXCLUDED_DIRECTORIES.contains(&name)
 }
 
 fn internal_link(relative: &Path, target: &Path) -> bool {
@@ -328,6 +344,8 @@ mod tests {
             (".git/config", "local git settings"),
             (".venv/bin/python", "host executable"),
             ("build/index.html", "application artifact"),
+            ("nested/build/app.apk", "nested build artifact"),
+            (".omni-code/session.json", "runtime data"),
         ] {
             let path = project.join(path);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -350,8 +368,8 @@ mod tests {
         assert_eq!(capture_directory(&project, &second).unwrap().0, revision);
         let files = archive_files(&first);
         assert!(files.contains_key(Path::new(".env.example")));
-        assert!(files.contains_key(Path::new("build/index.html")));
-        assert_eq!(files.len(), 4);
+        assert!(!files.contains_key(Path::new("build/index.html")));
+        assert_eq!(files.len(), 3);
         fs::write(project.join("src/main.txt"), "next application version").unwrap();
         assert_ne!(capture_directory(&project, &second).unwrap().0, revision);
         assert_eq!(
@@ -370,6 +388,22 @@ mod tests {
         let archive = output.join("source.tar");
         capture_directory(&project, &archive).unwrap();
         assert_eq!(archive_files(&archive).len(), 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_run_creation_removes_only_its_source_snapshot() {
+        let (root, project) = fixture();
+        let archive = root.join("source.tar");
+        fs::write(&archive, "incomplete snapshot").unwrap();
+        drop(PendingSnapshot(Some(archive.clone())));
+        assert!(!archive.exists());
+        assert!(project.join("src/main.txt").exists());
+        fs::write(&archive, "persisted snapshot").unwrap();
+        let mut pending = PendingSnapshot(Some(archive.clone()));
+        pending.0 = None;
+        drop(pending);
+        assert!(archive.exists());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -436,6 +470,15 @@ mod tests {
     #[tokio::test]
     async fn git_projects_keep_the_recorded_commit_snapshot() {
         let (root, project) = fixture();
+        for path in [
+            "build/app.apk",
+            "nested/build/lib.a",
+            "nested/target/debug/bin",
+        ] {
+            let path = project.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "tracked build artifact").unwrap();
+        }
         git(&project, &["init", "--quiet"]);
         git(&project, &["add", "."]);
         git(
@@ -467,6 +510,11 @@ mod tests {
         let files = archive_files(&archive);
         assert_eq!(files[Path::new("src/main.txt")], b"current application");
         assert!(!files.contains_key(Path::new("untracked.txt")));
+        assert_eq!(
+            files.len(),
+            2,
+            "tracked build outputs must also be excluded"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }

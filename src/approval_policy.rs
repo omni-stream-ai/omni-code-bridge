@@ -5,6 +5,63 @@ pub enum AutoApprovalDecision {
     Accept,
 }
 
+/// The caller supplies an image identity from Bridge state, never from the agent.
+pub fn is_acceptance_image_inspection(command: &str, image: &str) -> bool {
+    if !image.starts_with("sha256:")
+        || image.len() != 71
+        || !image[7..].bytes().all(|b| b.is_ascii_hexdigit())
+        || contains_shell_control(command)
+        || command.contains('&')
+    {
+        return false;
+    }
+    let Some(mut tokens) = shell_split(command) else {
+        return false;
+    };
+    if tokens.len() == 3
+        && matches!(
+            tokens[0].as_str(),
+            "sh" | "bash"
+                | "zsh"
+                | "/bin/sh"
+                | "/bin/bash"
+                | "/bin/zsh"
+                | "/usr/bin/sh"
+                | "/usr/bin/bash"
+                | "/usr/bin/zsh"
+                | "/run/current-system/sw/bin/sh"
+                | "/run/current-system/sw/bin/bash"
+                | "/run/current-system/sw/bin/zsh"
+        )
+        && matches!(tokens[1].as_str(), "-c" | "-lc")
+    {
+        let Some(inner) = shell_split(&tokens[2]) else {
+            return false;
+        };
+        tokens = inner;
+    }
+    if tokens.first().map(String::as_str) != Some("docker") {
+        return false;
+    }
+    let args = &tokens[1..];
+    let Some(mut args) = args.strip_prefix(&["image".into(), "inspect".into()]) else {
+        return false;
+    };
+    let mut target = false;
+    while let Some((arg, rest)) = args.split_first() {
+        match arg.as_str() {
+            "--format" | "-f" if !rest.is_empty() => args = &rest[1..],
+            value if value.starts_with("--format=") => args = rest,
+            value if value == image && !target => {
+                target = true;
+                args = rest;
+            }
+            _ => return false,
+        }
+    }
+    target
+}
+
 pub fn should_auto_approve(command: &str, project_root: &Path) -> Option<AutoApprovalDecision> {
     let command = command.trim();
     if command.is_empty() || contains_shell_control(command) {
@@ -266,6 +323,44 @@ fn shell_split(command: &str) -> Option<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn acceptance_inspection_requires_one_exact_image_and_no_other_operation() {
+        let image = format!("sha256:{}", "a".repeat(64));
+        for command in [
+            format!("docker image inspect {image}"),
+            format!("docker image inspect --format '{{{{.Architecture}}}}' {image}"),
+            format!("/run/current-system/sw/bin/zsh -lc 'docker image inspect {image}'"),
+        ] {
+            assert!(
+                is_acceptance_image_inspection(&command, &image),
+                "{command}"
+            );
+        }
+        for command in [
+            "docker images".into(),
+            "docker ps".into(),
+            "docker image inspect another-image".into(),
+            format!("docker image inspect {image} another-image"),
+            format!("docker image rm {image}"),
+            format!("docker image inspect {image}; docker system prune"),
+            format!("docker image inspect {image} & touch /tmp/marker"),
+            format!("docker --host tcp://other image inspect {image}"),
+            format!("docker image inspect --format '$(id)' {image}"),
+            format!("docker image inspect {image} > /tmp/output"),
+            format!("./zsh -c 'docker image inspect {image}'"),
+            format!("/tmp/bash -c 'docker image inspect {image}'"),
+        ] {
+            assert!(
+                !is_acceptance_image_inspection(&command, &image),
+                "{command}"
+            );
+        }
+        assert!(!is_acceptance_image_inspection(
+            "docker image inspect base",
+            "base"
+        ));
+    }
 
     #[test]
     fn only_explicitly_safe_read_commands_are_auto_approved() {

@@ -163,6 +163,7 @@ pub async fn run_permission_hook(
     // Layer 2: AI risk assessment before escalating to human
     let ai_request = ApprovalRequest {
         request_id: uuid::Uuid::new_v4().to_string(),
+        cwd: None,
         kind: ApprovalKind::ExecCommand,
         command: Some(command.clone()),
         reason: Some(format!("Claude requests {}", tool_name.unwrap_or("Bash"))),
@@ -304,6 +305,7 @@ impl ClaudePermissionRequest {
 
         ApprovalRequest {
             request_id: self.request_id.clone(),
+            cwd: None,
             kind: if command.is_some() {
                 ApprovalKind::ExecCommand
             } else {

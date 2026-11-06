@@ -1,5 +1,6 @@
 mod acceptance;
 mod acceptance_api;
+mod acceptance_approval;
 mod acceptance_context;
 #[cfg(test)]
 mod acceptance_test_support;
@@ -15,11 +16,13 @@ mod claude_store;
 mod client_auth_store;
 mod desktop_gateway;
 mod device_store;
+mod environment_probe;
 mod execution_health;
 mod logging;
 mod mcp;
 mod mcp_api;
 mod message_projection;
+mod metadata_persistence;
 mod models;
 mod pi_plugin_store;
 mod project_environment;
@@ -31,7 +34,7 @@ mod session_domain_store;
 mod session_store;
 mod session_trace;
 
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{future::IntoFuture, net::SocketAddr, path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use app_state::AppState;
@@ -155,20 +158,74 @@ async fn serve(port: u16, debug: bool, pi_request_timeout: u64) -> Result<()> {
     pi::http::client::set_request_timeout_override(pi_request_timeout);
     logging::init(debug);
     let state = Arc::new(AppState::new_strict().await?);
+    state.start_metadata_writer();
     state.acceptance.start_maintenance();
     state
         .acceptance
         .resume_automations(Arc::clone(&state))
         .await;
-    let app = router(state);
+    let app = router(Arc::clone(&state));
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
     println!("Omni Code bridge listening on http://{addr}");
 
-    axum::serve(listener, app).await?;
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_received = Arc::clone(&shutdown);
+    let server = axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            shutdown_received.notify_one();
+        })
+        .into_future();
+    tokio::pin!(server);
+    let result = tokio::select! {
+        result = &mut server => result,
+        _ = shutdown.notified() => {
+            if let Err(error) = state.flush_pending_session_metadata().await {
+                eprintln!("failed to flush session metadata during shutdown: {error}");
+            }
+            // SSE streams can remain open indefinitely; allow requests to
+            // drain briefly before completing the final metadata flush.
+            tokio::time::timeout(std::time::Duration::from_secs(5), &mut server)
+                .await
+                .unwrap_or(Ok(()))
+        }
+    };
+    state
+        .flush_pending_session_metadata()
+        .await
+        .map_err(anyhow::Error::msg)?;
+    result?;
     Ok(())
+}
+
+async fn shutdown_signal() {
+    let interrupt = async {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            eprintln!("failed to listen for interrupt signal: {error}");
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(error) => {
+                eprintln!("failed to listen for termination signal: {error}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = interrupt => {},
+        _ = terminate => {},
+    }
 }
 
 async fn validate_settings_cli(path: Option<PathBuf>) -> Result<()> {

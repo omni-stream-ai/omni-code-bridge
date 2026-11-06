@@ -51,10 +51,12 @@ impl Fixture {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now();
         let run = AcceptanceRun {
+            pending_approvals: Vec::new(),
             id: id.clone(),
             project_id: "test-project".into(),
             session_id: None,
             agent_session_id: None,
+            plan_agent_session_id: None,
             revision: "test-commit".into(),
             image_id: "test-image".into(),
             environment: None,

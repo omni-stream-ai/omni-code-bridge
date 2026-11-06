@@ -2107,6 +2107,31 @@ export default function init(pi) {
     }
 
     #[test]
+    fn codex_user_input_attaches_images_and_preserves_skill() {
+        let dir = std::env::temp_dir().join(format!("vision-input-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("actual image.png");
+        std::fs::write(&path, b"fixture").unwrap();
+        let prompt = format!("Inspect ![screen](<{}>) then decide", path.display());
+        let input = codex_user_input(&prompt, &[]);
+        assert_eq!(input[0]["text"], "Inspect ");
+        assert_eq!(input[1]["type"], "localImage");
+        assert_eq!(input[1]["path"], path.to_str().unwrap());
+        assert_eq!(input[2]["text"], " then decide");
+        let skills = parse_codex_skills_response(
+            &serde_json::json!({"data":[{"skills":[{"name":"review","path":"/tmp/SKILL.md","description":"review"}]}]}),
+        );
+        let input = codex_user_input(&format!("$review {prompt}"), &skills);
+        assert_eq!(input[0]["type"], "skill");
+        assert!(input.iter().any(|v| v["type"] == "localImage"));
+        assert_eq!(
+            codex_user_input("![missing](/missing.png)", &[])[0]["type"],
+            "text"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn codex_thread_list_prefers_name_and_groups_projects() {
         let mut archive = SessionArchiveSummary {
             fingerprint: 0,
@@ -2436,12 +2461,14 @@ export default function init(pi) {
             "method": "item/commandExecution/requestApproval",
             "params": {
                 "command": "cargo test",
+                "cwd": "/project/snapshot",
                 "reason": "run tests",
                 "availableDecisions": ["accept", "acceptForSession", "cancel"]
             }
         })) {
             CodexAppServerEvent::ApprovalRequested(pending) => {
                 assert_eq!(pending.request.request_id, "7");
+                assert_eq!(pending.request.cwd.as_deref(), Some("/project/snapshot"));
                 assert_eq!(pending.request.command.as_deref(), Some("cargo test"));
                 assert_eq!(pending.request.reason.as_deref(), Some("run tests"));
                 assert!(pending.request.allow_accept_for_session);
@@ -2943,11 +2970,64 @@ export default function init(pi) {
         );
     }
 
+    #[tokio::test]
+    async fn confirmed_acceptance_build_bypasses_unavailable_remote_approval() {
+        let fixture = crate::acceptance_test_support::Fixture::new().await;
+        let sid = format!("acceptance-execution-{}", fixture.id);
+        let path = fixture
+            .state
+            .runtime_plugins
+            .root
+            .join("runs")
+            .join(&fixture.id)
+            .join("run.json");
+        let mut run: crate::acceptance::AcceptanceRun =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        run.phase = crate::acceptance::RunPhase::Running;
+        run.agent_session_id = Some(sid.clone());
+        run.test_plan = Some(crate::acceptance::AcceptanceTestPlan {
+            version: 1,
+            cases: vec![],
+            notes: "confirmed build/test scope".into(),
+            approved_version: Some(1),
+            approved_by: Some("test".into()),
+            approved_at: Some(chrono::Utc::now()),
+        });
+        crate::runtime_plugin::atomic_json(&path, &run).unwrap();
+        let mut request: ApprovalRequest = serde_json::from_value(serde_json::json!({
+            "request_id":"test", "kind":"command_execution", "cwd":fixture.root,
+            "command":format!("timeout 600 nix develop path:./ --no-write-lock-file --command flutter build linux --release -v > {}/build.log 2>&1", fixture.root.display()),
+            "allow_accept_for_session":false,"allow_cancel":true,"resolvable":true,
+        })).unwrap();
+        let choice = tokio::time::timeout(
+            Duration::from_secs(1),
+            auto_approve_codex_request_for_state(&fixture.state, &sid, &mut request, &fixture.root),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(matches!(choice, Some(ApprovalChoice::Accept)));
+        assert_eq!(
+            request.auto_approval_reason_kind.as_deref(),
+            Some("acceptance_scope")
+        );
+        let unrelated = auto_approve_codex_request_for_state(
+            &fixture.state,
+            "acceptance-unrelated",
+            &mut request,
+            &fixture.root,
+        )
+        .await
+        .unwrap();
+        assert!(unrelated.is_none());
+    }
+
     #[test]
     fn codex_permission_approval_grants_only_requested_permissions() {
         let pending = PendingApproval {
             request: ApprovalRequest {
                 request_id: "permission-1".to_string(),
+                cwd: None,
                 kind: ApprovalKind::Permissions,
                 command: None,
                 reason: None,
@@ -6125,23 +6205,68 @@ fn parse_codex_skills_response(result: &Value) -> Vec<CodexSkill> {
     skills
 }
 
+// Convert attachment markdown to actual vision input at the provider boundary.
+fn codex_image_input(content: &str) -> Vec<Value> {
+    let mut input = Vec::new();
+    let mut cursor = 0;
+    let mut text_start = 0;
+    while let Some(offset) = content[cursor..].find("![") {
+        let start = cursor + offset;
+        let Some(label_end) = content[start + 2..].find("](") else {
+            break;
+        };
+        let source_start = start + 2 + label_end + 2;
+        let Some(end_offset) = content[source_start..].find(')') else {
+            break;
+        };
+        let end = source_start + end_offset;
+        let raw = content[source_start..end].trim();
+        let source = raw
+            .strip_prefix('<')
+            .and_then(|s| s.strip_suffix('>'))
+            .unwrap_or(raw);
+        let path = Path::new(source);
+        let block = if source.starts_with("data:image/") {
+            Some(serde_json::json!({"type":"image", "url":source}))
+        } else if path.is_absolute()
+            && path.is_file()
+            && path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+                matches!(
+                    e.to_ascii_lowercase().as_str(),
+                    "png" | "jpg" | "jpeg" | "webp" | "gif"
+                )
+            })
+        {
+            Some(serde_json::json!({"type":"localImage", "path":source}))
+        } else {
+            None
+        };
+        cursor = end + 1;
+        if let Some(block) = block {
+            if start > text_start {
+                input.push(serde_json::json!({"type":"text", "text": &content[text_start..start], "text_elements":[]}));
+            }
+            input.push(block);
+            text_start = cursor;
+        }
+    }
+    if text_start < content.len() || input.is_empty() {
+        input.push(
+            serde_json::json!({"type":"text", "text": &content[text_start..], "text_elements":[]}),
+        );
+    }
+    input
+}
+
 fn codex_user_input(content: &str, skills: &[CodexSkill]) -> Vec<Value> {
     let trimmed = content.trim_start();
     let token_end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
     let token = &trimmed[..token_end];
     let Some(skill_name) = token.strip_prefix('$').filter(|name| !name.is_empty()) else {
-        return vec![serde_json::json!({
-            "type": "text",
-            "text": content,
-            "text_elements": [],
-        })];
+        return codex_image_input(content);
     };
     let Some(skill) = skills.iter().find(|skill| skill.name == skill_name) else {
-        return vec![serde_json::json!({
-            "type": "text",
-            "text": content,
-            "text_elements": [],
-        })];
+        return codex_image_input(content);
     };
 
     let mut input = vec![serde_json::json!({
@@ -6151,11 +6276,7 @@ fn codex_user_input(content: &str, skills: &[CodexSkill]) -> Vec<Value> {
     })];
     let prompt = trimmed[token_end..].trim_start();
     if !prompt.is_empty() {
-        input.push(serde_json::json!({
-            "type": "text",
-            "text": prompt,
-            "text_elements": [],
-        }));
+        input.extend(codex_image_input(prompt));
     }
     input
 }
@@ -9099,7 +9220,7 @@ async fn run_codex(
                         }).await;
                     }
                     CodexAppServerEvent::ApprovalRequested(mut pending) => {
-                        if let Some(choice) = auto_approve_codex_request_for_state(&state, &mut pending.request, &project_root).await? {
+                        if let Some(choice) = auto_approve_codex_request_for_state(&state, &session.id, &mut pending.request, &project_root).await? {
                             send_json_rpc_response(
                                 &mut stdin,
                                 &pending.request.request_id,
@@ -9764,7 +9885,7 @@ async fn run_claude_code(
                 if pending_approval.is_none() {
                     if let Some(request) = next_claude_permission_request(&state_dir, &run_id, &mut seen_permission_requests).await? {
                         let mut approval = request.as_approval_request();
-                        if let Some(choice) = auto_approve_codex_request_for_state(&state, &mut approval, &project_root).await? {
+                        if let Some(choice) = auto_approve_codex_request_for_state(&state, &session.id, &mut approval, &project_root).await? {
                             let mut response = response_from_choice(&choice);
                             response.request_id = approval.request_id.clone();
                             tokio::fs::write(
@@ -10208,7 +10329,7 @@ async fn run_acp_http(
                         }
                         if let Some(mut request) = acp_event_to_approval(&event) {
                             if let Some(choice) =
-                                auto_approve_codex_request_for_state(&state, &mut request, &project_root).await?
+                                auto_approve_codex_request_for_state(&state, &session.id, &mut request, &project_root).await?
                             {
                                 send_acp_http_approval_decision(
                                     &client,
@@ -10663,7 +10784,7 @@ async fn run_stdio_acp(
                         .context("ACP stdio permission request did not include id")?;
                     let params = value.get("params").unwrap_or(&Value::Null);
                     let mut request = acp_permission_request_to_approval(&request_id, params);
-                    if let Some(choice) = auto_approve_codex_request_for_state(&state, &mut request, &project_root).await? {
+                    if let Some(choice) = auto_approve_codex_request_for_state(&state, &session.id, &mut request, &project_root).await? {
                         send_json_rpc_response(
                             &mut stdin,
                             &request_id,
@@ -11715,6 +11836,7 @@ impl CodexAppServerStreamingState {
             "item/commandExecution/requestApproval" => Some(PendingApproval {
                 request: ApprovalRequest {
                     request_id: request_id.clone(),
+                    cwd: params.get("cwd").and_then(Value::as_str).map(str::to_owned),
                     kind: ApprovalKind::CommandExecution,
                     command: params
                         .get("command")
@@ -11742,6 +11864,7 @@ impl CodexAppServerStreamingState {
             "item/fileChange/requestApproval" => Some(PendingApproval {
                 request: ApprovalRequest {
                     request_id: request_id.clone(),
+                    cwd: params.get("cwd").and_then(Value::as_str).map(str::to_owned),
                     kind: ApprovalKind::FileChange,
                     command: render_file_change_approval_command(params),
                     reason: params
@@ -11767,6 +11890,7 @@ impl CodexAppServerStreamingState {
             "execCommandApproval" => Some(PendingApproval {
                 request: ApprovalRequest {
                     request_id: request_id.clone(),
+                    cwd: params.get("cwd").and_then(Value::as_str).map(str::to_owned),
                     kind: ApprovalKind::ExecCommand,
                     command: params
                         .get("command")
@@ -11795,6 +11919,7 @@ impl CodexAppServerStreamingState {
             "applyPatchApproval" => Some(PendingApproval {
                 request: ApprovalRequest {
                     request_id: request_id.clone(),
+                    cwd: params.get("cwd").and_then(Value::as_str).map(str::to_owned),
                     kind: ApprovalKind::ApplyPatch,
                     command: render_file_change_approval_command(params),
                     reason: params
@@ -11814,8 +11939,11 @@ impl CodexAppServerStreamingState {
             "item/permissions/requestApproval" => Some(PendingApproval {
                 request: ApprovalRequest {
                     request_id: request_id.clone(),
+                    cwd: params.get("cwd").and_then(Value::as_str).map(str::to_owned),
                     kind: ApprovalKind::Permissions,
-                    command: None,
+                    command: params
+                        .get("permissions")
+                        .map(|permissions| format!("Requested permissions: {permissions}")),
                     reason: params
                         .get("reason")
                         .and_then(Value::as_str)
@@ -14471,6 +14599,7 @@ fn acp_event_to_approval(value: &Value) -> Option<ApprovalRequest> {
         .map(ToString::to_string);
     Some(ApprovalRequest {
         request_id,
+        cwd: None,
         kind: if command.is_some() {
             ApprovalKind::ExecCommand
         } else {
@@ -14628,6 +14757,7 @@ fn acp_permission_request_to_approval(request_id: &str, params: &Value) -> Appro
 
     ApprovalRequest {
         request_id: request_id.to_string(),
+        cwd: None,
         kind: if command.is_some() {
             ApprovalKind::ExecCommand
         } else {
@@ -15130,6 +15260,7 @@ fn opencode_permission_to_approval(value: &Value) -> ApprovalRequest {
     let command = metadata_command.or(patterns);
     ApprovalRequest {
         request_id,
+        cwd: None,
         kind: if command.is_some() {
             ApprovalKind::ExecCommand
         } else {
@@ -15149,7 +15280,7 @@ async fn auto_approve_opencode_request(
     request: &mut ApprovalRequest,
     project_root: &Path,
 ) -> Result<Option<ApprovalChoice>> {
-    match auto_approve_codex_request(request, project_root).await? {
+    match auto_approve_codex_request(request, project_root, None).await? {
         Some(ApprovalChoice::Accept) => Ok(Some(ApprovalChoice::Accept)),
         Some(other) => Ok(Some(other)),
         None => Ok(None),
@@ -15560,41 +15691,89 @@ fn shell_quote(value: &str) -> String {
 
 async fn auto_approve_codex_request_for_state(
     state: &AppState,
+    session_id: &str,
     request: &mut ApprovalRequest,
     project_root: &std::path::Path,
 ) -> Result<Option<ApprovalChoice>> {
+    let context = state.acceptance.approval_context(session_id).await;
+    if context
+        .as_ref()
+        .is_some_and(|context| crate::acceptance_approval::permits(request, project_root, context))
+    {
+        request.auto_approval_reason =
+            Some("已确认验收范围内的常规构建或只读诊断，本地核实通过".into());
+        request.auto_approval_reason_kind = Some("acceptance_scope".into());
+        state
+            .emit_system_message(
+                session_id,
+                "[approval:auto] 已确认验收范围内的常规构建或只读诊断，本地核实通过",
+            )
+            .await;
+        return Ok(Some(ApprovalChoice::Accept));
+    }
     // Approval settings belong to the active Bridge instance. Reading only the
     // process-global settings file lets isolated ACP/Codex sessions inherit a
     // stale enabled flag and unexpectedly make a network AI-review request.
     if !state.settings_store().get().await.ai_approval.enabled {
         return Ok(None);
     }
-    auto_approve_codex_request(request, project_root).await
+    if matches!(
+        request.kind,
+        ApprovalKind::CommandExecution | ApprovalKind::ExecCommand
+    ) && request.command.as_deref().is_some_and(|command| {
+        state
+            .acceptance
+            .environments
+            .permits_image_inspection(session_id, command)
+    }) {
+        return Ok(Some(ApprovalChoice::Accept));
+    }
+    auto_approve_codex_request(request, project_root, context).await
 }
 
 async fn auto_approve_codex_request(
     request: &mut ApprovalRequest,
     project_root: &std::path::Path,
+    context: Option<ai_approval::ApprovalContext>,
 ) -> Result<Option<ApprovalChoice>> {
     match request.kind {
-        ApprovalKind::CommandExecution | ApprovalKind::ExecCommand => {
+        ApprovalKind::CommandExecution
+        | ApprovalKind::ExecCommand
+        | ApprovalKind::FileChange
+        | ApprovalKind::ApplyPatch
+        | ApprovalKind::Permissions => {
+            if !matches!(
+                request.kind,
+                ApprovalKind::CommandExecution | ApprovalKind::ExecCommand
+            ) && context.is_none()
+            {
+                return Ok(None);
+            }
             let Some(command) = request.command.as_deref() else {
                 return Ok(None);
             };
-            if let Some(decision) = approval_policy::should_auto_approve(command, project_root) {
+            if context.is_none()
+                && let Some(decision) = approval_policy::should_auto_approve(command, project_root)
+            {
                 return Ok(match decision {
                     AutoApprovalDecision::Accept => Some(ApprovalChoice::Accept),
                 });
             }
             let preferred_language = APPROVAL_LANGUAGE.try_with(Clone::clone).ok();
-            let decision = match ai_approval::review_request(
+            let trusted_acceptance = context.is_some();
+            let decision = match ai_approval::review_request_with_context(
                 request,
                 project_root,
                 preferred_language.as_deref(),
+                context,
             )
             .await
             {
                 Ok(decision) => decision,
+                Err(error) if trusted_acceptance => {
+                    return Err(error)
+                        .context("验收自动审批服务不可用，操作未执行；任务将按自动恢复流程处理");
+                }
                 Err(error) => {
                     eprintln!(
                         "AI approval review failed; falling back to user approval: {error:?}"
@@ -15620,7 +15799,6 @@ async fn auto_approve_codex_request(
                 None => None,
             })
         }
-        ApprovalKind::FileChange | ApprovalKind::ApplyPatch | ApprovalKind::Permissions => Ok(None),
     }
 }
 

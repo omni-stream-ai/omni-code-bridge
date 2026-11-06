@@ -31,6 +31,8 @@ pub fn router() -> Router<Arc<AppState>> {
             get(project_environment).post(save_project_environment),
         )
         .route("/v2/acceptance/{id}", get(get_run))
+        .route("/v2/acceptance/{id}/retry", post(retry_automation))
+        .route("/v2/acceptance/{id}/rejudge", post(rejudge))
         .route("/v2/acceptance/{id}/test-plan", post(edit_test_plan))
         .route("/v2/acceptance/{id}/test-plan/retry", post(retry_test_plan))
         .route(
@@ -119,9 +121,46 @@ async fn list_runs(
     headers: HeaderMap,
 ) -> Result<Json<ApiResponse<Vec<AcceptanceRun>>>, ApiError> {
     crate::api::authorize_request(&headers, &state).await?;
-    Ok(Json(ApiResponse {
-        data: state.acceptance.list().await.map_err(internal)?,
-    }))
+    let mut runs = state.acceptance.list().await.map_err(internal)?;
+    for run in &mut runs {
+        project_pending_approvals(&state, run).await;
+    }
+    Ok(Json(ApiResponse { data: runs }))
+}
+
+async fn project_pending_approvals(state: &AppState, run: &mut AcceptanceRun) {
+    run.pending_approvals.clear();
+    if matches!(
+        run.phase,
+        crate::acceptance::RunPhase::Completed | crate::acceptance::RunPhase::Failed
+    ) {
+        return;
+    }
+    let mut sessions = run.requirement_agent_session_ids.clone();
+    sessions.extend(run.agent_session_id.clone());
+    sessions.extend(run.plan_agent_session_id.clone());
+    sessions.extend(
+        run.environment
+            .as_ref()
+            .and_then(|env| env.agent_session_id.clone()),
+    );
+    sessions.sort();
+    sessions.dedup();
+    for session_id in sessions {
+        if let Some(request) = state.pending_session_approval(&session_id).await {
+            run.pending_approvals
+                .push(crate::acceptance::AcceptanceApproval {
+                    session_id,
+                    request,
+                });
+        }
+    }
+    if !run.pending_approvals.is_empty() {
+        run.automation_progress = format!(
+            "等待验收操作审批（{} 项），环境准备或执行尚未完成",
+            run.pending_approvals.len()
+        );
+    }
 }
 
 async fn create_run(
@@ -173,13 +212,49 @@ async fn get_run(
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<AcceptanceRun>>, ApiError> {
     crate::api::authorize_request(&headers, &state).await?;
-    Ok(Json(ApiResponse {
-        data: state
-            .acceptance
-            .snapshot(&id)
-            .await
-            .map_err(operation_error)?,
-    }))
+    let mut run = state
+        .acceptance
+        .snapshot(&id)
+        .await
+        .map_err(operation_error)?;
+    project_pending_approvals(&state, &mut run).await;
+    Ok(Json(ApiResponse { data: run }))
+}
+
+async fn rejudge(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<(StatusCode, Json<ApiResponse<AcceptanceRun>>), ApiError> {
+    crate::api::authorize_request(&headers, &state).await?;
+    let run = state
+        .acceptance
+        .rejudge(Arc::clone(&state), &id)
+        .await
+        .map_err(operation_error)?;
+    Ok((StatusCode::ACCEPTED, Json(ApiResponse { data: run })))
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RetryAutomation {
+    #[serde(default)]
+    startup: Option<crate::acceptance::StartupDecision>,
+}
+
+async fn retry_automation(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<RetryAutomation>,
+) -> Result<(StatusCode, Json<ApiResponse<AcceptanceRun>>), ApiError> {
+    crate::api::authorize_request(&headers, &state).await?;
+    let run = state
+        .acceptance
+        .retry_automation(Arc::clone(&state), &id, input.startup)
+        .await
+        .map_err(operation_error)?;
+    Ok((StatusCode::ACCEPTED, Json(ApiResponse { data: run })))
 }
 
 #[derive(Deserialize)]
@@ -611,6 +686,94 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn run_responses_project_live_internal_approvals_without_persisting_them() {
+        let fixture = crate::acceptance_test_support::Fixture::new().await;
+        let request: crate::models::ApprovalRequest = serde_json::from_value(json!({
+            "request_id":"0", "kind":"command_execution", "command":"build app",
+            "allow_accept_for_session":false, "allow_cancel":true, "resolvable":true
+        }))
+        .unwrap();
+        for session in [
+            "acceptance-environment",
+            "acceptance-execution",
+            "unrelated-session",
+        ] {
+            fixture.state.raise_approval(session, request.clone()).await;
+        }
+        let path = fixture
+            .state
+            .runtime_plugins
+            .root
+            .join("runs")
+            .join(&fixture.id)
+            .join("run.json");
+        let mut run: AcceptanceRun =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        run.phase = crate::acceptance::RunPhase::Starting;
+        run.agent_session_id = Some("acceptance-execution".into());
+        run.environment = Some(
+            serde_json::from_value(json!({
+                "id":"a".repeat(64), "project_id":run.project_id, "base_image_id":"base",
+                "config":{}, "source_key":"source", "phase":"identifying", "name":"Agent",
+                "description":"", "dockerfile":"", "verify_command":"", "progress":"preparing",
+                "agent_session_id":"acceptance-environment", "updated_at":chrono::Utc::now()
+            }))
+            .unwrap(),
+        );
+        crate::runtime_plugin::atomic_json(&path, &run).unwrap();
+        // Populate the cache before snapshot recovery can interpret this as a restart.
+        let cached = fixture.state.acceptance.get(&fixture.id).await.unwrap();
+        cached.lock().await.phase = crate::acceptance::RunPhase::Starting;
+        crate::runtime_plugin::atomic_json(&path, &run).unwrap();
+        let Json(response) = get_run(
+            State(Arc::clone(&fixture.state)),
+            fixture.headers.clone(),
+            Path(fixture.id.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.data.pending_approvals.len(), 2);
+        assert!(
+            response
+                .data
+                .automation_progress
+                .contains("等待验收操作审批")
+        );
+        assert!(
+            response
+                .data
+                .pending_approvals
+                .iter()
+                .any(|a| a.session_id == "acceptance-environment")
+        );
+        assert!(
+            !std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("pending_approvals")
+        );
+        fixture
+            .state
+            .resolve_approval(
+                "acceptance-environment",
+                "0",
+                crate::models::ApprovalChoice::Accept,
+            )
+            .await;
+        let Json(response) = list_runs(State(Arc::clone(&fixture.state)), fixture.headers.clone())
+            .await
+            .unwrap();
+        assert_eq!(response.data[0].pending_approvals.len(), 1);
+        assert_eq!(
+            response.data[0].pending_approvals[0].session_id,
+            "acceptance-execution"
+        );
+        let mut terminal = response.data[0].clone();
+        terminal.phase = crate::acceptance::RunPhase::Completed;
+        project_pending_approvals(&fixture.state, &mut terminal).await;
+        assert!(terminal.pending_approvals.is_empty());
+    }
+
+    #[tokio::test]
     async fn project_environments_are_authenticated_isolated_and_validated() {
         let fixture = crate::acceptance_test_support::Fixture::new().await;
         let a = fixture
@@ -831,6 +994,16 @@ mod tests {
                 reqwest::Method::POST,
                 format!("/v2/acceptance/{id}/test-plan/confirm"),
                 Some(json!({"version":1})),
+            ),
+            (
+                reqwest::Method::POST,
+                format!("/v2/acceptance/{id}/retry"),
+                Some(json!({})),
+            ),
+            (
+                reqwest::Method::POST,
+                format!("/v2/acceptance/{id}/rejudge"),
+                None,
             ),
             (
                 reqwest::Method::POST,

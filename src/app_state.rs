@@ -4,7 +4,10 @@ use std::{
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
     process::Command,
-    sync::{Arc, Mutex as StdMutex},
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -231,7 +234,7 @@ pub struct AppState {
     unread_message_ids: RwLock<HashMap<String, String>>,
     messages: RwLock<HashMap<String, Vec<ChatMessage>>>,
     session_diffs: RwLock<HashMap<String, Vec<SessionDiffEvent>>>,
-    metadata_write_lock: Mutex<()>,
+    metadata_writes: Arc<MetadataWriteState>,
     client_message_results: RwLock<HashMap<(String, String), (ChatMessage, ChatMessage)>>,
     devices: RwLock<HashMap<String, PushDeviceRegistration>>,
     list_cache: Mutex<Option<AggregatedListCache>>,
@@ -266,6 +269,14 @@ struct EventStreamState {
     log: VecDeque<SequencedSessionEvent>,
 }
 
+#[derive(Default)]
+struct MetadataWriteState {
+    lock: Arc<Mutex<()>>,
+    generation: AtomicU64,
+    persisted_generation: AtomicU64,
+    worker_started: AtomicBool,
+}
+
 pub enum EventReplay {
     Events(Vec<SequencedSessionEvent>),
     SyncRequired,
@@ -285,6 +296,7 @@ pub enum MarkSessionReadError {
 
 impl AppState {
     const LIST_CACHE_TTL: Duration = Duration::from_secs(5);
+    const METADATA_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
     const MAX_PERSISTED_DIFF_CHARS: usize = 200_000;
     const STALE_RUNNING_SESSION_DAYS: i64 = 7;
 
@@ -398,7 +410,7 @@ impl AppState {
                     .map(|(id, entry)| (id.clone(), entry.diffs.clone()))
                     .collect(),
             ),
-            metadata_write_lock: Mutex::new(()),
+            metadata_writes: Arc::new(MetadataWriteState::default()),
             client_message_results: RwLock::new(HashMap::new()),
             devices: RwLock::new(load_device_registrations()),
             list_cache: Mutex::new(None),
@@ -516,7 +528,7 @@ impl AppState {
                     .map(|(id, entry)| (id.clone(), entry.diffs.clone()))
                     .collect(),
             ),
-            metadata_write_lock: Mutex::new(()),
+            metadata_writes: Arc::new(MetadataWriteState::default()),
             client_message_results: RwLock::new(HashMap::new()),
             devices: RwLock::new(load_device_registrations()),
             list_cache: Mutex::new(None),
@@ -632,7 +644,7 @@ impl AppState {
                     .map(|(id, entry)| (id.clone(), entry.diffs.clone()))
                     .collect(),
             ),
-            metadata_write_lock: Mutex::new(()),
+            metadata_writes: Arc::new(MetadataWriteState::default()),
             client_message_results: RwLock::new(HashMap::new()),
             devices: RwLock::new(load_device_registrations()),
             list_cache: Mutex::new(None),
@@ -1311,6 +1323,18 @@ impl AppState {
                     .unwrap_or_default(),
             ),
         })
+    }
+
+    pub(crate) async fn pending_session_approval(
+        &self,
+        session_id: &str,
+    ) -> Option<ApprovalRequest> {
+        self.runtime
+            .lock()
+            .await
+            .get(session_id)?
+            .pending_approval
+            .clone()
     }
 
     pub async fn create_project(&self, input: CreateProjectInput) -> ProjectSummary {
@@ -2801,7 +2825,7 @@ impl AppState {
             created_at: Utc::now(),
         };
         self.push_message(message.clone()).await;
-        if let Err(error) = self.write_session_metadata().await {
+        if let Err(error) = self.schedule_session_metadata_write().await {
             eprintln!("failed to persist session activity: {error}");
         }
         self.publish_event(SessionEvent::MessageCreated(message));
@@ -2847,7 +2871,7 @@ impl AppState {
             created_at: Utc::now(),
         };
         self.push_message(message.clone()).await;
-        if let Err(error) = self.write_session_metadata().await {
+        if let Err(error) = self.schedule_session_metadata_write().await {
             eprintln!("failed to persist session activity: {error}");
         }
         self.publish_event(SessionEvent::MessageCreated(message));
@@ -2928,7 +2952,7 @@ impl AppState {
         entries.retain(|item| session_diff_key(item) != key);
         entries.push(event.clone());
         drop(diffs);
-        if let Err(error) = self.write_session_metadata().await {
+        if let Err(error) = self.schedule_session_metadata_write().await {
             eprintln!("failed to persist session diff: {error}");
         }
         self.publish_event(SessionEvent::SessionDiff(event.clone()));
@@ -3354,6 +3378,9 @@ impl AppState {
             }
         })
         .await;
+        if let Err(error) = self.flush_pending_session_metadata().await {
+            eprintln!("failed to flush session metadata at turn completion: {error}");
+        }
     }
 
     pub async fn set_cancel_sender(&self, session_id: &str, sender: mpsc::UnboundedSender<()>) {
@@ -4075,53 +4102,139 @@ impl AppState {
         self.write_session_metadata().await
     }
 
+    pub(crate) fn start_metadata_writer(self: &Arc<Self>) {
+        self.start_metadata_writer_with_interval(Self::METADATA_FLUSH_INTERVAL);
+    }
+
+    fn start_metadata_writer_with_interval(self: &Arc<Self>, interval: Duration) {
+        if self
+            .metadata_writes
+            .worker_started
+            .swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        let state = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut timer =
+                tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                // Fixed ticks bound the delay even during continuous updates.
+                timer.tick().await;
+                let Some(state) = state.upgrade() else {
+                    break;
+                };
+                if let Err(error) = state.flush_pending_session_metadata().await {
+                    eprintln!("failed to persist queued session metadata: {error}");
+                }
+            }
+        });
+    }
+
+    fn mark_session_metadata_dirty(&self) {
+        self.metadata_writes
+            .generation
+            .fetch_add(1, Ordering::AcqRel);
+    }
+
+    async fn schedule_session_metadata_write(&self) -> Result<(), String> {
+        self.mark_session_metadata_dirty();
+        if self.metadata_writes.worker_started.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            // Standalone AppState users retain synchronous persistence until
+            // the server starts its background writer.
+            self.flush_pending_session_metadata().await
+        }
+    }
+
     async fn write_session_metadata(&self) -> Result<(), String> {
-        let _write_guard = self.metadata_write_lock.lock().await;
-        let entries = self.session_title_overrides.read().await.clone();
-        let unread_message_ids = self.unread_message_ids.read().await.clone();
-        let session_diffs = self.session_diffs.read().await.clone();
-        let system_messages = self.messages.read().await.clone();
-        let canonical_sessions = self.sessions.read().await.clone();
-        let mut metadata = PersistedSessionMetadata {
-            sessions: HashMap::new(),
-            projects: self.projects.read().await.clone(),
-        };
-        for (session_id, session) in canonical_sessions {
-            metadata.sessions.insert(
-                session_id.clone(),
-                PersistedSessionMetadataEntry {
-                    title: entries.get(&session_id).cloned(),
-                    session: Some(session),
-                    last_unread_message_id: unread_message_ids.get(&session_id).cloned(),
-                    diffs: session_diffs.get(&session_id).cloned().unwrap_or_default(),
-                    system_messages: system_messages
-                        .get(&session_id)
-                        .into_iter()
-                        .flatten()
-                        .filter(|message| matches!(message.role, MessageRole::System))
-                        .cloned()
-                        .collect(),
-                    user_messages: system_messages
-                        .get(&session_id)
-                        .into_iter()
-                        .flatten()
-                        .filter(|message| matches!(message.role, MessageRole::User))
-                        .cloned()
-                        .collect(),
-                },
-            );
+        self.mark_session_metadata_dirty();
+        self.flush_pending_session_metadata().await
+    }
+
+    pub(crate) async fn flush_pending_session_metadata(&self) -> Result<(), String> {
+        let writes = Arc::clone(&self.metadata_writes);
+        let guard = Arc::clone(&writes.lock).lock_owned().await;
+        let generation = writes.generation.load(Ordering::Acquire);
+        if generation == writes.persisted_generation.load(Ordering::Acquire) {
+            return Ok(());
         }
-        for (session_id, title) in entries {
-            metadata.sessions.entry(session_id).or_default().title = Some(title);
-        }
-        write_persisted_session_metadata(&self.session_metadata_store_path, &metadata)
-            .await
-            .map_err(|error| {
+        let metadata = self.session_metadata_snapshot().await;
+        let path = self.session_metadata_store_path.clone();
+        tokio::task::spawn_blocking(move || {
+            // Keep serialization ordered even when the async caller is
+            // cancelled: spawn_blocking itself cannot be cancelled mid-write.
+            let _guard = guard;
+            crate::metadata_persistence::write_atomic_json(&path, &metadata).map_err(|error| {
                 format!(
                     "failed to persist session metadata at {}: {error}",
-                    self.session_metadata_store_path.display()
+                    path.display()
+                )
+            })?;
+            writes
+                .persisted_generation
+                .fetch_max(generation, Ordering::AcqRel);
+            Ok::<(), String>(())
+        })
+        .await
+        .map_err(|error| format!("session metadata writer failed: {error}"))?
+    }
+
+    async fn session_metadata_snapshot(&self) -> PersistedSessionMetadata {
+        let sessions = self
+            .sessions
+            .read()
+            .await
+            .iter()
+            .map(|(id, session)| {
+                (
+                    id.clone(),
+                    PersistedSessionMetadataEntry {
+                        session: Some(session.clone()),
+                        ..Default::default()
+                    },
                 )
             })
+            .collect();
+        let mut metadata = PersistedSessionMetadata {
+            sessions,
+            projects: self.projects.read().await.clone(),
+        };
+        {
+            let unread = self.unread_message_ids.read().await;
+            for (id, entry) in &mut metadata.sessions {
+                entry.last_unread_message_id = unread.get(id).cloned();
+            }
+        }
+        {
+            let diffs = self.session_diffs.read().await;
+            for (id, entry) in &mut metadata.sessions {
+                entry.diffs = diffs.get(id).cloned().unwrap_or_default();
+            }
+        }
+        {
+            let messages = self.messages.read().await;
+            for (id, entry) in &mut metadata.sessions {
+                for message in messages.get(id).into_iter().flatten() {
+                    // Assistant histories belong to provider archives. Never
+                    // clone them just to discard them before serialization.
+                    match message.role {
+                        MessageRole::User => entry.user_messages.push(message.clone()),
+                        MessageRole::System => entry.system_messages.push(message.clone()),
+                        MessageRole::Assistant => {}
+                    }
+                }
+            }
+        }
+        {
+            let titles = self.session_title_overrides.read().await;
+            for (id, title) in titles.iter() {
+                metadata.sessions.entry(id.clone()).or_default().title = Some(title.clone());
+            }
+        }
+        metadata
     }
 
     async fn refresh_project_summary(&self, project_id: &str) {
@@ -4763,18 +4876,6 @@ async fn load_persisted_session_metadata(path: &PathBuf) -> PersistedSessionMeta
     }
 }
 
-async fn write_persisted_session_metadata(
-    path: &PathBuf,
-    metadata: &PersistedSessionMetadata,
-) -> Result<(), std::io::Error> {
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    let body = serde_json::to_string_pretty(metadata)
-        .map_err(|error| std::io::Error::other(error.to_string()))?;
-    tokio::fs::write(path, body).await
-}
-
 fn runtime_store_path() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -5024,6 +5125,258 @@ mod tests {
             content: content.to_string(),
             created_at,
         }
+    }
+
+    async fn metadata_test_state(prefix: &str) -> (Arc<AppState>, SessionSummary) {
+        let state = Arc::new(
+            test_state_with_providers(prefix, ProviderRegistry::from_map(HashMap::new())).await,
+        );
+        let project = state
+            .create_project(CreateProjectInput {
+                name: "Metadata fixture".to_string(),
+                root_path: std::env::temp_dir().to_string_lossy().to_string(),
+            })
+            .await;
+        let session = state
+            .create_session(CreateSessionInput {
+                client_session_id: Uuid::new_v4().to_string(),
+                project_id: project.id,
+                title: Some("Persistent metadata".to_string()),
+                agent: AgentKind::Custom,
+                brief_reply_mode: false,
+                provider_id: None,
+                reasoning_effort: None,
+                model: None,
+            })
+            .await
+            .unwrap();
+        (state, session)
+    }
+
+    #[tokio::test]
+    async fn metadata_snapshot_preserves_recovery_fields_without_assistant_history() {
+        let (state, session) = metadata_test_state("metadata-filter").await;
+        let now = Utc::now();
+        state.messages.write().await.insert(
+            session.id.clone(),
+            vec![
+                test_message("user", &session.id, MessageRole::User, "用户输入", now),
+                test_message(
+                    "assistant",
+                    &session.id,
+                    MessageRole::Assistant,
+                    &"assistant history".repeat(128 * 1024),
+                    now,
+                ),
+                test_message(
+                    "progress",
+                    &session.id,
+                    MessageRole::System,
+                    "执行进度",
+                    now,
+                ),
+            ],
+        );
+        state.session_diffs.write().await.insert(
+            session.id.clone(),
+            vec![SessionDiffEvent {
+                session_id: session.id.clone(),
+                conversation_turn_id: None,
+                files: vec!["src/main.rs".to_string()],
+                added: Some(1),
+                removed: Some(0),
+                patch: Some("+saved change".to_string()),
+                summary: None,
+            }],
+        );
+        state
+            .session_title_overrides
+            .write()
+            .await
+            .insert(session.id.clone(), "自定义标题".to_string());
+        state
+            .unread_message_ids
+            .write()
+            .await
+            .insert(session.id.clone(), "assistant".to_string());
+        state
+            .sessions
+            .write()
+            .await
+            .get_mut(&session.id)
+            .unwrap()
+            .unread_count = 1;
+        state.write_session_metadata().await.unwrap();
+
+        let metadata = load_persisted_session_metadata(&state.session_metadata_store_path).await;
+        let entry = &metadata.sessions[&session.id];
+        assert_eq!(entry.title.as_deref(), Some("自定义标题"));
+        assert_eq!(entry.last_unread_message_id.as_deref(), Some("assistant"));
+        assert_eq!(entry.user_messages.len(), 1);
+        assert_eq!(entry.user_messages[0].content, "用户输入");
+        assert_eq!(entry.system_messages.len(), 1);
+        assert_eq!(entry.system_messages[0].content, "执行进度");
+        assert_eq!(entry.diffs[0].patch.as_deref(), Some("+saved change"));
+        assert!(
+            fs::metadata(&state.session_metadata_store_path)
+                .unwrap()
+                .len()
+                < 16 * 1024
+        );
+        assert_eq!(state.messages.read().await[&session.id].len(), 3);
+
+        let restored = AppState::new_with_paths_and_providers(
+            test_path("metadata-filter-restored-settings"),
+            state.runtime_store_path.clone(),
+            state.session_metadata_store_path.clone(),
+            ProviderRegistry::from_map(HashMap::new()),
+        )
+        .await;
+        assert_eq!(restored.messages.read().await[&session.id].len(), 2);
+        assert_eq!(
+            restored.session_diffs.read().await[&session.id][0]
+                .patch
+                .as_deref(),
+            Some("+saved change")
+        );
+        assert_eq!(
+            restored.unread_message_ids.read().await[&session.id],
+            "assistant"
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_progress_coalesces_and_critical_writes_flush_pending_updates() {
+        let (state, session) = metadata_test_state("metadata-coalesce").await;
+        state.start_metadata_writer_with_interval(Duration::from_secs(60));
+        let before = fs::read(&state.session_metadata_store_path).unwrap();
+        let saved = state
+            .metadata_writes
+            .persisted_generation
+            .load(Ordering::Acquire);
+        for index in 0..100 {
+            state
+                .emit_progress(&session.id, format!("progress {index}"))
+                .await;
+        }
+        assert_eq!(
+            fs::read(&state.session_metadata_store_path).unwrap(),
+            before
+        );
+        assert_eq!(
+            state
+                .metadata_writes
+                .persisted_generation
+                .load(Ordering::Acquire),
+            saved
+        );
+
+        state
+            .update_session_title(&session.id, "关键状态立即保存".to_string())
+            .await
+            .unwrap();
+        let metadata = load_persisted_session_metadata(&state.session_metadata_store_path).await;
+        let entry = &metadata.sessions[&session.id];
+        assert_eq!(entry.title.as_deref(), Some("关键状态立即保存"));
+        assert_eq!(entry.system_messages.len(), 100);
+        assert_eq!(entry.system_messages.last().unwrap().content, "progress 99");
+
+        state.emit_progress(&session.id, "last progress").await;
+        state.finish_turn(&session.id).await;
+        let metadata = load_persisted_session_metadata(&state.session_metadata_store_path).await;
+        assert_eq!(metadata.sessions[&session.id].system_messages.len(), 101);
+        assert_eq!(
+            state
+                .metadata_writes
+                .persisted_generation
+                .load(Ordering::Acquire),
+            state.metadata_writes.generation.load(Ordering::Acquire)
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_periodic_writer_flushes_during_continuous_activity() {
+        let (state, session) = metadata_test_state("metadata-periodic").await;
+        state.start_metadata_writer_with_interval(Duration::from_millis(30));
+        let stop = Arc::new(AtomicBool::new(false));
+        let producer = {
+            let state = Arc::clone(&state);
+            let id = session.id.clone();
+            let stop = Arc::clone(&stop);
+            tokio::spawn(async move {
+                while !stop.load(Ordering::Acquire) {
+                    state.emit_progress(&id, "still running").await;
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let metadata =
+                    load_persisted_session_metadata(&state.session_metadata_store_path).await;
+                if !metadata.sessions[&session.id].system_messages.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("continuous progress must not postpone the flush indefinitely");
+        assert!(!producer.is_finished());
+        stop.store(true, Ordering::Release);
+        producer.await.unwrap();
+        state.flush_pending_session_metadata().await.unwrap();
+        let metadata = load_persisted_session_metadata(&state.session_metadata_store_path).await;
+        assert_eq!(
+            metadata.sessions[&session.id].system_messages.len(),
+            state.messages.read().await[&session.id].len()
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_failed_write_remains_dirty_and_can_be_retried() {
+        let (mut state, session) = metadata_test_state("metadata-retry").await;
+        let original = state.session_metadata_store_path.clone();
+        let before = fs::read(&original).unwrap();
+        let blocked_parent = test_path("metadata-blocked-parent");
+        fs::write(&blocked_parent, "not a directory").unwrap();
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .session_metadata_store_path = blocked_parent.join("metadata.json");
+        state
+            .push_message(test_message(
+                "retry",
+                &session.id,
+                MessageRole::System,
+                "retry this update",
+                Utc::now(),
+            ))
+            .await;
+
+        assert!(state.write_session_metadata().await.is_err());
+        assert!(
+            state.metadata_writes.generation.load(Ordering::Acquire)
+                > state
+                    .metadata_writes
+                    .persisted_generation
+                    .load(Ordering::Acquire)
+        );
+        assert_eq!(fs::read(&original).unwrap(), before);
+        fs::remove_file(&blocked_parent).unwrap();
+        state.flush_pending_session_metadata().await.unwrap();
+        let metadata = load_persisted_session_metadata(&state.session_metadata_store_path).await;
+        assert_eq!(
+            metadata.sessions[&session.id].system_messages[0].content,
+            "retry this update"
+        );
+        assert_eq!(
+            state
+                .metadata_writes
+                .persisted_generation
+                .load(Ordering::Acquire),
+            state.metadata_writes.generation.load(Ordering::Acquire)
+        );
+        fs::remove_dir_all(blocked_parent).unwrap();
     }
 
     #[tokio::test]
@@ -6795,6 +7148,7 @@ mod tests {
         state.set_approval_sender(&session.id, approval_tx).await;
         let mut request = ApprovalRequest {
             request_id: "approval-1".to_string(),
+            cwd: None,
             kind: crate::models::ApprovalKind::CommandExecution,
             command: Some("cargo test".to_string()),
             reason: None,
