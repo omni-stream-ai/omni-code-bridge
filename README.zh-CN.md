@@ -486,3 +486,29 @@ scripts/acp-smoke.sh --keep-artifacts
 ## 许可证
 
 [MIT](LICENSE)
+
+## Worktree 管理
+
+Bridge 内置 worktree 子命令，和独立 omni-worktree CLI 使用同一个
+[Rust crate](crates/omni-worktree/README.md)：
+
+~~~sh
+omni-code-bridge worktree --repo /path/to/repo create feature/example --base main
+omni-code-bridge worktree --repo /path/to/repo list
+omni-code-bridge worktree --repo /path/to/repo watch
+omni-code-bridge worktree --repo /path/to/repo merge feature/example
+omni-code-bridge worktree skill
+~~~
+
+支持创建、查看、检测依赖、解除共享、合并、删除、清理失效记录和持续监控。
+Node/Composer 依赖通过符号链接共享；Flutter/Dart 重用 Pub 缓存并重写本地包路径；
+Rust 重用 Cargo 缓存及仓库内 vendor，构建目录独立。任一侧依赖清单、锁文件、
+相关配置或补丁变化后，sync/watch 会解除共享，保留源依赖。
+
+merge 成功后默认清理 worktree；watch 或 sync --cleanup 可检测外部普通合并。
+create --keep 可关闭自动清理。分支会保留；未提交、未跟踪、锁定或未知忽略文件会
+阻止删除，已知的依赖和构建缓存可随 worktree 清理。Squash 合并需检查后显式 remove。
+安装依赖前先运行 detach，避免安装器写入共享目录。
+
+随项目提供的 [omni-worktree skill](.agents/skills/omni-worktree/SKILL.md)
+说明了 coding agent 的使用流程，也可通过 worktree skill 直接输出。

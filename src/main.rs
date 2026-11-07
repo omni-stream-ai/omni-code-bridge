@@ -51,6 +51,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Manage Git worktrees, dependency sharing, and merge cleanup
+    Worktree(omni_worktree::cli::WorktreeArgs),
     /// Start the HTTP bridge server (default)
     Serve {
         #[arg(long, default_value = "8787")]
@@ -127,6 +129,7 @@ async fn run() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Some(Command::Worktree(args)) => omni_worktree::cli::run(args),
         Some(Command::ClaudePermissionHook {
             state_dir,
             session_id,

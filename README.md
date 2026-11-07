@@ -471,3 +471,21 @@ This repository publishes release binaries for Linux, macOS, and Windows via Git
 ## License
 
 [MIT](LICENSE)
+
+## Worktree CLI and Rust library
+
+The bridge includes a complete worktree subcommand, backed by the standalone
+[omni-worktree crate](crates/omni-worktree/README.md):
+
+~~~sh
+omni-code-bridge worktree --repo /path/to/repo create feature/example --base main
+omni-code-bridge worktree --repo /path/to/repo watch
+omni-code-bridge worktree --repo /path/to/repo merge feature/example
+omni-code-bridge worktree skill
+~~~
+
+It shares unchanged Node, Flutter/Dart, Rust and Composer dependencies, detaches
+invalidated aliases, and can clean up merged checkouts. The same crate provides
+an independent CLI and a library API. A bundled agent skill is available in
+[.agents/skills/omni-worktree](.agents/skills/omni-worktree/SKILL.md).
+Run detach before package installers; watch polls for changes and external merges.

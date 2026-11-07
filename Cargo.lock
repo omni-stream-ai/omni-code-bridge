@@ -4221,6 +4221,7 @@ dependencies = [
  "flate2",
  "futures-util",
  "jsonwebtoken",
+ "omni-worktree",
  "pi_agent_rust",
  "reqwest",
  "rusqlite",
@@ -4234,6 +4235,19 @@ dependencies = [
  "toml",
  "toml_edit 0.22.27",
  "tower-http",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "omni-worktree"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
  "url",
  "uuid",
 ]

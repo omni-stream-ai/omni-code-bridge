@@ -10,6 +10,7 @@ readme = "README.md"
 publish = false
 
 [dependencies]
+omni-worktree = { path = "crates/omni-worktree" }
 anyhow = "1.0.104"
 clap = { version = "4", features = ["derive"] }
 async-trait = "0.1"
