@@ -25,6 +25,7 @@ mod message_projection;
 mod metadata_persistence;
 mod models;
 mod pi_plugin_store;
+mod project_detection;
 mod project_environment;
 mod push;
 mod runtime_plugin;

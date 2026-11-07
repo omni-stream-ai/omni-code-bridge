@@ -30,6 +30,10 @@ pub fn router() -> Router<Arc<AppState>> {
             "/v2/projects/{project_id}/acceptance-environment",
             get(project_environment).post(save_project_environment),
         )
+        .route(
+            "/v2/projects/{project_id}/acceptance-environment/detect",
+            post(detect_project_environment),
+        )
         .route("/v2/acceptance/{id}", get(get_run))
         .route("/v2/acceptance/{id}/retry", post(retry_automation))
         .route("/v2/acceptance/{id}/rejudge", post(rejudge))
@@ -71,18 +75,26 @@ async fn project_environment(
 ) -> Result<Json<ApiResponse<EnvironmentSettings>>, ApiError> {
     crate::api::authorize_request(&headers, &state).await?;
     require_project(&state, &project_id).await?;
-    Ok(Json(ApiResponse {
-        data: state
-            .acceptance
-            .environments
-            .settings(&project_id)
-            .map_err(internal)?,
-    }))
+    let project = state
+        .find_project(&project_id)
+        .await
+        .ok_or_else(|| bad_request("project not found"))?;
+    let mut settings = state
+        .acceptance
+        .environments
+        .settings(&project_id)
+        .map_err(internal)?;
+    settings.detection = Some(crate::project_detection::detect(std::path::Path::new(
+        &project.root_path,
+    )));
+    Ok(Json(ApiResponse { data: settings }))
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SaveEnvironment {
+    #[serde(default)]
+    build: Option<crate::project_detection::BuildConfiguration>,
     #[serde(default)]
     mode: EnvironmentMode,
     #[serde(default)]
@@ -102,6 +114,7 @@ async fn save_project_environment(
     crate::api::authorize_request(&headers, &state).await?;
     require_project(&state, &project_id).await?;
     let config = EnvironmentConfig {
+        build: input.build,
         mode: input.mode,
         dockerfile: input.dockerfile,
         image: input.image,
@@ -114,6 +127,42 @@ async fn save_project_environment(
             .save_config(&project_id, config, input.rebuild)
             .map_err(operation_error)?,
     }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DetectEnvironment {
+    #[serde(default)]
+    agent: bool,
+    #[serde(default)]
+    current: crate::project_detection::BuildConfiguration,
+}
+async fn detect_project_environment(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+    Json(input): Json<DetectEnvironment>,
+) -> Result<Json<ApiResponse<crate::project_detection::Detection>>, ApiError> {
+    crate::api::authorize_request(&headers, &state).await?;
+    let project = state
+        .find_project(&project_id)
+        .await
+        .ok_or_else(|| bad_request("project not found"))?;
+    input.current.validate().map_err(operation_error)?;
+    let root = std::path::Path::new(&project.root_path);
+    let mut detection = crate::project_detection::detect(root);
+    if input.agent {
+        detection.configuration = crate::project_detection::identify_with_agent(
+            &state,
+            &project_id,
+            root,
+            &input.current,
+            &detection,
+        )
+        .await
+        .map_err(operation_error)?;
+    }
+    Ok(Json(ApiResponse { data: detection }))
 }
 
 async fn list_runs(
@@ -841,6 +890,110 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn build_detection_is_read_only_and_reviewed_edits_survive_reload() {
+        let fixture = crate::acceptance_test_support::Fixture::new().await;
+        let root = fixture.root.join("detected");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"packageManager":"pnpm@9","scripts":{"build":"vite build"}}"#,
+        )
+        .unwrap();
+        let project = fixture
+            .state
+            .create_project(crate::models::CreateProjectInput {
+                name: "Detected".into(),
+                root_path: root.to_string_lossy().into_owned(),
+            })
+            .await;
+        let (origin, server) = fixture.server().await;
+        let client = reqwest::Client::new();
+        let url = format!("{origin}/v2/projects/{}/acceptance-environment", project.id);
+        let detection_url = format!("{url}/detect");
+        assert_eq!(
+            client
+                .post(&detection_url)
+                .json(&json!({}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let detected: Value = client
+            .get(&url)
+            .headers(fixture.headers.clone())
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            detected["data"]["detection"]["configuration"]["build_command"],
+            "pnpm run build"
+        );
+        assert!(detected["data"]["config"]["build"].is_null());
+        let reviewed = json!({"language":"typescript", "package_manager":"pnpm", "install_command":"", "build_command":"pnpm run custom", "start_command":"", "artifact_directory":""});
+        let saved: Value = client
+            .post(&url)
+            .headers(fixture.headers.clone())
+            .json(&json!({"mode":"auto", "build": reviewed}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(saved["data"]["config"]["build"], reviewed);
+        let detected: Value = client
+            .post(&detection_url)
+            .headers(fixture.headers.clone())
+            .json(&json!({"agent":false, "current":reviewed}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            detected["data"]["configuration"]["build_command"],
+            "pnpm run build"
+        );
+        let restored: Value = client
+            .get(&url)
+            .headers(fixture.headers.clone())
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(restored["data"]["config"]["build"], reviewed);
+        let reloaded = crate::project_environment::ProjectEnvironmentStore::new(Arc::clone(
+            &fixture.state.runtime_plugins,
+        ));
+        assert_eq!(
+            reloaded
+                .config(&project.id)
+                .unwrap()
+                .build
+                .unwrap()
+                .build_command,
+            "pnpm run custom"
+        );
+        let invalid = client
+            .post(&url)
+            .headers(fixture.headers.clone())
+            .json(&json!({"build":{"build_command":"x".repeat(8001)}}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
         server.abort();
     }
 

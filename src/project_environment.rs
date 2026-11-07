@@ -44,6 +44,8 @@ pub enum EnvironmentMode {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct EnvironmentConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<crate::project_detection::BuildConfiguration>,
     #[serde(default)]
     pub mode: EnvironmentMode,
     #[serde(default)]
@@ -57,6 +59,9 @@ pub struct EnvironmentConfig {
 
 impl EnvironmentConfig {
     pub fn validate(&self) -> Result<()> {
+        if let Some(build) = &self.build {
+            build.validate()?;
+        }
         if self.dockerfile.len() > 64 * 1024 || self.dockerfile.contains('\0') {
             bail!("Dockerfile 不能包含空字符或超过 64 KB");
         }
@@ -123,6 +128,7 @@ pub struct ProjectEnvironment {
 
 #[derive(Serialize)]
 pub struct EnvironmentSettings {
+    pub detection: Option<crate::project_detection::Detection>,
     pub config: EnvironmentConfig,
     pub current: Option<ProjectEnvironment>,
     pub available: Vec<EnvironmentImage>,
@@ -350,6 +356,7 @@ impl ProjectEnvironmentStore {
         }
         available.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(EnvironmentSettings {
+            detection: None,
             config,
             current,
             available,
@@ -655,6 +662,12 @@ Flutter Linux 官方发布清单为 https://storage.googleapis.com/flutter_infra
             } else {
                 prompt
             };
+            if let Some(build) = &record.config.build {
+                content.push_str(&format!(
+                    "\n用户已审阅并保存的打包和依赖配置（优先于自动推断）：{}。严格使用其中非空的包管理器、安装、构建、启动命令和产物目录；命令相对冻结源码根目录。空字段表示未确定，不代表已验证，不要擅自更换已填写字段。若命令与环境不兼容，报告具体原因而不是静默替换。",
+                    serde_json::to_string(build)?
+                ));
+            }
             content.push_str(&environment_failure_context(record));
             for attempt in 0..2 {
                 let (_, reply) = send_automation_message(
