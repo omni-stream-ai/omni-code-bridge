@@ -34,6 +34,7 @@ impl TurnStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SegmentKind {
+    UserMessage,
     AssistantMessage,
     Execution,
 }
@@ -100,6 +101,30 @@ pub struct DomainMessage {
     pub attachments: Vec<Attachment>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+impl DomainMessage {
+    pub fn provider_content(&self) -> String {
+        let mut content = self.content.clone();
+        for attachment in &self.attachments {
+            let label = if attachment.file_name.trim().is_empty() {
+                "attachment"
+            } else {
+                attachment.file_name.trim()
+            };
+            let reference =
+                if attachment.kind == "image" || attachment.content_type.starts_with("image/") {
+                    format!("![{label}]({})", attachment.url)
+                } else {
+                    format!("[{label}]({})", attachment.url)
+                };
+            if !content.is_empty() {
+                content.push_str("\n\n");
+            }
+            content.push_str(&reference);
+        }
+        content
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -277,8 +302,29 @@ pub struct CreateTurnResult {
     pub request_fingerprint: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SteerTurnCommand {
+    pub command_id: String,
+    pub user_message_id: String,
+    pub content: String,
+    #[serde(default)]
+    pub attachments: Vec<Attachment>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SteerTurnResult {
+    pub message: DomainMessage,
+    pub cursor: i64,
+    pub created: bool,
+    pub request_fingerprint: String,
+}
+
 #[derive(Debug, Clone)]
 pub enum AgentProjection {
+    UserInputState {
+        message_id: String,
+        state: EntityState,
+    },
     ExecutionProgress {
         phase: ExecutionPhase,
     },

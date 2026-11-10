@@ -194,6 +194,33 @@ async fn desktop_asset(
 }
 
 async fn browser_grant(state: &AppState, id: &str, headers: &HeaderMap) -> Result<Grant, ApiError> {
+    // The embedded connector supplies a process-scoped native credential.
+    // Relay has already authorized the individual remote device. Preserve
+    // business control ownership/generation without exchanging browser cookies.
+    if headers
+        .get("x-omni-code-client-id")
+        .is_some_and(|value| value == omni_relay_connector::UPSTREAM_CLIENT_ID)
+    {
+        crate::api::authorize_request(headers, state).await?;
+        let shared = state
+            .acceptance
+            .get(id)
+            .await
+            .map_err(|_| error(StatusCode::NOT_FOUND, "Acceptance run not found"))?;
+        let run = shared.lock().await;
+        let grant = Grant {
+            run_id: id.into(),
+            client_id: omni_relay_connector::UPSTREAM_CLIENT_ID.into(),
+            auth: headers.clone(),
+            generation: run.control_generation,
+            expires: run.expires_at.min(Utc::now() + chrono::Duration::hours(1)),
+            ticket: false,
+            artifact: None,
+        };
+        drop(run);
+        validate_grant(state, &grant).await?;
+        return Ok(grant);
+    }
     let cookie = headers
         .get(header::COOKIE)
         .and_then(|v| v.to_str().ok())
@@ -298,6 +325,20 @@ async fn evidence(
     Query(query): Query<EvidenceQuery>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
+    if headers
+        .get("x-omni-code-client-id")
+        .is_some_and(|value| value == omni_relay_connector::UPSTREAM_CLIENT_ID)
+    {
+        crate::api::authorize_request(&headers, &state).await?;
+        return crate::acceptance_api::artifact_response(
+            &state,
+            &id,
+            &name,
+            &headers,
+            query.download,
+        )
+        .await;
+    }
     if let Some(ticket) = query.ticket {
         let mut grant = state
             .desktop_gateway
@@ -545,7 +586,16 @@ async fn relay(
             }
             message = upstream.next() => {
                 let message = match message {
-                    Some(Ok(UpstreamMessage::Binary(data))) => Message::Binary(data),
+                    Some(Ok(UpstreamMessage::Binary(data))) => {
+                        // RFB is a byte stream. Keep every downstream WS message
+                        // inside Relay's 64 KiB budget, including large frames.
+                        let mut failed = false;
+                        for chunk in data.chunks(64 * 1024) {
+                            if !matches!(tokio::time::timeout(Duration::from_secs(2), client.send(Message::Binary(chunk.to_vec().into()))).await, Ok(Ok(()))) { failed = true; break; }
+                        }
+                        if failed { break; }
+                        continue;
+                    },
                     Some(Ok(UpstreamMessage::Text(data))) => Message::Text(data.to_string().into()),
                     Some(Ok(UpstreamMessage::Ping(data))) => Message::Ping(data),
                     Some(Ok(UpstreamMessage::Pong(data))) => Message::Pong(data),

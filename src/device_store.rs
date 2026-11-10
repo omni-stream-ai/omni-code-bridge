@@ -22,10 +22,7 @@ pub fn save_device_registrations(devices: &HashMap<String, PushDeviceRegistratio
 }
 
 fn storage_path() -> PathBuf {
-    let mut path = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    path.push(".omni-code");
+    let mut path = crate::bridge_settings::data_dir();
     path.push("device-registrations.json");
     path
 }

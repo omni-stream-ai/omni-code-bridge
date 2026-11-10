@@ -13,7 +13,7 @@ use crate::{
     session_domain::{
         AgentProjection, CreateTurnCommand, CreateTurnResult, DomainMessage, DomainSession,
         DomainSessionStatus, EntityState, MessagePurpose, Segment, SegmentKind, SessionConfig,
-        SessionDomainEvent, SessionState, Turn, TurnStatus,
+        SessionDomainEvent, SessionState, SteerTurnCommand, SteerTurnResult, Turn, TurnStatus,
     },
 };
 use uuid::Uuid;
@@ -206,26 +206,130 @@ impl SessionDomainStore {
                 .map(|row| decode(&row.map_err(|error| error.to_string())?))
                 .collect::<Result<Vec<Turn>, String>>()?
         };
+        let append_only = existing_turns
+            .iter()
+            .any(|turn| !turn.id.starts_with("imported-turn-"));
+        // Once bridge turns exist, preserve their IDs, activities and artifacts.
+        // Only append completed native turns newer than our latest user input.
+        let suffix;
+        let messages = if append_only {
+            let latest = existing_turns
+                .iter()
+                .map(|turn| turn.user_message.created_at)
+                .max();
+            let archive = assistant_messages_by_turn(messages);
+            let mut matched = HashSet::new();
+            for turn in &existing_turns {
+                let candidate = archive
+                    .iter()
+                    .find(|(user, _)| user.id == turn.user_message.id)
+                    .or_else(|| {
+                        archive
+                            .iter()
+                            .filter(|(user, _)| {
+                                !matched.contains(&user.id) && archive_turn_matches(turn, user)
+                            })
+                            .min_by_key(|(user, _)| {
+                                (user.created_at - turn.user_message.created_at)
+                                    .num_milliseconds()
+                                    .abs()
+                            })
+                    });
+                if let Some((user, _)) = candidate {
+                    matched.insert(user.id.clone());
+                }
+                for input in turn
+                    .segments
+                    .iter()
+                    .filter_map(|segment| segment.message.as_ref())
+                    .filter(|message| {
+                        message.purpose == MessagePurpose::User
+                            && message.state == EntityState::Completed
+                    })
+                {
+                    let content = input.provider_content();
+                    if let Some((user, _)) = archive
+                        .iter()
+                        .find(|(user, _)| user.id == input.id)
+                        .or_else(|| {
+                            archive
+                                .iter()
+                                .filter(|(user, _)| {
+                                    !matched.contains(&user.id)
+                                        && user.content.trim() == content.trim()
+                                        && user.created_at
+                                            >= turn.created_at - chrono::TimeDelta::seconds(5)
+                                        && turn.completed_at.is_none_or(|completed| {
+                                            user.created_at
+                                                <= completed + chrono::TimeDelta::seconds(5)
+                                        })
+                                })
+                                .min_by_key(|(user, _)| {
+                                    (user.created_at - input.created_at)
+                                        .num_milliseconds()
+                                        .abs()
+                                })
+                        })
+                    {
+                        matched.insert(user.id.clone());
+                    }
+                }
+            }
+            let start = archive.iter().find_map(|(user, assistants)| {
+                (!assistants.is_empty()
+                    && latest.is_none_or(|latest| user.created_at > latest)
+                    && !matched.contains(&user.id))
+                .then(|| {
+                    messages
+                        .iter()
+                        .position(|message| message.id == user.id)
+                        .unwrap()
+                })
+            });
+            let Some(start) = start else {
+                return Ok(());
+            };
+            let last_completed = archive
+                .iter()
+                .rfind(|(_, assistants)| !assistants.is_empty())
+                .unwrap()
+                .0;
+            let last_user = messages
+                .iter()
+                .position(|message| message.id == last_completed.id)
+                .unwrap();
+            let end = messages[last_user + 1..]
+                .iter()
+                .position(|message| message.role == MessageRole::User)
+                .map_or(messages.len(), |offset| last_user + 1 + offset);
+            suffix = messages[start..end].to_vec();
+            suffix.as_slice()
+        } else {
+            messages
+        };
         if !existing_turns.is_empty() {
             // Imported snapshots must keep following the CLI archive. Native
             // turns belong to the bridge runtime and must not be rebuilt here.
             if session.active_turn_id.is_some()
-                || existing_turns
-                    .iter()
-                    .any(|turn| !turn.id.starts_with("imported-turn-"))
                 || imported_history_matches(&existing_turns, messages)
             {
                 return Ok(());
             }
-            transaction
-                .execute(
-                    "DELETE FROM domain_turns WHERE session_id = ?1",
-                    [session_id],
-                )
-                .map_err(|error| error.to_string())?;
+            if !append_only {
+                transaction
+                    .execute(
+                        "DELETE FROM domain_turns WHERE session_id = ?1",
+                        [session_id],
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
         }
 
-        let mut turns = Vec::<Turn>::new();
+        let mut turns = if append_only {
+            existing_turns.clone()
+        } else {
+            Vec::<Turn>::new()
+        };
         for message in messages {
             if message.role == MessageRole::User || turns.is_empty() {
                 let sequence = turns.len() as i64 + 1;
@@ -426,6 +530,15 @@ impl SessionDomainStore {
             .collect::<Vec<_>>();
         let mut matched_archive_turns = HashSet::new();
         for turn in &mut turns {
+            // A steered turn has several user inputs. Its streamed segments are
+            // authoritative; the legacy one-user-per-turn archive cannot replace them.
+            if turn
+                .segments
+                .iter()
+                .any(|segment| segment.kind == SegmentKind::UserMessage)
+            {
+                continue;
+            }
             let exact_id_candidates = archive_turns
                 .iter()
                 .enumerate()
@@ -813,6 +926,124 @@ impl SessionDomainStore {
         Ok(result)
     }
 
+    pub fn enqueue_turn_input(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        command: &SteerTurnCommand,
+    ) -> Result<SteerTurnResult, DomainStoreError> {
+        validate_id("command_id", &command.command_id)?;
+        validate_id("user_message_id", &command.user_message_id)?;
+        let content = command.content.trim();
+        if content.is_empty() && command.attachments.is_empty() {
+            return Err(DomainStoreError::Invalid(
+                "content or attachments are required".into(),
+            ));
+        }
+        let fingerprint = command_fingerprint(&(turn_id, command))?;
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|e| DomainStoreError::Storage(e.to_string()))?;
+        let transaction = connection
+            .transaction()
+            .map_err(|e| DomainStoreError::Storage(e.to_string()))?;
+        if let Some(result) = read_command_result::<SteerTurnResult>(
+            &transaction,
+            session_id,
+            &command.command_id,
+            "steer_turn",
+        )? {
+            if result.request_fingerprint != fingerprint {
+                return Err(DomainStoreError::Conflict(
+                    "command_id was already used with a different request".into(),
+                ));
+            }
+            return Ok(SteerTurnResult {
+                created: false,
+                ..result
+            });
+        }
+        let mut session = read_session(&transaction, session_id)?
+            .ok_or_else(|| DomainStoreError::NotFound("session not found".into()))?;
+        if session.active_turn_id.as_deref() != Some(turn_id) {
+            return Err(DomainStoreError::Conflict("the active turn changed".into()));
+        }
+        let mut turn = read_turn(&transaction, turn_id)?
+            .ok_or_else(|| DomainStoreError::NotFound("turn not found".into()))?;
+        if turn.user_message.id == command.user_message_id
+            || turn.segments.iter().any(|segment| {
+                segment
+                    .message
+                    .as_ref()
+                    .is_some_and(|message| message.id == command.user_message_id)
+            })
+        {
+            return Err(DomainStoreError::Conflict(
+                "user_message_id was already used".into(),
+            ));
+        }
+        let now = Utc::now();
+        let sequence = turn.segments.len() as i64 + 1;
+        let message = DomainMessage {
+            id: command.user_message_id.clone(),
+            turn_id: turn_id.to_string(),
+            sequence: sequence + 1,
+            revision: 1,
+            purpose: MessagePurpose::User,
+            state: EntityState::Pending,
+            content: content.to_string(),
+            attachments: command.attachments.clone(),
+            created_at: now,
+            updated_at: now,
+        };
+        turn.segments.push(Segment {
+            id: Uuid::new_v4().to_string(),
+            turn_id: turn_id.to_string(),
+            sequence,
+            revision: 1,
+            kind: SegmentKind::UserMessage,
+            state: EntityState::Pending,
+            message: Some(message.clone()),
+            activities: vec![],
+            latest_activity_id: None,
+            created_at: now,
+            updated_at: now,
+        });
+        turn.version += 1;
+        session.version += 1;
+        session.updated_at = now;
+        write_turn(&transaction, &turn)?;
+        write_session(&transaction, &session)?;
+        let event = insert_event(
+            &transaction,
+            &session,
+            Some(turn_id),
+            "message.queued",
+            Some(&message.id),
+            Some(message.revision),
+            json!({}),
+        )?;
+        let result = SteerTurnResult {
+            message,
+            cursor: event.event_id,
+            created: true,
+            request_fingerprint: fingerprint,
+        };
+        write_command_result(
+            &transaction,
+            session_id,
+            &command.command_id,
+            "steer_turn",
+            &result,
+        )?;
+        transaction
+            .commit()
+            .map_err(|e| DomainStoreError::Storage(e.to_string()))?;
+        let _ = self.event_tx.send(event);
+        Ok(result)
+    }
+
     pub fn events_after(
         &self,
         session_id: &str,
@@ -879,6 +1110,36 @@ impl SessionDomainStore {
         let now = Utc::now();
         turn.execution = Some(ExecutionHealth::observe(&turn, &projection, now));
         let (event_type, entity_id, entity_revision) = match projection {
+            AgentProjection::UserInputState { message_id, state } => {
+                let Some(index) = turn.segments.iter().position(|segment| {
+                    segment.kind == SegmentKind::UserMessage
+                        && segment.message.as_ref().is_some_and(|message| {
+                            message.id == message_id && message.state == EntityState::Pending
+                        })
+                }) else {
+                    return Ok(());
+                };
+                let mut segment = turn.segments.remove(index);
+                let message = segment.message.as_mut().expect("user message segment");
+                message.state = state;
+                message.revision += 1;
+                message.updated_at = now;
+                segment.state = state;
+                segment.revision += 1;
+                segment.updated_at = now;
+                let revision = message.revision;
+                // Only actual runtime consumption moves input into the transcript.
+                // Until then the client renders pending input after live output.
+                if state == EntityState::Completed {
+                    turn.segments.push(segment);
+                } else {
+                    turn.segments.insert(index, segment);
+                }
+                for (index, segment) in turn.segments.iter_mut().enumerate() {
+                    segment.sequence = index as i64 + 1;
+                }
+                ("message.updated", Some(message_id), Some(revision))
+            }
             AgentProjection::ExecutionProgress { phase } => {
                 let execution = turn.execution.as_mut().expect("execution initialized");
                 execution.last_progress_at = now;
@@ -1141,6 +1402,18 @@ impl SessionDomainStore {
                         _ => unreachable!("terminal status matched above"),
                     };
                     for segment in &mut turn.segments {
+                        if segment.kind == SegmentKind::UserMessage
+                            && let Some(message) = segment.message.as_mut()
+                            && message.state == EntityState::Pending
+                        {
+                            // Finishing a turn does not imply queued input was consumed.
+                            message.state = EntityState::Failed;
+                            message.revision += 1;
+                            message.updated_at = now;
+                            segment.state = EntityState::Failed;
+                            segment.revision += 1;
+                            segment.updated_at = now;
+                        }
                         if !matches!(
                             segment.state,
                             EntityState::Completed | EntityState::Cancelled | EntityState::Failed
@@ -1471,7 +1744,7 @@ fn merge_json_object(existing: &mut Value, incoming: Value) {
     }
 }
 
-fn command_fingerprint(command: &CreateTurnCommand) -> Result<String, DomainStoreError> {
+fn command_fingerprint<T: Serialize>(command: &T) -> Result<String, DomainStoreError> {
     let encoded = encode(command).map_err(DomainStoreError::Storage)?;
     Ok(format!(
         "sha256:v1:{:x}",
@@ -1725,13 +1998,230 @@ mod tests {
         models::{AgentKind, ChatMessage, InputMode, MessageRole, SessionStatus, SessionSummary},
         session_domain::{
             AgentProjection, Attachment, CreateTurnCommand, EntityState, MessagePurpose,
-            SegmentKind, TurnStatus,
+            SegmentKind, SteerTurnCommand, TurnStatus,
         },
     };
 
     fn test_store() -> SessionDomainStore {
         let path = std::env::temp_dir().join(format!("omni-domain-{}.sqlite3", Uuid::new_v4()));
         SessionDomainStore::open(&path).expect("domain store should open")
+    }
+
+    #[test]
+    fn queued_turn_input_is_durable_idempotent_and_only_consumed_by_the_runtime() {
+        let path = std::env::temp_dir().join(format!("omni-input-{}.sqlite3", Uuid::new_v4()));
+        let store = SessionDomainStore::open(&path).unwrap();
+        store.ensure_session(&session("queued-input")).unwrap();
+        let command = serde_json::from_value(json!({
+            "command_id":"start", "turn_id":"active", "user_message_id":"original",
+            "content":"original request", "input_mode":"text"
+        }))
+        .unwrap();
+        store.create_turn("queued-input", &command).unwrap();
+        let input = SteerTurnCommand {
+            command_id: "append-1".into(),
+            user_message_id: "follow-up-1".into(),
+            content: "additional instructions".into(),
+            attachments: vec![],
+        };
+        assert!(
+            store
+                .enqueue_turn_input("queued-input", "active", &input)
+                .unwrap()
+                .created
+        );
+        assert!(
+            !store
+                .enqueue_turn_input("queued-input", "active", &input)
+                .unwrap()
+                .created
+        );
+        let mut conflict = input.clone();
+        conflict.content = "different instructions".into();
+        assert!(matches!(
+            store.enqueue_turn_input("queued-input", "active", &conflict),
+            Err(super::DomainStoreError::Conflict(_))
+        ));
+        let other = SteerTurnCommand {
+            command_id: "append-2".into(),
+            user_message_id: "follow-up-2".into(),
+            ..input.clone()
+        };
+        assert!(matches!(
+            store.enqueue_turn_input("queued-input", "stale", &other),
+            Err(super::DomainStoreError::Conflict(_))
+        ));
+        store
+            .enqueue_turn_input("queued-input", "active", &other)
+            .unwrap();
+        drop(store);
+        let store = SessionDomainStore::open(&path).unwrap();
+        let pending = store.session_state("queued-input").unwrap().unwrap();
+        assert_eq!(pending.turns.len(), 1);
+        assert!(
+            pending.turns[0]
+                .segments
+                .iter()
+                .all(|segment| segment.message.as_ref().unwrap().state == EntityState::Pending)
+        );
+        store
+            .project_agent_event(
+                "queued-input",
+                "active",
+                AgentProjection::UserInputState {
+                    message_id: input.user_message_id.clone(),
+                    state: EntityState::Completed,
+                },
+            )
+            .unwrap();
+        store
+            .project_agent_event(
+                "queued-input",
+                "active",
+                AgentProjection::TurnStatus {
+                    status: TurnStatus::Completed,
+                    error: None,
+                },
+            )
+            .unwrap();
+        let completed = store.session_state("queued-input").unwrap().unwrap();
+        let states = completed.turns[0]
+            .segments
+            .iter()
+            .filter_map(|segment| segment.message.as_ref())
+            .map(|message| (message.id.as_str(), message.state))
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(states["follow-up-1"], EntityState::Completed);
+        assert_eq!(states["follow-up-2"], EntityState::Failed);
+        assert!(
+            !store
+                .enqueue_turn_input("queued-input", "active", &input)
+                .unwrap()
+                .created
+        );
+        let at = completed.turns[0].created_at;
+        let history = [
+            ("original", MessageRole::User, "original request"),
+            ("before", MessageRole::Assistant, "original reply"),
+            (
+                "native-follow-up",
+                MessageRole::User,
+                "additional instructions",
+            ),
+            ("after", MessageRole::Assistant, "follow-up reply"),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (id, role, content))| ChatMessage {
+            id: id.into(),
+            session_id: "queued-input".into(),
+            role,
+            content: content.into(),
+            created_at: at + chrono::TimeDelta::milliseconds(index as i64),
+        })
+        .collect::<Vec<_>>();
+        store
+            .import_message_history("queued-input", &history)
+            .unwrap();
+        store
+            .refresh_completed_assistant_history("queued-input", &history)
+            .unwrap();
+        let refreshed = store.session_state("queued-input").unwrap().unwrap();
+        assert_eq!(refreshed.turns.len(), 1);
+        assert_eq!(refreshed.turns[0].segments.len(), 2);
+        assert_eq!(
+            refreshed.turns[0]
+                .segments
+                .iter()
+                .filter_map(|segment| segment.message.as_ref())
+                .find(|message| message.id == "follow-up-2")
+                .unwrap()
+                .state,
+            EntityState::Failed
+        );
+    }
+
+    #[test]
+    fn native_history_appends_after_bridge_turns_without_rebuilding_them() {
+        let store = test_store();
+        let session = session("handoff-history");
+        store.ensure_session(&session).unwrap();
+        let command: CreateTurnCommand = serde_json::from_value(json!({
+            "command_id":"bridge-command", "turn_id":"bridge-turn", "user_message_id":"bridge-user",
+            "content":"repeat this", "attachments":[], "input_mode":"text"
+        }))
+        .unwrap();
+        store.create_turn(&session.id, &command).unwrap();
+        store
+            .project_agent_event(
+                &session.id,
+                "bridge-turn",
+                AgentProjection::AssistantMessage {
+                    message_id: "bridge-answer".into(),
+                    purpose: MessagePurpose::Final,
+                    state: EntityState::Completed,
+                    content: "bridge reply".into(),
+                },
+            )
+            .unwrap();
+        store
+            .project_agent_event(
+                &session.id,
+                "bridge-turn",
+                AgentProjection::TurnStatus {
+                    status: TurnStatus::Completed,
+                    error: None,
+                },
+            )
+            .unwrap();
+        let before = store.session_state(&session.id).unwrap().unwrap();
+        let now = before.turns[0].user_message.created_at;
+        let message = |id: &str, role, content: &str, seconds| ChatMessage {
+            id: id.into(),
+            session_id: session.id.clone(),
+            role,
+            content: content.into(),
+            created_at: now + chrono::TimeDelta::seconds(seconds),
+        };
+        let mut history = vec![
+            message("archive-bridge-user", MessageRole::User, "repeat this", 1),
+            message(
+                "archive-bridge-answer",
+                MessageRole::Assistant,
+                "bridge reply",
+                2,
+            ),
+            message("native-user", MessageRole::User, "repeat this", 3),
+            message("native-answer", MessageRole::Assistant, "native reply", 4),
+            message("pending-native-user", MessageRole::User, "not finished", 5),
+        ];
+        store.import_message_history(&session.id, &history).unwrap();
+        let after = store.session_state(&session.id).unwrap().unwrap();
+        assert_eq!(
+            after.turns.len(),
+            2,
+            "completed repeat must be imported, pending turn must wait"
+        );
+        assert_eq!(
+            serde_json::to_value(&after.turns[0]).unwrap(),
+            serde_json::to_value(&before.turns[0]).unwrap()
+        );
+        assert_eq!(after.turns[1].user_message.id, "native-user");
+        store.import_message_history(&session.id, &history).unwrap();
+        assert_eq!(
+            store.session_state(&session.id).unwrap().unwrap().cursor,
+            after.cursor
+        );
+        history.push(message(
+            "pending-native-answer",
+            MessageRole::Assistant,
+            "now complete",
+            6,
+        ));
+        store.import_message_history(&session.id, &history).unwrap();
+        let final_state = store.session_state(&session.id).unwrap().unwrap();
+        assert_eq!(final_state.turns.len(), 3);
+        assert_eq!(final_state.turns[1].id, after.turns[1].id);
     }
 
     #[test]

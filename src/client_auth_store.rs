@@ -153,9 +153,5 @@ async fn read_records(path: &PathBuf) -> HashMap<String, ClientAuthRecord> {
 }
 
 fn storage_path() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".omni-code")
-        .join("client-auth.json")
+    crate::bridge_settings::data_dir().join("client-auth.json")
 }

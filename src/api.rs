@@ -38,7 +38,7 @@ use crate::{
         TriggerClientMessageInput, UpdateSessionInput, UploadedFileResponse,
     },
     pi_plugin_store::{InstallPiPluginInput, PiPlugin, UpdatePiPluginInput},
-    session_domain::CreateTurnCommand,
+    session_domain::{CreateTurnCommand, SteerTurnCommand},
     session_domain_store::DomainStoreError,
 };
 
@@ -138,6 +138,10 @@ pub fn router() -> Router<Arc<AppState>> {
             put(mark_domain_session_read),
         )
         .route("/v2/sessions/{id}/turns", post(create_domain_turn))
+        .route(
+            "/v2/sessions/{id}/turns/{turn_id}/steer",
+            post(steer_domain_turn),
+        )
         .route("/v2/sessions/{id}/events", get(domain_session_events))
         .route(
             "/v2/pi/plugins",
@@ -1871,6 +1875,24 @@ async fn mark_domain_session_read(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn steer_domain_turn(
+    Path((id, turn_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Json(command): Json<SteerTurnCommand>,
+) -> Result<impl IntoResponse, ApiError> {
+    authorize_request(&headers, &state).await?;
+    let result = state
+        .steer_domain_turn(&id, &turn_id, &command)
+        .await
+        .map_err(domain_store_api_error)?
+        .ok_or_else(|| ApiError {
+            status: StatusCode::NOT_IMPLEMENTED,
+            message: "This runtime cannot accept input during an active turn".into(),
+        })?;
+    Ok((StatusCode::ACCEPTED, Json(ApiResponse { data: result })))
+}
+
 async fn create_domain_turn(
     Path(id): Path<String>,
     headers: HeaderMap,
@@ -2041,11 +2063,26 @@ async fn domain_session_events(
         }
     });
 
-    Ok(Sse::new(initial.chain(live)).keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text("keep-alive"),
-    ))
+    // An independent CLI/SDK appends to the native transcript without emitting
+    // bridge events. Check it while this session is open; dropping the stream
+    // also drops the timer, so no detached watcher survives a client disconnect.
+    let sync_native = matches!(snapshot.session.agent, AgentKind::Codex | AgentKind::Pi);
+    let native_updates = stream::unfold((Arc::clone(&state), id), move |(state, id)| async move {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        if sync_native && let Err(error) = state.domain_session_state(&id).await {
+            eprintln!("native session sync failed for {id}: {error}");
+        }
+        Some((None::<Result<Event, Infallible>>, (state, id)))
+    })
+    .filter_map(|event| async move { event });
+
+    Ok(
+        Sse::new(stream::select(initial.chain(live), native_updates)).keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("keep-alive"),
+        ),
+    )
 }
 
 fn hydrate_domain_sse_event(

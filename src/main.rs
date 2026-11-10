@@ -28,6 +28,7 @@ mod pi_plugin_store;
 mod project_detection;
 mod project_environment;
 mod push;
+mod relay;
 mod runtime_plugin;
 mod secret_store;
 mod session_domain;
@@ -52,6 +53,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Configure the embedded Relay before starting the server
+    Relay {
+        #[arg(trailing_var_arg = true)]
+        arguments: Vec<String>,
+    },
     /// Manage Git worktrees, dependency sharing, and merge cleanup
     Worktree(omni_worktree::cli::WorktreeArgs),
     /// Start the HTTP bridge server (default)
@@ -130,6 +136,9 @@ async fn run() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Some(Command::Relay { arguments }) => {
+            omni_relay_connector::host_cli(relay::host(8787)?.as_ref(), &arguments).await
+        }
         Some(Command::Worktree(args)) => omni_worktree::cli::run(args),
         Some(Command::ClaudePermissionHook {
             state_dir,
@@ -161,7 +170,10 @@ fn pi_request_timeout_from_env() -> u64 {
 async fn serve(port: u16, debug: bool, pi_request_timeout: u64) -> Result<()> {
     pi::http::client::set_request_timeout_override(pi_request_timeout);
     logging::init(debug);
-    let state = Arc::new(AppState::new_strict().await?);
+    let relay = relay::host(port)?;
+    let mut state = AppState::new_strict().await?;
+    state.relay = Some(relay.clone());
+    let state = Arc::new(state);
     state.start_metadata_writer();
     state.acceptance.start_maintenance();
     state
@@ -172,14 +184,17 @@ async fn serve(port: u16, debug: bool, pi_request_timeout: u64) -> Result<()> {
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    relay.resume().await?;
 
     println!("Omni Code bridge listening on http://{addr}");
 
     let shutdown = Arc::new(tokio::sync::Notify::new());
     let shutdown_received = Arc::clone(&shutdown);
+    let stopping_relay = relay.clone();
     let server = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             shutdown_signal().await;
+            stopping_relay.shutdown().await;
             shutdown_received.notify_one();
         })
         .into_future();
@@ -197,6 +212,7 @@ async fn serve(port: u16, debug: bool, pi_request_timeout: u64) -> Result<()> {
                 .unwrap_or(Ok(()))
         }
     };
+    relay.shutdown().await;
     state
         .flush_pending_session_metadata()
         .await
@@ -323,10 +339,15 @@ fn load_bridge_env() {
 }
 
 fn router(state: Arc<AppState>) -> Router {
-    Router::new().merge(api::router()).with_state(state).layer(
-        CorsLayer::new()
-            .allow_origin(Any)
-            .allow_methods(Any)
-            .allow_headers(Any),
-    )
+    Router::new()
+        .merge(api::router())
+        .merge(relay::router())
+        .layer(axum::middleware::from_fn(relay::guard))
+        .with_state(state)
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any),
+        )
 }

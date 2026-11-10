@@ -74,9 +74,5 @@ async fn read_records(path: &PathBuf) -> HashMap<String, String> {
 }
 
 fn storage_path() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".omni-code")
-        .join("acp-secrets.json")
+    crate::bridge_settings::data_dir().join("acp-secrets.json")
 }

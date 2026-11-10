@@ -1636,6 +1636,10 @@ impl AgentProvider for StubProvider {
 }
 
 #[cfg(test)]
+#[path = "llm_mock_tests.rs"]
+mod llm_mock_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::bridge_settings::{AiApprovalSettings, BridgeSettingsInput};
@@ -3282,7 +3286,7 @@ export default function init(pi) {
     }
 
     #[test]
-    fn codex_thread_action_migrates_when_model_changes() {
+    fn codex_thread_action_resumes_when_model_changes() {
         assert_eq!(
             decide_codex_thread_action(
                 Some("thread-1"),
@@ -3291,12 +3295,12 @@ export default function init(pi) {
                 Some("model-a"),
                 Some("model-b"),
             ),
-            CodexThreadDecision::StartWithMigration
+            CodexThreadDecision::ResumeWithChangedConfig
         );
     }
 
     #[test]
-    fn codex_thread_action_migrates_when_provider_changes() {
+    fn codex_thread_action_resumes_when_provider_changes() {
         assert_eq!(
             decide_codex_thread_action(
                 Some("thread-1"),
@@ -3305,7 +3309,7 @@ export default function init(pi) {
                 Some("model-a"),
                 Some("model-a"),
             ),
-            CodexThreadDecision::StartWithMigration
+            CodexThreadDecision::ResumeWithChangedConfig
         );
         assert_eq!(
             decide_codex_thread_action(
@@ -4569,7 +4573,7 @@ for line in sys.stdin:
     }
 
     #[cfg(unix)]
-    async fn codex_test_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    pub(super) async fn codex_test_lock() -> tokio::sync::MutexGuard<'static, ()> {
         static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
         LOCK.lock().await
     }
@@ -4668,6 +4672,7 @@ scenario = os.environ.get("OMNI_CODE_MOCK_CODEX_SCENARIO", "success")
 log_path = os.environ.get("OMNI_CODE_MOCK_CODEX_LOG")
 turn_request_id = None
 probe_count = 0
+steer_count = 0
 
 def write(value):
     sys.stdout.write(json.dumps(value, separators=(",", ":")) + "\n")
@@ -4699,6 +4704,8 @@ for line in sys.stdin:
             write({"jsonrpc":"2.0","id":request_id,"result":{"data":[{"id":"mock-listed-thread","sessionId":"mock-listed-thread","cwd":"/tmp/mock-project","name":"Generated Codex title","preview":"Original user prompt","createdAt":1767036064,"updatedAt":1767036065,"status":{"type":"idle"},"source":"cli","modelProvider":"openai","cliVersion":"test","ephemeral":False,"projectId":None,"turns":[]}],"nextCursor":"page-2"}})
     elif method == "thread/resume" and scenario == "resume-failure":
         write({"jsonrpc":"2.0","id":request_id,"error":{"code":-32001,"message":"mock thread no longer exists"}})
+    elif method == "thread/resume" and scenario == "resume-wrong-thread":
+        write({"jsonrpc":"2.0","id":request_id,"result":{"thread":{"id":"unexpected-thread"}}})
     elif method in ("thread/start", "thread/resume", "thread/fork"):
         write({"jsonrpc":"2.0","id":request_id,"result":{"thread":{"id":"mock-thread","approvalPolicy":"on-request","approvalsReviewer":"user"}}})
     elif method == "thread/archive":
@@ -4709,6 +4716,8 @@ for line in sys.stdin:
         write({"jsonrpc":"2.0","method":"turn/started","params":{"turn":{"id":"mock-turn","status":"inProgress"}}})
         if scenario == "failure":
             write({"jsonrpc":"2.0","method":"turn/completed","params":{"turn":{"id":"mock-turn","status":"failed","error":{"message":"mock provider failed"}}}})
+        elif scenario in ("steer", "steer-rejected"):
+            write({"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"itemId":"assistant-before","delta":"Partial reply before follow-ups"}})
         elif scenario == "cancel":
             write({"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"itemId":"assistant-1","delta":"partial before cancel"}})
         elif scenario == "retry-then-success":
@@ -4735,6 +4744,24 @@ for line in sys.stdin:
             write({"jsonrpc":"2.0","method":"item/completed","params":{"item":{"id":"cmd-1","type":"commandExecution","command":"cargo test","status":"completed","exitCode":0}}})
             write({"jsonrpc":"2.0","method":"turn/diff/updated","params":{"turnId":"mock-turn","diff":"diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1 +1 @@\n-old\n+new"}})
             complete()
+    elif method == "turn/steer":
+        params = value.get("params", {})
+        assert params.get("expectedTurnId") == "mock-turn"
+        assert params.get("threadId") == "mock-thread"
+        if scenario == "steer-rejected":
+            write({"jsonrpc":"2.0","id":request_id,"error":{"code":-32000,"message":"input rejected"}})
+            threading.Timer(0.1, complete).start()
+            continue
+        steer_count += 1
+        client_id = params["clientUserMessageId"]
+        write({"jsonrpc":"2.0","id":request_id,"result":{"turnId":"mock-turn"}})
+        def consume(client_id=client_id, index=steer_count, inputs=params["input"]):
+            write({"jsonrpc":"2.0","method":"item/started","params":{"item":{"id":"native-" + client_id,"clientId":client_id,"type":"userMessage","content":inputs}}})
+            if index == 1:
+                write({"jsonrpc":"2.0","method":"item/completed","params":{"item":{"id":"assistant-steer-1","type":"agentMessage","phase":"commentary","text":"Handled first follow-up"}}})
+            else:
+                complete("Answer after both follow-ups")
+        threading.Timer(0.15 * steer_count, consume).start()
     elif method == "thread/read" and scenario.startswith(("health-", "watchdog-")):
         write({"jsonrpc":"2.0","id":request_id,"result":{"thread":{"id":"mock-thread","status":{"type":"active","activeFlags":[]}}}})
     elif method == "thread/turns/list" and scenario.startswith("health-"):
@@ -5136,32 +5163,53 @@ for line in sys.stdin:
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn codex_provider_recovers_from_resume_failure_with_a_new_thread() {
+    async fn codex_provider_retains_original_thread_on_resume_failure() {
         let _lock = codex_test_lock().await;
-        let mock = MockCodexEnvironment::new("resume-failure");
-        let state = Arc::new(test_state("codex-full-chain-resume-fallback").await);
-        let session = create_mock_codex_session(&state, "resume-fallback").await;
+        for (scenario, changed_config) in [
+            ("resume-failure", false),
+            ("resume-failure", true),
+            ("resume-wrong-thread", false),
+        ] {
+            let mock = MockCodexEnvironment::new(scenario);
+            let state =
+                Arc::new(test_state(&format!("codex-resume-{scenario}-{changed_config}")).await);
+            let session = create_mock_codex_session(&state, "resume-fallback").await;
 
-        start_mock_codex_turn(&state, &session, 1).await;
-        wait_for_turn_completion(&state, &session.id)
-            .await
-            .expect("initial Codex turn should complete");
-        start_mock_codex_turn(&state, &session, 2).await;
-        wait_for_turn_completion(&state, &session.id)
-            .await
-            .expect("fallback Codex turn should complete");
+            start_mock_codex_turn(&state, &session, 1).await;
+            wait_for_turn_completion(&state, &session.id)
+                .await
+                .expect("initial Codex turn should complete");
+            if changed_config {
+                state
+                    .set_codex_model(&session.id, Some("previous-model".into()))
+                    .await;
+            }
+            start_mock_codex_turn(&state, &session, 2).await;
+            wait_for_turn_completion(&state, &session.id)
+                .await
+                .expect("failed turn should finish");
 
-        let detail = state.get_session(&session.id).await.unwrap();
-        assert!(matches!(detail.session.status, SessionStatus::Idle));
-        assert_eq!(
-            detail.session.runtime_session_ref.as_deref(),
-            Some("mock-thread")
-        );
-        let methods =
-            std::fs::read_to_string(&mock.log_path).expect("mock Codex request log should exist");
-        assert_eq!(methods.matches("thread/resume\n").count(), 1);
-        assert_eq!(methods.matches("thread/start\n").count(), 2);
-        assert_eq!(methods.matches("turn/start\n").count(), 2);
+            let detail = state.get_session(&session.id).await.unwrap();
+            assert!(matches!(detail.session.status, SessionStatus::Failed));
+            assert!(
+                detail
+                    .session
+                    .last_message_preview
+                    .as_deref()
+                    .is_some_and(|message| message.contains("original session retained"))
+            );
+            assert_eq!(
+                detail.session.runtime_session_ref.as_deref(),
+                Some("mock-thread")
+            );
+            let methods = std::fs::read_to_string(&mock.log_path)
+                .expect("mock Codex request log should exist");
+            assert_eq!(methods.matches("thread/resume\n").count(), 1);
+            assert_eq!(methods.matches("thread/start\n").count(), 1);
+            assert!(!methods.contains("thread/fork"));
+            assert!(!methods.contains("thread/archive"));
+            assert_eq!(methods.matches("turn/start\n").count(), 1);
+        }
     }
 
     #[cfg(unix)]
@@ -5569,6 +5617,120 @@ for line in sys.stdin:
         let methods = std::fs::read_to_string(&mock.log_path).unwrap();
         assert_eq!(methods.matches("thread/turns/list\n").count(), 6);
         assert!(!methods.contains("turn/interrupt\n"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_provider_consumes_followups_without_interrupting_or_starting_another_turn() {
+        let _lock = codex_test_lock().await;
+        let mock = MockCodexEnvironment::new("steer");
+        let state = Arc::new(test_state("codex-steering").await);
+        let session = create_mock_codex_session(&state, "steering").await;
+        let turn = start_mock_codex_turn(&state, &session, 1).await;
+        wait_for_assistant_message_text(&state, &session.id, "Partial reply before follow-ups")
+            .await
+            .unwrap();
+        for index in 1..=2 {
+            let command = crate::session_domain::SteerTurnCommand {
+                command_id: format!("steer-{index}"),
+                user_message_id: format!("follow-up-{index}"),
+                content: format!("additional instructions {index}"),
+                attachments: vec![],
+            };
+            let result = state
+                .steer_domain_turn(&session.id, &turn, &command)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(result.created);
+            assert_eq!(result.message.state, EntityState::Pending);
+            assert!(
+                !state
+                    .steer_domain_turn(&session.id, &turn, &command)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .created
+            );
+        }
+        wait_for_turn_completion(&state, &session.id).await.unwrap();
+        let domain = state
+            .domain_session_state(&session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(domain.turns.len(), 1);
+        assert_eq!(domain.turns[0].status, TurnStatus::Completed);
+        let messages = domain.turns[0]
+            .segments
+            .iter()
+            .filter_map(|segment| segment.message.as_ref())
+            .collect::<Vec<_>>();
+        let users = messages
+            .iter()
+            .filter(|message| message.purpose == crate::session_domain::MessagePurpose::User)
+            .collect::<Vec<_>>();
+        assert_eq!(users.len(), 2);
+        assert!(
+            users
+                .iter()
+                .all(|message| message.state == EntityState::Completed)
+        );
+        let texts = messages
+            .iter()
+            .filter(|message| message.purpose != crate::session_domain::MessagePurpose::User)
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            texts,
+            [
+                "Partial reply before follow-ups",
+                "Handled first follow-up",
+                "Answer after both follow-ups"
+            ]
+        );
+        let methods = std::fs::read_to_string(&mock.log_path).unwrap();
+        assert_eq!(methods.matches("turn/start\n").count(), 1);
+        assert_eq!(methods.matches("turn/steer\n").count(), 2);
+        assert!(!methods.contains("turn/interrupt"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejected_followup_does_not_fail_the_active_codex_turn() {
+        let _lock = codex_test_lock().await;
+        let _mock = MockCodexEnvironment::new("steer-rejected");
+        let state = Arc::new(test_state("codex-steering-rejected").await);
+        let session = create_mock_codex_session(&state, "steering-rejected").await;
+        let turn = start_mock_codex_turn(&state, &session, 1).await;
+        wait_for_assistant_message_text(&state, &session.id, "Partial reply before follow-ups")
+            .await
+            .unwrap();
+        let command = crate::session_domain::SteerTurnCommand {
+            command_id: "rejected".into(),
+            user_message_id: "rejected-input".into(),
+            content: "follow-up".into(),
+            attachments: vec![],
+        };
+        state
+            .steer_domain_turn(&session.id, &turn, &command)
+            .await
+            .unwrap()
+            .unwrap();
+        wait_for_turn_completion(&state, &session.id).await.unwrap();
+        let domain = state
+            .domain_session_state(&session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(domain.turns[0].status, TurnStatus::Completed);
+        let input = domain.turns[0]
+            .segments
+            .iter()
+            .filter_map(|segment| segment.message.as_ref())
+            .find(|message| message.id == "rejected-input")
+            .unwrap();
+        assert_eq!(input.state, EntityState::Failed);
     }
 
     #[cfg(unix)]
@@ -6807,6 +6969,11 @@ impl AgentProvider for CodexProvider {
                         error
                     );
                     sleep(delay).await;
+                    // Cancellation can arrive while no app-server receiver is
+                    // alive. Never start another process after that backoff.
+                    if !state.codex_turn_can_retry(&session.id, &reply.id).await {
+                        return Ok(());
+                    }
                     last_error = Some(error);
                 }
             }
@@ -7798,55 +7965,6 @@ async fn start_codex_thread(
     wait_for_json_rpc_response(stdout_rx, raw_stdout, request_id).await
 }
 
-async fn fork_codex_thread(
-    stdin: &mut (impl tokio::io::AsyncWrite + Unpin),
-    next_request_id: &mut u64,
-    stdout_rx: &mut mpsc::UnboundedReceiver<std::result::Result<String, String>>,
-    raw_stdout: &mut String,
-    source_thread_id: &str,
-    cwd: &Path,
-    model_provider: Option<&str>,
-    model: Option<&str>,
-    developer_instructions: &Option<String>,
-) -> Result<serde_json::Value> {
-    let request_id = send_json_rpc_request(
-        stdin,
-        next_request_id,
-        "thread/fork",
-        serde_json::json!({
-            "threadId": source_thread_id,
-            "cwd": cwd.display().to_string(),
-            "approvalPolicy": "on-request",
-            "approvalsReviewer": "user",
-            "sandbox": "workspace-write",
-            "modelProvider": model_provider,
-            "model": model,
-            "developerInstructions": developer_instructions,
-        }),
-    )
-    .await?;
-    wait_for_json_rpc_response(stdout_rx, raw_stdout, request_id).await
-}
-
-async fn archive_codex_thread(
-    stdin: &mut (impl tokio::io::AsyncWrite + Unpin),
-    next_request_id: &mut u64,
-    stdout_rx: &mut mpsc::UnboundedReceiver<std::result::Result<String, String>>,
-    raw_stdout: &mut String,
-    thread_id: &str,
-) -> Result<serde_json::Value> {
-    let request_id = send_json_rpc_request(
-        stdin,
-        next_request_id,
-        "thread/archive",
-        serde_json::json!({
-            "threadId": thread_id,
-        }),
-    )
-    .await?;
-    wait_for_json_rpc_response(stdout_rx, raw_stdout, request_id).await
-}
-
 fn brief_reply_developer_prompt(session: &SessionSummary) -> Option<&'static str> {
     session.brief_reply_mode.then_some(
         "回复要求：请简短说明你做了什么和结果，尽量不超过 50 个汉字。只保留关键动作、结果或结论，避免展开解释。",
@@ -7971,7 +8089,7 @@ fn build_context_migration_instructions(
 enum CodexThreadDecision {
     StartFresh,
     Resume,
-    StartWithMigration,
+    ResumeWithChangedConfig,
 }
 
 fn decide_codex_thread_action(
@@ -7987,9 +8105,9 @@ fn decide_codex_thread_action(
 
     match (stored_provider_name, current_provider_name) {
         (Some(stored), Some(current)) if stored != current => {
-            CodexThreadDecision::StartWithMigration
+            CodexThreadDecision::ResumeWithChangedConfig
         }
-        _ if stored_model != current_model => CodexThreadDecision::StartWithMigration,
+        _ if stored_model != current_model => CodexThreadDecision::ResumeWithChangedConfig,
         _ => CodexThreadDecision::Resume,
     }
 }
@@ -8491,27 +8609,42 @@ async fn run_codex(
         .map(crate::session_store::codex_profile_config)
         .transpose()
         .map_err(anyhow::Error::msg)?;
-    // Resolve the codex provider name for this session.
-    // When the bridge explicitly resolved a provider_id (message-level or session-level),
-    // use it directly as the codex provider name — the -c overrides will create the
-    // matching model_providers entry. This avoids mismatches where the fallback chain
-    // picks a different provider name than what the bridge actually configured.
+    let existing_runtime_ref = state.provider_session_ref(&session.id).await;
+    if existing_runtime_ref.as_deref() == Some(session.id.as_str()) {
+        // Pin a CLI-imported thread before attempting resume. A failed first
+        // handoff must not make later retries depend on catalog availability.
+        state
+            .set_provider_session_ref(&session.id, existing_runtime_ref.clone())
+            .await;
+    }
+    // A native thread keeps its original provider name in the rollout header.
+    // Apply the selected bridge config under that process-local name so Codex
+    // can resume even if the CLI originally used a transient -c provider.
+    let native_provider_name = provider_config.as_ref().and_then(|_| {
+        existing_runtime_ref
+            .as_deref()
+            .and_then(read_codex_session_provider)
+    });
+    // For new threads, use the resolved bridge provider ID. For native threads,
+    // the process-local alias above receives exactly the same selected config.
     //
     // Fallback chain when the bridge did not inject a provider config:
     // 1. Codex session data file (model_provider in session_meta)
     // 2. Current config.toml's model_provider
     // 3. No override
-    let codex_provider_name = match provider_config.as_ref().and_then(|c| c.provider_id.clone()) {
-        Some(id) => Some(id),
-        None => profile_config
-            .as_ref()
-            .and_then(|config| config.get("model_provider"))
-            .and_then(toml::Value::as_str)
-            .map(str::to_string)
-            .or_else(|| profile_config.as_ref().map(|_| "openai".to_string()))
-            .or_else(|| read_codex_session_provider(&session.id))
-            .or_else(find_codex_provider_name),
-    };
+    let codex_provider_name = native_provider_name.or_else(|| {
+        match provider_config.as_ref().and_then(|c| c.provider_id.clone()) {
+            Some(id) => Some(id),
+            None => profile_config
+                .as_ref()
+                .and_then(|config| config.get("model_provider"))
+                .and_then(toml::Value::as_str)
+                .map(str::to_string)
+                .or_else(|| profile_config.as_ref().map(|_| "openai".to_string()))
+                .or_else(|| read_codex_session_provider(&session.id))
+                .or_else(find_codex_provider_name),
+        }
+    });
     let mut child = spawn_codex_app_server_with_config(
         &project_root,
         provider_config.as_ref(),
@@ -8572,6 +8705,8 @@ async fn run_codex(
     state
         .set_execution_check_sender(&session.id, execution_check_tx)
         .await;
+    let (steering_tx, mut steering_rx) = mpsc::unbounded_channel();
+    state.set_steering_sender(&session.id, steering_tx).await;
     let (user_input_tx, mut user_input_rx) = mpsc::unbounded_channel();
 
     let mut next_request_id = 1_u64;
@@ -8608,7 +8743,6 @@ async fn run_codex(
                 .map(str::to_string)
         });
     let stored_model = state.codex_model(&session.id).await;
-    let existing_runtime_ref = state.provider_session_ref(&session.id).await;
     let stored_provider_name = state.codex_provider_name(&session.id).await;
     let thread_decision = decide_codex_thread_action(
         existing_runtime_ref.as_deref(),
@@ -8617,93 +8751,29 @@ async fn run_codex(
         stored_model.as_deref(),
         current_model.as_deref(),
     );
-    let base_developer_instructions = turn_system_prompt(session, system_prompt);
-    let developer_instructions = base_developer_instructions.clone();
+    let developer_instructions = turn_system_prompt(session, system_prompt);
 
-    if thread_decision == CodexThreadDecision::StartWithMigration {
+    if thread_decision == CodexThreadDecision::ResumeWithChangedConfig {
         debug_log!(
-            "[codex] forking thread for session={}: provider changed old_provider={:?} new_provider={:?} old_model={:?} new_model={:?}",
+            "[codex] resuming thread with changed configuration for session={}: old_provider={:?} new_provider={:?} old_model={:?} new_model={:?}",
             session.id,
             stored_provider_name,
             codex_provider_name,
             stored_model,
             current_model,
         );
-    } else if thread_decision == CodexThreadDecision::Resume && stored_model != current_model {
-        debug_log!(
-            "[codex] attempting thread/resume across model change for session={}: provider={:?} old_model={:?} new_model={:?}",
-            session.id,
-            codex_provider_name,
-            stored_model,
-            current_model,
-        );
     }
-    let thread_response = if thread_decision == CodexThreadDecision::StartWithMigration {
-        let source_thread_id = existing_runtime_ref
-            .as_deref()
-            .context("missing source thread for codex fork")?;
-        match fork_codex_thread(
-            &mut stdin,
-            &mut next_request_id,
-            &mut stdout_rx,
-            &mut raw_stdout,
-            source_thread_id,
-            &project_root,
-            codex_provider_name.as_deref(),
-            current_model.as_deref(),
-            &developer_instructions,
-        )
-        .await
-        {
-            Ok(resp) => {
-                if let Err(error) = archive_codex_thread(
-                    &mut stdin,
-                    &mut next_request_id,
-                    &mut stdout_rx,
-                    &mut raw_stdout,
-                    source_thread_id,
-                )
-                .await
-                {
-                    eprintln!(
-                        "[codex] failed to archive source thread after fork session={} source_thread={}: {error}",
-                        session.id, source_thread_id,
-                    );
-                }
-                resp
-            }
-            Err(error) => {
-                eprintln!(
-                    "[codex] thread/fork failed, falling back to thread/start with migrated context: {error}"
-                );
-                state.set_provider_session_ref(&session.id, None).await;
-                state.set_codex_provider_name(&session.id, None).await;
-                state.set_codex_model(&session.id, None).await;
-                let fallback_developer_instructions = combine_developer_instructions(
-                    base_developer_instructions.clone(),
-                    state.list_messages(&session.id).await.and_then(|messages| {
-                        build_context_migration_instructions(&messages, input, reply)
-                    }),
-                );
-                start_codex_thread(
-                    &mut stdin,
-                    &mut next_request_id,
-                    &mut stdout_rx,
-                    &mut raw_stdout,
-                    &state,
-                    &session,
-                    &fallback_developer_instructions,
-                )
-                .await?
-            }
-        }
-    } else if let Some(thread_id) = existing_runtime_ref.as_deref() {
+    // Keep the native thread and full context on continuation. Failed resume
+    // must not silently fork or start a replacement thread.
+    let thread_response = if let Some(thread_id) = existing_runtime_ref.as_deref() {
         let resume_id = send_json_rpc_request(
             &mut stdin,
             &mut next_request_id,
             "thread/resume",
             serde_json::json!({
                 "threadId": thread_id,
+                "modelProvider": codex_provider_name,
+                "model": current_model,
                 "approvalPolicy": "on-request",
                 "approvalsReviewer": "user",
                 "sandbox": "workspace-write",
@@ -8712,54 +8782,15 @@ async fn run_codex(
             }),
         )
         .await?;
-        match wait_for_json_rpc_response(&mut stdout_rx, &mut raw_stdout, resume_id).await {
-            Ok(resp) if resp.get("error").is_none() => resp,
-            Ok(resp) => {
-                eprintln!(
-                    "[codex] thread/resume failed, falling back to thread/start: {}",
-                    resp
-                );
-                state.set_codex_provider_name(&session.id, None).await;
-                state.set_codex_model(&session.id, None).await;
-                let fallback_developer_instructions = combine_developer_instructions(
-                    base_developer_instructions.clone(),
-                    state.list_messages(&session.id).await.and_then(|messages| {
-                        build_context_migration_instructions(&messages, input, reply)
-                    }),
-                );
-                start_codex_thread(
-                    &mut stdin,
-                    &mut next_request_id,
-                    &mut stdout_rx,
-                    &mut raw_stdout,
-                    &state,
-                    &session,
-                    &fallback_developer_instructions,
-                )
-                .await?
-            }
-            Err(e) => {
-                eprintln!("[codex] thread/resume failed, falling back to thread/start: {e}");
-                state.set_codex_provider_name(&session.id, None).await;
-                state.set_codex_model(&session.id, None).await;
-                let fallback_developer_instructions = combine_developer_instructions(
-                    base_developer_instructions.clone(),
-                    state.list_messages(&session.id).await.and_then(|messages| {
-                        build_context_migration_instructions(&messages, input, reply)
-                    }),
-                );
-                start_codex_thread(
-                    &mut stdin,
-                    &mut next_request_id,
-                    &mut stdout_rx,
-                    &mut raw_stdout,
-                    &state,
-                    &session,
-                    &fallback_developer_instructions,
-                )
-                .await?
-            }
+        let response = wait_for_json_rpc_response(&mut stdout_rx, &mut raw_stdout, resume_id)
+            .await
+            .with_context(|| {
+                format!("failed to resume Codex thread {thread_id}; original session retained")
+            })?;
+        if let Some(error) = response.get("error") {
+            bail!("failed to resume Codex thread {thread_id}; original session retained: {error}");
         }
+        response
     } else {
         let developer_instructions = combine_developer_instructions(
             developer_instructions,
@@ -8790,8 +8821,13 @@ async fn run_codex(
                 .and_then(Value::as_str)
                 .map(ToString::to_string)
         })
-        .or(existing_runtime_ref)
         .context("codex app-server did not provide a thread id")?;
+    if let Some(expected) = existing_runtime_ref.as_deref() {
+        anyhow::ensure!(
+            thread_id == expected,
+            "Codex resumed an unexpected thread {thread_id} instead of {expected}; original session retained"
+        );
+    }
     state
         .set_provider_session_ref(&session.id, Some(thread_id.clone()))
         .await;
@@ -8972,6 +9008,8 @@ async fn run_codex(
     execution_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut turn_finished = false;
     let mut active_turn_id: Option<String> = None;
+    let mut steering_requests = HashMap::<u64, String>::new();
+    let mut current_reply = reply.clone();
     let mut interrupt_requested = false;
     let mut last_rendered = String::new();
     let mut background_waiting = false;
@@ -8999,6 +9037,26 @@ async fn run_codex(
 
                 let value = serde_json::from_str::<Value>(&line)
                     .unwrap_or_else(|_| serde_json::json!({ "raw_line": line }));
+                if let Some(request_id) = value.get("id").and_then(Value::as_u64)
+                    .filter(|id| is_json_rpc_response_for(&value, *id))
+                    && let Some(message_id) = steering_requests.remove(&request_id)
+                {
+                    if value.get("error").is_some() {
+                        state.fail_steered_input(&session.id, &message_id);
+                    }
+                    continue;
+                }
+                if matches!(value.get("method").and_then(Value::as_str), Some("item/started" | "item/completed"))
+                    && value.pointer("/params/item/type").and_then(Value::as_str) == Some("userMessage")
+                    && let Some(client_id) = value.pointer("/params/item/clientId")
+                        .or_else(|| value.pointer("/params/item/id")).and_then(Value::as_str)
+                    && client_id != input.id
+                    && let Some(next_reply) = state.consume_steered_input(&session.id, client_id, &current_reply.id).await
+                {
+                    current_reply = next_reply;
+                    parsed.start_input_response();
+                    last_rendered.clear();
+                }
                 if is_json_rpc_response_for(&value, mcp_status_request) {
                     if let Some(servers) = value.pointer("/result/data").filter(|v| v.is_array()) {
                         crate::mcp::record_session_runtime(&session.id, servers.clone());
@@ -9203,7 +9261,7 @@ async fn run_codex(
                 match parsed.ingest_value(&value) {
                     CodexAppServerEvent::None => {}
                     CodexAppServerEvent::Content(text) => {
-                        push_incremental_text(&state, &session.id, &reply.id, &mut last_rendered, &text).await;
+                        push_incremental_text(&state, &session.id, &current_reply.id, &mut last_rendered, &text).await;
                     }
                     CodexAppServerEvent::Status(status) => {
                         parsed.latest_status = Some(status);
@@ -9340,9 +9398,6 @@ async fn run_codex(
                         }
                     }
                     CodexAppServerEvent::TurnFailed(message) => {
-                        if message.contains("tool call output is missing") {
-                            state.set_provider_session_ref(&session.id, None).await;
-                        }
                         bail!("{message}");
                     }
                 }
@@ -9358,6 +9413,18 @@ async fn run_codex(
                 {
                     break;
                 }
+            }
+            Some(message) = steering_rx.recv(), if active_turn_id.is_some() && !turn_finished && !interrupt_requested => {
+                let request_id = send_json_rpc_request(
+                    &mut stdin, &mut next_request_id, "turn/steer",
+                    serde_json::json!({
+                        "threadId": thread_id,
+                        "expectedTurnId": active_turn_id,
+                        "clientUserMessageId": message.id,
+                        "input": codex_image_input(&message.provider_content()),
+                    }),
+                ).await?;
+                steering_requests.insert(request_id, message.id);
             }
             Some(choice) = approval_rx.recv(), if pending_approval.is_some() => {
                 let request = pending_approval
@@ -9544,13 +9611,13 @@ async fn run_codex(
     // The final item is authoritative and may not share a prefix with the last
     // commentary snapshot, so it must bypass streaming-prefix throttling.
     state
-        .emit_assistant_message_snapshot(&session.id, &reply.id, &text)
+        .emit_assistant_message_snapshot(&session.id, &current_reply.id, &text)
         .await;
 
     if turn_finished {
         stderr_task.abort();
         state
-            .finish_assistant_message(&session.id, &reply.id)
+            .finish_assistant_message(&session.id, &current_reply.id)
             .await
             .map_err(anyhow::Error::msg)?;
         return Ok(());
@@ -9574,7 +9641,7 @@ async fn run_codex(
     }
 
     state
-        .finish_assistant_message(&session.id, &reply.id)
+        .finish_assistant_message(&session.id, &current_reply.id)
         .await
         .map_err(anyhow::Error::msg)?;
     Ok(())
@@ -11553,6 +11620,14 @@ fn classify_codex_slash_command(input: &str) -> Option<CodexSlashAction<'_>> {
 }
 
 impl CodexAppServerStreamingState {
+    fn start_input_response(&mut self) {
+        self.display_blocks.clear();
+        self.assistant_blocks.clear();
+        self.partial_agent_messages.clear();
+        self.last_agent_message_delta.clear();
+        self.final_answer_received = false;
+    }
+
     fn current_status(&self) -> Option<&str> {
         self.latest_status.as_deref()
     }

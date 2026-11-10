@@ -2,6 +2,7 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock;
 
 use crate::models::{AcpServerConfig, ModelProviderConfig};
@@ -153,8 +154,10 @@ impl BridgeSettingsStore {
         F: FnOnce(&mut BridgeSettings),
     {
         let mut settings = self.settings.write().await;
-        update(&mut settings);
-        write_settings(&self.path, &settings).await?;
+        let mut next = settings.clone();
+        update(&mut next);
+        write_settings(&self.path, &next).await?;
+        *settings = next;
         Ok(settings.clone())
     }
 }
@@ -167,9 +170,28 @@ async fn write_settings(path: &PathBuf, settings: &BridgeSettings) -> Result<()>
     }
     let body =
         serde_json::to_string_pretty(settings).context("failed to encode bridge settings")?;
-    tokio::fs::write(path, body)
-        .await
-        .with_context(|| format!("failed to write bridge settings: {}", path.display()))
+    // Readers in another process must see either the previous document or the
+    // complete replacement. A failed save must leave the old file intact.
+    let temporary = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
+    let result = async {
+        let mut options = tokio::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&temporary).await?;
+        if let Ok(metadata) = tokio::fs::metadata(path).await {
+            file.set_permissions(metadata.permissions()).await?;
+        }
+        file.write_all(body.as_bytes()).await?;
+        file.sync_all().await?;
+        drop(file);
+        tokio::fs::rename(&temporary, path).await
+    }
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&temporary).await;
+    }
+    result.with_context(|| format!("failed to write bridge settings: {}", path.display()))
 }
 
 pub async fn load_settings_from_path(path: &PathBuf) -> Result<BridgeSettings> {
@@ -189,22 +211,24 @@ pub fn validate_bridge_settings(settings: &BridgeSettings) -> Result<(), String>
 pub fn settings_path() -> PathBuf {
     std::env::var("OMNI_CODE_SETTINGS_PATH")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| {
+        .unwrap_or_else(|_| data_dir().join("settings.json"))
+}
+
+/// Isolate Bridge state without changing the system home or agent credentials.
+pub fn data_dir() -> PathBuf {
+    std::env::var_os("OMNI_CODE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
             default_home_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join(".omni-code")
-                .join("settings.json")
         })
 }
 
 /// Project-scoped temporary directory (~/.omni-code/tmp/<subdir>).
 /// Cross-platform: uses the same base directory as settings.
 pub fn project_tmp_dir(subdir: &str) -> PathBuf {
-    default_home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".omni-code")
-        .join("tmp")
-        .join(subdir)
+    data_dir().join("tmp").join(subdir)
 }
 
 /// Validate a list of model provider configurations
@@ -235,6 +259,18 @@ pub fn validate_model_providers(providers: &[ModelProviderConfig]) -> Result<(),
         if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
             return Err(format!(
                 "provider {} base_url must start with http:// or https://",
+                provider.id
+            ));
+        }
+        let parsed = url::Url::parse(base_url).map_err(|_| {
+            format!(
+                "provider {} base_url must be a valid HTTP URL with a host",
+                provider.id
+            )
+        })?;
+        if parsed.host_str().is_none() {
+            return Err(format!(
+                "provider {} base_url must have a host",
                 provider.id
             ));
         }

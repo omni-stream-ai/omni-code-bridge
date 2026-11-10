@@ -11,6 +11,7 @@ publish = false
 
 [dependencies]
 omni-worktree = { path = "crates/omni-worktree" }
+omni-relay-connector = { path = "crates/omni-relay-connector", version = "0.2.0" }
 anyhow = "1.0.104"
 clap = { version = "4", features = ["derive"] }
 async-trait = "0.1"

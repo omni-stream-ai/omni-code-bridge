@@ -1,0 +1,14 @@
+{
+  "source": "https://github.com/omni-stream-ai/omni-relay",
+  "package": "omni-relay-connector",
+  "files": {
+    "Cargo.toml": "3cf0b48d77785bd64039f67904dd089abe2e5067d046cfd3a040d9250c203169",
+    "README.md": "086a26671369d54f3ee7082d0ccbbb1a6f1fe440a74d5b4582b535e4ebcfa175",
+    "src/client.rs": "879cb74495e4f315ab27de73fa27e4e23b97b01dd079f3d766a2a886e9101aae",
+    "src/connector.rs": "ec80de69421b7b43eba07f3164ff607f7a96142272f923b1c2f0206c429737cd",
+    "src/host.rs": "45e821e6c382296f0c1f4a41eaf34d17401fadb0154038e3a9d3f9d0fde2b824",
+    "src/lib.rs": "251d6cc979129aeca23f1978daa8821371f05669eb868492cf6e07889de6c5f3",
+    "src/protocol.rs": "13a2e8b255e5bdb0e13b3348728c310b76e23d0f466af1a6072ec81b7e9a9b8f",
+    "src/util.rs": "fba24b2f7ed16c65eab63e255bd41e9961bbac2b048578ef53f04ef97b0b2bb3"
+  }
+}

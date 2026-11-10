@@ -327,6 +327,10 @@ Codex receives this as `model_reasoning_effort`, Claude Code receives it as `--e
 OpenCode currently ignores the field because the headless prompt API used by the bridge does not
 expose a matching option.
 
+## Relay Remote Access
+
+Bridge can embed the Relay Connector and manage its login, service registration and lifecycle. See [setup, storage and verification](docs/relay.md).
+
 ## Client Authorization
 
 Clients register and get approved via CLI:
@@ -398,6 +402,24 @@ sh scripts/setup-git-hooks.sh
 ```
 
 Run `sh scripts/setup-git-hooks.sh` once after cloning to enable the local `commit-msg` hook.
+
+### Model API Mock Tests
+
+Use the [local model API mock](tests/fixtures/LLM_MOCK.md) to test Chat Completions,
+Responses and Anthropic Messages without a model account. It supports scripted
+tool calls, streaming, configuration changes and injected failures.
+
+```bash
+python3 -m unittest discover -s tests/fixtures -p test_llm_mock.py -v
+python3 -m unittest discover -s tests/fixtures -p test_real_codex.py -v
+cargo test model_api_ -- --nocapture
+```
+
+The integration tests require Python 3 and the real Codex CLI on PATH. They
+exercise Pi, Codex, authenticated HTTP routes, persistence, configuration races,
+tools, cancellation and network failures with isolated temporary configuration.
+Claude Code and OpenCode integrations are excluded. See the coverage matrix and
+known SDK behavior in the linked guide.
 
 ### Settings Validation
 

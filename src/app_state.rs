@@ -51,8 +51,8 @@ use crate::{
     secret_store::SecretStore,
     session_domain::{
         ActivityKind, AgentProjection, ArtifactKind, CreateTurnCommand, CreateTurnResult,
-        DomainSessionStatus, EntityState, MessagePurpose, SessionDomainEvent, SessionState,
-        TurnStatus,
+        DomainMessage, DomainSessionStatus, EntityState, MessagePurpose, SessionDomainEvent,
+        SessionState, SteerTurnCommand, SteerTurnResult, TurnStatus,
     },
     session_domain_store::{DomainStoreError, SessionDomainStore},
     session_store::project_id_for_path,
@@ -77,6 +77,7 @@ struct SessionRuntimeState {
     approval_tx: Option<mpsc::UnboundedSender<ApprovalChoice>>,
     cancel_tx: Option<mpsc::UnboundedSender<()>>,
     execution_check_tx: Option<mpsc::UnboundedSender<()>>,
+    steering_tx: Option<mpsc::UnboundedSender<DomainMessage>>,
     turn_abort: Option<AbortHandle>,
     turn_in_flight: bool,
     interrupted: bool,
@@ -161,6 +162,7 @@ impl SessionRuntimeState {
             approval_tx: None,
             cancel_tx: None,
             execution_check_tx: None,
+            steering_tx: None,
             turn_abort: None,
             turn_in_flight: false,
             interrupted: value.interrupted,
@@ -247,6 +249,7 @@ pub struct AppState {
     providers: ProviderRegistry,
     settings: BridgeSettingsStore,
     client_auth: ClientAuthStore,
+    pub(crate) relay: Option<Arc<omni_relay_connector::Host>>,
     secret_store: SecretStore,
     push: PushService,
     session_domain: Arc<SessionDomainStore>,
@@ -433,6 +436,7 @@ impl AppState {
             providers: ProviderRegistry::new(),
             settings: BridgeSettingsStore::load_from_path(settings_path).await,
             client_auth: ClientAuthStore::load().await,
+            relay: None,
             secret_store: SecretStore::load().await,
             push: PushService::new(),
             session_domain,
@@ -551,6 +555,7 @@ impl AppState {
             providers,
             settings: BridgeSettingsStore::load_from_path(settings_path).await,
             client_auth: ClientAuthStore::load().await,
+            relay: None,
             secret_store: SecretStore::load().await,
             push: PushService::new(),
             session_domain,
@@ -667,6 +672,7 @@ impl AppState {
             providers: ProviderRegistry::new(),
             settings: BridgeSettingsStore::load_from_path_strict(settings_path).await?,
             client_auth: ClientAuthStore::load().await,
+            relay: None,
             secret_store: SecretStore::load().await,
             push: PushService::new(),
             session_domain,
@@ -691,6 +697,9 @@ impl AppState {
     }
 
     pub async fn is_runtime_client_id_allowed(&self, client_id: &str) -> bool {
+        if client_id == omni_relay_connector::UPSTREAM_CLIENT_ID {
+            return self.relay.as_ref().is_some_and(|relay| relay.enabled());
+        }
         self.client_auth.has_approved_client_id(client_id).await
     }
 
@@ -791,6 +800,12 @@ impl AppState {
     }
 
     pub async fn client_token_matches(&self, client_id: &str, token: &str) -> bool {
+        if client_id == omni_relay_connector::UPSTREAM_CLIENT_ID {
+            return self
+                .relay
+                .as_ref()
+                .is_some_and(|relay| relay.authenticates(token));
+        }
         self.client_auth.token_matches(client_id, token).await
     }
 
@@ -828,6 +843,11 @@ impl AppState {
 
     pub async fn get_client_auth_request(&self, request_id: &str) -> Option<ClientAuthRecord> {
         self.client_auth.get(request_id).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn clear_push_devices_for_test(&self) {
+        self.devices.write().await.clear();
     }
 
     #[cfg(test)]
@@ -1178,7 +1198,9 @@ impl AppState {
         let Some(session) = self.find_session(session_id).await else {
             return None;
         };
-        let provider_messages = if let Some(provider) = self.provider_for_agent(session.agent) {
+        let provider_messages = if session.agent == AgentKind::Pi {
+            self.pi_transcript_messages(session_id).await
+        } else if let Some(provider) = self.provider_for_agent(session.agent) {
             let mut provider_session_ids = vec![session_id.to_string()];
             provider_session_ids.extend(self.provider_session_ref_chain(session_id).await);
             let mut combined = Vec::new();
@@ -1219,6 +1241,70 @@ impl AppState {
         Some(sort_messages(messages))
     }
 
+    async fn pi_transcript_messages(&self, session_id: &str) -> Option<Vec<ChatMessage>> {
+        use pi::{
+            model::{ContentBlock, UserContent},
+            session::{Session, SessionEntry, SessionMessage},
+        };
+        let path = self.pi_session_path(session_id);
+        let transcript = Session::open(path.to_str()?).await.ok()?;
+        let text = |blocks: &[ContentBlock]| {
+            blocks
+                .iter()
+                .filter_map(|block| {
+                    if let ContentBlock::Text(text) = block {
+                        Some(text.text.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        Some(
+            transcript
+                .entries_for_current_path()
+                .into_iter()
+                .filter_map(|entry| {
+                    let SessionEntry::Message(entry) = entry else {
+                        return None;
+                    };
+                    let (role, content) = match &entry.message {
+                        SessionMessage::User { content, .. } => (
+                            MessageRole::User,
+                            match content {
+                                UserContent::Text(text) => text.clone(),
+                                UserContent::Blocks(blocks) => text(blocks),
+                            },
+                        ),
+                        SessionMessage::Assistant { message } => {
+                            (MessageRole::Assistant, text(&message.content))
+                        }
+                        SessionMessage::ToolResult {
+                            tool_name, content, ..
+                        } => (
+                            MessageRole::System,
+                            format!("[tool:{tool_name}:output] {}", text(content)),
+                        ),
+                        _ => return None,
+                    };
+                    if content.trim().is_empty() {
+                        return None;
+                    }
+                    Some(ChatMessage {
+                        id: format!("pi-entry-{}", entry.base.id.as_ref()?),
+                        session_id: session_id.into(),
+                        role,
+                        content,
+                        created_at: DateTime::parse_from_rfc3339(&entry.base.timestamp)
+                            .ok()?
+                            .with_timezone(&Utc),
+                    })
+                })
+                .collect(),
+        )
+    }
+
     fn failed_domain_user_message_ids(&self, session_id: &str) -> HashSet<String> {
         self.session_domain
             .session_state(session_id)
@@ -1247,7 +1333,10 @@ impl AppState {
                     .position(|message| message.id == message_id)?;
                 Some(
                     messages[reply_index].content.trim().is_empty()
-                        && messages.len() == reply_index + 1,
+                        // Provider status/retry notices are not model progress.
+                        && messages[reply_index + 1..]
+                            .iter()
+                            .all(|message| matches!(message.role, MessageRole::System)),
                 )
             })
             .unwrap_or(false);
@@ -1292,7 +1381,7 @@ impl AppState {
             .lock()
             .await
             .get(session_id)
-            .is_some_and(|runtime| runtime.pending_approval.is_none())
+            .is_some_and(|runtime| runtime.pending_approval.is_none() && !runtime.interrupted)
     }
 
     pub async fn get_session(&self, session_id: &str) -> Option<SessionDetail> {
@@ -1429,6 +1518,7 @@ impl AppState {
                 approval_tx: None,
                 cancel_tx: None,
                 execution_check_tx: None,
+                steering_tx: None,
                 turn_abort: None,
                 turn_in_flight: false,
                 interrupted: false,
@@ -1607,21 +1697,22 @@ impl AppState {
                 .needs_legacy_history_reimport(session_id)?
         {
             if state.session.active_turn_id.is_none()
-                && state
-                    .turns
-                    .iter()
-                    .all(|turn| turn.id.starts_with("imported-turn-"))
+                && (matches!(state.session.agent, AgentKind::Codex | AgentKind::Pi)
+                    || state
+                        .turns
+                        .iter()
+                        .all(|turn| turn.id.starts_with("imported-turn-")))
                 && let Some(messages) = self.list_messages(session_id).await
             {
                 self.session_domain
                     .import_message_history(session_id, &messages)?;
-            } else if state.session.agent == AgentKind::Codex
-                && state.session.status == DomainSessionStatus::Idle
-                && let Some(messages) = self.list_messages(session_id).await
-                && completed_codex_history_is_ready(&state, &messages)
-            {
-                self.session_domain
-                    .refresh_completed_assistant_history(session_id, &messages)?;
+                if state.session.agent == AgentKind::Codex
+                    && state.session.status == DomainSessionStatus::Idle
+                    && completed_codex_history_is_ready(&state, &messages)
+                {
+                    self.session_domain
+                        .refresh_completed_assistant_history(session_id, &messages)?;
+                }
             }
             let diffs = self
                 .session_diffs
@@ -1725,6 +1816,139 @@ impl AppState {
             .map_err(DomainStoreError::Storage)?
             .ok_or_else(|| DomainStoreError::NotFound("session not found".to_string()))?;
         self.session_domain.create_turn(session_id, command)
+    }
+
+    pub async fn steer_domain_turn(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        command: &SteerTurnCommand,
+    ) -> Result<Option<SteerTurnResult>, DomainStoreError> {
+        let snapshot = self
+            .session_domain
+            .session_state(session_id)?
+            .ok_or_else(|| DomainStoreError::NotFound("session not found".into()))?;
+        if snapshot.session.agent != AgentKind::Codex {
+            return Ok(None);
+        }
+        let runtime = self.runtime.lock().await;
+        let sender = runtime
+            .get(session_id)
+            .filter(|entry| entry.current_turn_id.as_deref() == Some(turn_id))
+            .and_then(|entry| entry.steering_tx.as_ref());
+        let Some(sender) = sender else {
+            return Err(DomainStoreError::Conflict(
+                "the active runtime is not ready for additional input".into(),
+            ));
+        };
+        let result = self
+            .session_domain
+            .enqueue_turn_input(session_id, turn_id, command)?;
+        if result.created && sender.send(result.message.clone()).is_err() {
+            let _ = self.session_domain.project_agent_event(
+                session_id,
+                turn_id,
+                AgentProjection::UserInputState {
+                    message_id: result.message.id.clone(),
+                    state: EntityState::Failed,
+                },
+            );
+        }
+        Ok(Some(result))
+    }
+
+    pub async fn set_steering_sender(
+        &self,
+        session_id: &str,
+        sender: mpsc::UnboundedSender<DomainMessage>,
+    ) {
+        let mut runtime = self.runtime.lock().await;
+        let entry = runtime.entry(session_id.to_string()).or_default();
+        if DOMAIN_TURN_ID.try_with(Clone::clone).ok().as_deref() == entry.current_turn_id.as_deref()
+        {
+            entry.steering_tx = Some(sender);
+        }
+    }
+
+    pub fn fail_steered_input(&self, session_id: &str, message_id: &str) {
+        self.project_agent_event(
+            session_id,
+            AgentProjection::UserInputState {
+                message_id: message_id.to_string(),
+                state: EntityState::Failed,
+            },
+        );
+    }
+
+    pub async fn consume_steered_input(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        reply_id: &str,
+    ) -> Option<ChatMessage> {
+        let snapshot = self.session_domain.session_state(session_id).ok()??;
+        let turn_id = snapshot.session.active_turn_id.as_deref()?;
+        let message = snapshot
+            .turns
+            .iter()
+            .find(|turn| turn.id == turn_id)?
+            .segments
+            .iter()
+            .filter_map(|segment| segment.message.as_ref())
+            .find(|message| {
+                message.id == message_id
+                    && message.purpose == MessagePurpose::User
+                    && message.state == EntityState::Pending
+            })?
+            .clone();
+        let prior_reply = self
+            .messages
+            .read()
+            .await
+            .get(session_id)?
+            .iter()
+            .find(|message| message.id == reply_id)
+            .cloned();
+        if let Some(prior) = prior_reply.filter(|message| !message.content.trim().is_empty()) {
+            self.try_project_agent_event(
+                session_id,
+                AgentProjection::AssistantMessage {
+                    message_id: prior.id.clone(),
+                    purpose: MessagePurpose::Commentary,
+                    state: EntityState::Completed,
+                    content: prior.content.clone(),
+                },
+            )
+            .ok()?;
+            self.publish_event(SessionEvent::MessageCreated(prior));
+        }
+        self.try_project_agent_event(
+            session_id,
+            AgentProjection::UserInputState {
+                message_id: message.id.clone(),
+                state: EntityState::Completed,
+            },
+        )
+        .ok()?;
+        let user = ChatMessage {
+            id: message.id.clone(),
+            session_id: session_id.to_string(),
+            role: MessageRole::User,
+            content: message.provider_content(),
+            created_at: Utc::now(),
+        };
+        self.push_message(user.clone()).await;
+        self.publish_event(SessionEvent::MessageCreated(user));
+        let reply = ChatMessage {
+            id: Uuid::new_v4().to_string(),
+            session_id: session_id.to_string(),
+            role: MessageRole::Assistant,
+            content: String::new(),
+            created_at: Utc::now(),
+        };
+        self.push_message(reply.clone()).await;
+        self.publish_event(SessionEvent::MessageCreated(reply.clone()));
+        Some(reply)
     }
 
     pub async fn mark_domain_session_read(&self, session_id: &str) -> Result<(), String> {
@@ -2517,6 +2741,7 @@ impl AppState {
             let abort_handle = entry.turn_abort.take();
             let cancel_tx = entry.cancel_tx.take();
             entry.execution_check_tx = None;
+            entry.steering_tx = None;
             let had_active_turn = entry.turn_in_flight || abort_handle.is_some();
             let had_detached_running = Self::is_detached_running(entry);
             let should_interrupt = had_active_turn
@@ -3374,6 +3599,7 @@ impl AppState {
                 entry.turn_abort = None;
                 entry.cancel_tx = None;
                 entry.execution_check_tx = None;
+                entry.steering_tx = None;
                 entry.current_turn_id = None;
             }
         })
@@ -4877,19 +5103,11 @@ async fn load_persisted_session_metadata(path: &PathBuf) -> PersistedSessionMeta
 }
 
 fn runtime_store_path() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".omni-code")
-        .join("session-runtime.json")
+    crate::bridge_settings::data_dir().join("session-runtime.json")
 }
 
 fn session_metadata_store_path() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".omni-code")
-        .join("session-metadata.json")
+    crate::bridge_settings::data_dir().join("session-metadata.json")
 }
 
 fn approval_choice_preview(choice: &ApprovalChoice) -> &'static str {
