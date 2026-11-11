@@ -1205,7 +1205,16 @@ impl SessionDomainStore {
                     segment.state = state;
                     segment.updated_at = now;
                     let revision = message.revision;
-                    turn.segments.push(segment);
+                    // Updates may follow execution activity, but must stay before
+                    // user input that the runtime consumed after this reply.
+                    let boundary = turn.segments[index..]
+                        .iter()
+                        .position(|next| {
+                            next.kind == SegmentKind::UserMessage
+                                && next.state == EntityState::Completed
+                        })
+                        .map_or(turn.segments.len(), |offset| index + offset);
+                    turn.segments.insert(boundary, segment);
                     for (index, segment) in turn.segments.iter_mut().enumerate() {
                         segment.sequence = index as i64 + 1;
                     }
@@ -1238,13 +1247,6 @@ impl SessionDomainStore {
                     });
                     1
                 };
-                if purpose == MessagePurpose::Final && state == EntityState::Completed {
-                    turn.final_assistant_message_id = turn
-                        .segments
-                        .last()
-                        .and_then(|segment| segment.message.as_ref())
-                        .map(|message| message.id.clone());
-                }
                 ("message.updated", Some(message_id), Some(revision))
             }
             AgentProjection::Activity {
@@ -3243,6 +3245,83 @@ mod tests {
         assert!(error.contains("turn mismatch"));
         let state = store.session_state("session-late").unwrap().unwrap();
         assert!(state.turns[1].segments.is_empty());
+    }
+
+    #[test]
+    fn assistant_updates_never_cross_consumed_user_input() {
+        let store = test_store();
+        store.ensure_session(&session("input-order")).unwrap();
+        let command = serde_json::from_value(json!({
+            "command_id":"start", "turn_id":"active", "user_message_id":"original",
+            "content":"original request", "input_mode":"text"
+        }))
+        .unwrap();
+        store.create_turn("input-order", &command).unwrap();
+        let project_reply = |id: &str, state, content: &str| {
+            store
+                .project_agent_event(
+                    "input-order",
+                    "active",
+                    AgentProjection::AssistantMessage {
+                        message_id: id.into(),
+                        purpose: MessagePurpose::Commentary,
+                        state,
+                        content: content.into(),
+                    },
+                )
+                .unwrap();
+        };
+        project_reply("original-reply", EntityState::Running, "Working");
+        store
+            .enqueue_turn_input(
+                "input-order",
+                "active",
+                &SteerTurnCommand {
+                    command_id: "append".into(),
+                    user_message_id: "follow-up".into(),
+                    content: "additional instructions".into(),
+                    attachments: vec![],
+                },
+            )
+            .unwrap();
+        project_reply("original-reply", EntityState::Running, "Still working");
+        store
+            .project_agent_event(
+                "input-order",
+                "active",
+                AgentProjection::UserInputState {
+                    message_id: "follow-up".into(),
+                    state: EntityState::Completed,
+                },
+            )
+            .unwrap();
+        project_reply("follow-up-reply", EntityState::Running, "Following up");
+        // Completion of the earlier stream can arrive after runtime consumption.
+        project_reply(
+            "original-reply",
+            EntityState::Completed,
+            "Original complete",
+        );
+        let state = store.session_state("input-order").unwrap().unwrap();
+        let segments = &state.turns[0].segments;
+        assert_eq!(
+            segments
+                .iter()
+                .map(|segment| segment.message.as_ref().unwrap().id.as_str())
+                .collect::<Vec<_>>(),
+            ["original-reply", "follow-up", "follow-up-reply"]
+        );
+        assert_eq!(
+            segments
+                .iter()
+                .map(|segment| segment.sequence)
+                .collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        assert_eq!(
+            segments[0].message.as_ref().unwrap().content,
+            "Original complete"
+        );
     }
 
     #[test]
