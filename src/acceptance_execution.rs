@@ -75,6 +75,9 @@ impl AcceptanceStore {
         requirements: &str,
     ) -> Result<Value> {
         let run = self.snapshot(id).await?;
+        if let Some(startup) = &run.startup {
+            self.check_runtime_dependencies(id, startup).await?;
+        }
         let runtime_observation = self.observe_runtime_environment(id).await?;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20 * 60);
         let mut results = Vec::<Value>::new();

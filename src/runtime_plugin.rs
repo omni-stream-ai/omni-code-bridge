@@ -378,6 +378,31 @@ pub fn path_str(path: &Path) -> Result<&str> {
     path.to_str().context("path is not valid UTF-8")
 }
 
+pub(crate) fn state_write_failure(
+    operation: &str,
+    previous: Option<&str>,
+    error: &anyhow::Error,
+) -> String {
+    let details = format!("{error:#}");
+    let previous = previous.filter(|message| !message.is_empty());
+    let diagnostic = format!("{}\n{details}", previous.unwrap_or_default()).to_lowercase();
+    let hint = if error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::StorageFull)
+    }) || diagnostic.contains("no space left on device")
+        || diagnostic.contains("enospc")
+    {
+        "磁盘空间不足，请释放 Bridge 数据目录及 Docker 所在磁盘的空间后重试。"
+    } else {
+        ""
+    };
+    let previous = previous
+        .map(|message| format!("\n此前错误：{message}"))
+        .unwrap_or_default();
+    format!("{operation}失败。{hint}{previous}\n详细原因：{details}")
+}
+
 /// Atomic replacement with file and directory sync for crash recovery.
 pub fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
     use std::io::Write;

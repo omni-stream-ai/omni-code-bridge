@@ -3458,7 +3458,7 @@ export default function init(pi) {
 
     #[tokio::test]
     async fn stub_provider_completes_when_called_directly() {
-        let state = Arc::new(AppState::new().await);
+        let state = Arc::new(test_state("stub-provider-direct").await);
         let provider = StubProvider::new(AgentKind::Custom);
         let session = SessionSummary {
             id: "stub-session".to_string(),

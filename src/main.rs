@@ -171,6 +171,10 @@ async fn serve(port: u16, debug: bool, pi_request_timeout: u64) -> Result<()> {
     pi::http::client::set_request_timeout_override(pi_request_timeout);
     logging::init(debug);
     let relay = relay::host(port)?;
+    // Reserve the port before startup recovery can modify persisted turns.
+    // A duplicate server must fail without interrupting the running server.
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let listener = tokio::net::TcpListener::bind(addr).await?;
     let mut state = AppState::new_strict().await?;
     state.relay = Some(relay.clone());
     let state = Arc::new(state);
@@ -182,8 +186,6 @@ async fn serve(port: u16, debug: bool, pi_request_timeout: u64) -> Result<()> {
         .await;
     let app = router(Arc::clone(&state));
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    let listener = tokio::net::TcpListener::bind(addr).await?;
     relay.resume().await?;
 
     println!("Omni Code bridge listening on http://{addr}");

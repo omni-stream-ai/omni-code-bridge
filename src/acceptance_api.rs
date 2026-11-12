@@ -96,6 +96,10 @@ struct SaveEnvironment {
     #[serde(default)]
     build: Option<crate::project_detection::BuildConfiguration>,
     #[serde(default)]
+    build_targets: Vec<crate::project_detection::BuildTarget>,
+    #[serde(default)]
+    build_reasoning: String,
+    #[serde(default)]
     mode: EnvironmentMode,
     #[serde(default)]
     dockerfile: String,
@@ -115,6 +119,8 @@ async fn save_project_environment(
     require_project(&state, &project_id).await?;
     let config = EnvironmentConfig {
         build: input.build,
+        build_targets: input.build_targets,
+        build_reasoning: input.build_reasoning,
         mode: input.mode,
         dockerfile: input.dockerfile,
         image: input.image,
@@ -136,6 +142,14 @@ struct DetectEnvironment {
     agent: bool,
     #[serde(default)]
     current: crate::project_detection::BuildConfiguration,
+    #[serde(default)]
+    target_directory: Option<String>,
+    #[serde(default)]
+    requirements: String,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    current_targets: Vec<crate::project_detection::BuildTarget>,
 }
 async fn detect_project_environment(
     State(state): State<Arc<AppState>>,
@@ -151,16 +165,37 @@ async fn detect_project_environment(
     input.current.validate().map_err(operation_error)?;
     let root = std::path::Path::new(&project.root_path);
     let mut detection = crate::project_detection::detect(root);
+    if let Some(directory) = &input.target_directory {
+        let candidate = detection
+            .candidates
+            .iter()
+            .find(|candidate| candidate.directory == *directory)
+            .ok_or_else(|| bad_request("验收目标未在识别结果中找到，请刷新后重试"))?;
+        detection.configuration = candidate.configuration.clone();
+    }
     if input.agent {
-        detection.configuration = crate::project_detection::identify_with_agent(
+        let identified = crate::project_detection::identify_with_agent(
             &state,
             &project_id,
             root,
             &input.current,
             &detection,
+            input.target_directory.as_deref(),
+            &crate::project_detection::IdentificationContext {
+                requirements: input.requirements,
+                session_id: input.session_id,
+                current_targets: input.current_targets,
+            },
         )
         .await
         .map_err(operation_error)?;
+        detection.configuration = identified
+            .targets
+            .first()
+            .map(|target| target.configuration.clone())
+            .unwrap_or_default();
+        detection.targets = identified.targets;
+        detection.reasoning = identified.reasoning;
     }
     Ok(Json(ApiResponse { data: detection }))
 }
@@ -735,6 +770,56 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn run_responses_show_unsaved_failure_instead_of_stale_build_progress() {
+        let fixture = crate::acceptance_test_support::Fixture::new().await;
+        let cached = fixture.state.acceptance.get(&fixture.id).await.unwrap();
+        let path = fixture
+            .state
+            .runtime_plugins
+            .root
+            .join("runs")
+            .join(&fixture.id)
+            .join("run.json");
+        {
+            let mut run = cached.lock().await;
+            run.phase = crate::acceptance::RunPhase::Starting;
+            run.automation_progress = "正在构建项目环境".into();
+            crate::runtime_plugin::atomic_json(&path, &*run).unwrap();
+            run.phase = crate::acceptance::RunPhase::Failed;
+            run.automation = crate::acceptance::AutomationPhase::Failed;
+            run.automation_progress = "验收状态保存失败".into();
+            run.error = Some("磁盘空间不足：No space left on device (os error 28)".into());
+        }
+        let (origin, server) = fixture.server().await;
+        let client = reqwest::Client::new();
+        for suffix in [format!("/{}", fixture.id), String::new()] {
+            let response = client
+                .get(format!("{origin}/v2/acceptance{suffix}"))
+                .headers(fixture.headers.clone())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: Value = response.json().await.unwrap();
+            let run = if suffix.is_empty() {
+                &body["data"][0]
+            } else {
+                &body["data"]
+            };
+            assert_eq!(run["phase"], "failed");
+            assert_eq!(run["automation"], "failed");
+            assert!(
+                run["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("No space left on device")
+            );
+            assert_eq!(run["automation_progress"], "验收状态保存失败");
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn run_responses_project_live_internal_approvals_without_persisting_them() {
         let fixture = crate::acceptance_test_support::Fixture::new().await;
         let request: crate::models::ApprovalRequest = serde_json::from_value(json!({
@@ -772,7 +857,7 @@ mod tests {
         crate::runtime_plugin::atomic_json(&path, &run).unwrap();
         // Populate the cache before snapshot recovery can interpret this as a restart.
         let cached = fixture.state.acceptance.get(&fixture.id).await.unwrap();
-        cached.lock().await.phase = crate::acceptance::RunPhase::Starting;
+        *cached.lock().await = run.clone();
         crate::runtime_plugin::atomic_json(&path, &run).unwrap();
         let Json(response) = get_run(
             State(Arc::clone(&fixture.state)),
@@ -994,6 +1079,121 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn build_detection_exposes_targets_and_validates_explicit_selection() {
+        let fixture = crate::acceptance_test_support::Fixture::new().await;
+        let root = fixture.root.join("multi-project");
+        for (directory, manifest, content) in [
+            (
+                "client",
+                "pubspec.yaml",
+                "dependencies:\n  flutter:\n    sdk: flutter",
+            ),
+            (
+                "bridge",
+                "Cargo.toml",
+                "[package]\nname = 'bridge'\nversion = '0.1.0'",
+            ),
+        ] {
+            std::fs::create_dir_all(root.join(directory)).unwrap();
+            std::fs::write(root.join(directory).join(manifest), content).unwrap();
+        }
+        let project = fixture
+            .state
+            .create_project(crate::models::CreateProjectInput {
+                name: "Multiple targets".into(),
+                root_path: root.to_string_lossy().into_owned(),
+            })
+            .await;
+        let (origin, server) = fixture.server().await;
+        let client = reqwest::Client::new();
+        let url = format!("{origin}/v2/projects/{}/acceptance-environment", project.id);
+        let detected: Value = client
+            .get(&url)
+            .headers(fixture.headers.clone())
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            detected["data"]["detection"]["configuration"]["language"],
+            ""
+        );
+        assert_eq!(
+            detected["data"]["detection"]["candidates"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        let selected: Value = client
+            .post(format!("{url}/detect"))
+            .headers(fixture.headers.clone())
+            .json(&json!({"target_directory": "client"}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(selected["data"]["configuration"]["language"], "flutter");
+        assert_eq!(
+            selected["data"]["configuration"]["install_command"],
+            "cd 'client' && flutter pub get"
+        );
+        assert!(
+            fixture
+                .state
+                .acceptance
+                .environments
+                .config(&project.id)
+                .unwrap()
+                .build
+                .is_none()
+        );
+        let targets = json!([
+            {"directory":"client","role":"客户端","reason":"展示登录结果",
+             "configuration":{"language":"flutter","package_manager":"flutter pub","install_command":"","build_command":"cd 'client' && custom-build","start_command":"","artifact_directory":""}},
+            {"directory":"bridge","role":"后端服务","reason":"提供登录 API",
+             "configuration":{"language":"rust","package_manager":"cargo","install_command":"","build_command":"cd 'bridge' && cargo build","start_command":"cd 'bridge' && ./api","artifact_directory":""}}
+        ]);
+        let saved = client
+            .post(&url)
+            .headers(fixture.headers.clone())
+            .json(&json!({"build_targets": targets, "build_reasoning": "登录前后端联动"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(saved.status(), StatusCode::OK);
+        let restored: Value = client
+            .get(&url)
+            .headers(fixture.headers.clone())
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(restored["data"]["config"]["build_targets"], targets);
+        assert_eq!(
+            restored["data"]["config"]["build_reasoning"],
+            "登录前后端联动"
+        );
+        for invalid in ["../outside", "client/../bridge", "missing"] {
+            let response = client
+                .post(format!("{url}/detect"))
+                .headers(fixture.headers.clone())
+                .json(&json!({"agent": true, "target_directory": invalid}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
         server.abort();
     }
 
