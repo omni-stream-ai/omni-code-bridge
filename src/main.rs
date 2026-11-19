@@ -25,8 +25,11 @@ mod message_projection;
 mod metadata_persistence;
 mod models;
 mod pi_plugin_store;
+mod pi_approval;
 mod project_detection;
 mod project_environment;
+mod project_icon;
+mod project_runtime;
 mod push;
 mod relay;
 mod runtime_plugin;
@@ -35,6 +38,7 @@ mod session_domain;
 mod session_domain_store;
 mod session_store;
 mod session_trace;
+mod workspace_agent;
 
 use std::{future::IntoFuture, net::SocketAddr, path::PathBuf, sync::Arc};
 
@@ -45,7 +49,11 @@ use clap::{Parser, Subcommand};
 use tower_http::cors::{Any, CorsLayer};
 
 #[derive(Parser)]
-#[command(name = "omni-code-bridge", about = "Omni Code bridge CLI and server")]
+#[command(
+    name = "omni-code-bridge",
+    version,
+    about = "Omni Code bridge CLI and server"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -60,6 +68,8 @@ enum Command {
     },
     /// Manage Git worktrees, dependency sharing, and merge cleanup
     Worktree(omni_worktree::cli::WorktreeArgs),
+    /// Inspect and lease project runtimes from an Agent session
+    ProjectRuntime(project_runtime::agent::Args),
     /// Start the HTTP bridge server (default)
     Serve {
         #[arg(long, default_value = "8787")]
@@ -140,6 +150,7 @@ async fn run() -> Result<()> {
             omni_relay_connector::host_cli(relay::host(8787)?.as_ref(), &arguments).await
         }
         Some(Command::Worktree(args)) => omni_worktree::cli::run(args),
+        Some(Command::ProjectRuntime(args)) => project_runtime::agent::run(args).await,
         Some(Command::ClaudePermissionHook {
             state_dir,
             session_id,
@@ -179,6 +190,7 @@ async fn serve(port: u16, debug: bool, pi_request_timeout: u64) -> Result<()> {
     state.relay = Some(relay.clone());
     let state = Arc::new(state);
     state.start_metadata_writer();
+    workspace_agent::dispatch::start(&state);
     state.acceptance.start_maintenance();
     state
         .acceptance
@@ -352,4 +364,19 @@ fn router(state: Arc<AppState>) -> Router {
                 .allow_methods(Any)
                 .allow_headers(Any),
         )
+}
+
+#[cfg(test)]
+mod cli_version_tests {
+    use super::Cli;
+    use clap::{Parser, error::ErrorKind};
+
+    #[test]
+    fn compiled_bridge_version_is_available_without_starting_a_service() {
+        let error = Cli::try_parse_from(["omni-code-bridge", "--version"])
+            .err()
+            .expect("version flag should exit before running the server");
+        assert_eq!(error.kind(), ErrorKind::DisplayVersion);
+        assert!(error.to_string().contains(env!("CARGO_PKG_VERSION")));
+    }
 }

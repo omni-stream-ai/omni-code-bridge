@@ -173,6 +173,15 @@ pub struct HeaderKeyValue {
     pub value: String,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalMode {
+    Manual,
+    #[default]
+    Smart,
+    Auto,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionStatus {
@@ -200,6 +209,8 @@ pub struct SessionSummary {
     pub agent: AgentKind,
     #[serde(default)]
     pub brief_reply_mode: bool,
+    #[serde(default)]
+    pub approval_mode: ApprovalMode,
     pub status: SessionStatus,
     pub updated_at: DateTime<Utc>,
     pub unread_count: u32,
@@ -318,6 +329,8 @@ pub struct CreateSessionInput {
     pub agent: AgentKind,
     #[serde(default)]
     pub brief_reply_mode: bool,
+    #[serde(default)]
+    pub approval_mode: Option<ApprovalMode>,
     /// Default provider for this session.
     /// Omit to avoid bridge-side provider resolution; use "AUTO" to enable auto-selection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -332,6 +345,8 @@ pub struct CreateSessionInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateSessionInput {
+    #[serde(default)]
+    pub approval_mode: Option<ApprovalMode>,
     #[serde(default)]
     pub profile_id: Option<String>,
     /// Update the session-level provider selection.
@@ -404,6 +419,8 @@ where
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectSummary {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon_data_uri: Option<String>,
     pub id: String,
     pub name: String,
     pub root_path: String,
@@ -931,4 +948,6 @@ pub struct AgentCommandsSummary {
 pub struct AgentCommandsQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
 }

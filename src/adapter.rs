@@ -251,6 +251,12 @@ pub trait AgentProvider: Send + Sync {
         None
     }
 
+    /// A revision of the transcript itself, independent of title/catalog time.
+    /// None means consumers must read the messages before declaring a cache hit.
+    async fn message_revision(&self, _session_id: &str) -> Option<String> {
+        None
+    }
+
     async fn default_runtime_ref(&self, _session_id: &str) -> Option<String> {
         None
     }
@@ -386,6 +392,7 @@ async fn list_acp_sessions(
                     title,
                     agent: AgentKind::Acp,
                     brief_reply_mode: false,
+                    approval_mode: Default::default(),
                     status: crate::models::SessionStatus::Idle,
                     updated_at: chrono::Utc::now(),
                     unread_count: 0,
@@ -1089,6 +1096,9 @@ impl AgentProvider for PiAgentProvider {
             no_session: false,
             session_path: Some(pi_session_path),
             extension_paths,
+            tool_factory: Some(Arc::new(crate::pi_approval::ApprovalToolFactory {
+                state: state.clone(), session_id: session.id.clone(),
+            })),
             extension_ui_handler: Some(Arc::new(BridgePiExtensionUiHandler {
                 state: Arc::clone(&state),
                 session_id: session.id.clone(),
@@ -1854,6 +1864,7 @@ export default function init(pi) {
                 title: Some("Pi Extension E2E".to_string()),
                 agent: AgentKind::Pi,
                 brief_reply_mode: false,
+                approval_mode: Default::default(),
                 provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                 reasoning_effort: None,
                 model: None,
@@ -2975,6 +2986,94 @@ export default function init(pi) {
     }
 
     #[tokio::test]
+    async fn approval_modes_apply_to_live_requests_without_affecting_other_sessions() {
+        use crate::models::{ApprovalMode, CreateProjectInput, CreateSessionInput};
+        let fixture = crate::acceptance_test_support::Fixture::new().await;
+        let state = &fixture.state;
+        let project = state
+            .create_project(CreateProjectInput {
+                name: "Approval modes".into(),
+                root_path: fixture.root.to_string_lossy().into(),
+            })
+            .await;
+        let make = |id: &str| CreateSessionInput {
+            client_session_id: id.into(),
+            project_id: project.id.clone(),
+            title: None,
+            agent: AgentKind::Custom,
+            brief_reply_mode: false,
+            approval_mode: None,
+            provider_id: None,
+            reasoning_effort: None,
+            model: None,
+        };
+        let a = state.create_session(make("mode-auto")).await.unwrap();
+        let b = state.create_session(make("mode-manual")).await.unwrap();
+        state
+            .update_session_approval_mode(&a.id, ApprovalMode::Auto)
+            .await
+            .unwrap();
+        state
+            .update_session_approval_mode(&b.id, ApprovalMode::Manual)
+            .await
+            .unwrap();
+        let mut request: ApprovalRequest = serde_json::from_value(serde_json::json!({
+            "request_id":"tool", "kind":"exec_command", "command":"rm -rf /", "resolvable":true,
+            "allow_accept_for_session":false, "allow_cancel":true,
+        }))
+        .unwrap();
+        assert!(matches!(
+            auto_approve_codex_request_for_state(state, &a.id, &mut request, &fixture.root)
+                .await
+                .unwrap(),
+            Some(ApprovalChoice::Accept)
+        ));
+        request.command = Some("pwd".into());
+        assert!(
+            auto_approve_codex_request_for_state(state, &b.id, &mut request, &fixture.root)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        state
+            .update_session_approval_mode(&a.id, ApprovalMode::Smart)
+            .await
+            .unwrap();
+        assert!(matches!(
+            auto_approve_codex_request_for_state(state, &a.id, &mut request, &fixture.root)
+                .await
+                .unwrap(),
+            Some(ApprovalChoice::Accept)
+        ));
+        state
+            .update_session_approval_mode(&a.id, ApprovalMode::Auto)
+            .await
+            .unwrap();
+        request.command = None;
+        request.kind = ApprovalKind::FileChange;
+        assert!(matches!(
+            auto_approve_codex_request_for_state(state, &a.id, &mut request, &fixture.root)
+                .await
+                .unwrap(),
+            Some(ApprovalChoice::Accept)
+        ));
+        request.kind = ApprovalKind::Permissions;
+        assert!(matches!(
+            auto_approve_codex_request_for_state(state, &a.id, &mut request, &fixture.root)
+                .await
+                .unwrap(),
+            Some(ApprovalChoice::Accept)
+        ));
+        request.resolvable = false;
+        assert!(
+            auto_approve_codex_request_for_state(state, &a.id, &mut request, &fixture.root)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn confirmed_acceptance_build_bypasses_unavailable_remote_approval() {
         let fixture = crate::acceptance_test_support::Fixture::new().await;
         let sid = format!("acceptance-execution-{}", fixture.id);
@@ -3466,6 +3565,7 @@ export default function init(pi) {
             title: "Stub".to_string(),
             agent: AgentKind::Custom,
             brief_reply_mode: false,
+            approval_mode: Default::default(),
             status: SessionStatus::Running,
             updated_at: chrono::Utc::now(),
             unread_count: 0,
@@ -3518,6 +3618,7 @@ export default function init(pi) {
                 title: Some("Kiro ACP".to_string()),
                 agent: AgentKind::Acp,
                 brief_reply_mode: false,
+                approval_mode: Default::default(),
                 provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                 reasoning_effort: None,
                 model: None,
@@ -3586,6 +3687,7 @@ export default function init(pi) {
                 title: Some("Kiro ACP Cancel".to_string()),
                 agent: AgentKind::Acp,
                 brief_reply_mode: false,
+                approval_mode: Default::default(),
                 provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                 reasoning_effort: None,
                 model: None,
@@ -3640,6 +3742,7 @@ export default function init(pi) {
                 title: Some("Kiro ACP Secret Storage".to_string()),
                 agent: AgentKind::Acp,
                 brief_reply_mode: false,
+                approval_mode: Default::default(),
                 provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                 reasoning_effort: None,
                 model: None,
@@ -3700,6 +3803,7 @@ export default function init(pi) {
                 title: Some("Kiro ACP Load Fallback".to_string()),
                 agent: AgentKind::Acp,
                 brief_reply_mode: false,
+                approval_mode: Default::default(),
                 provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                 reasoning_effort: None,
                 model: None,
@@ -3801,6 +3905,7 @@ export default function init(pi) {
                 title: Some("Generic HTTP JSON".to_string()),
                 agent: AgentKind::Acp,
                 brief_reply_mode: false,
+                approval_mode: Default::default(),
                 provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                 reasoning_effort: None,
                 model: None,
@@ -3936,6 +4041,7 @@ data: {\"type\":\"done\"}\n\n",
                 title: Some("Generic HTTP SSE".to_string()),
                 agent: AgentKind::Acp,
                 brief_reply_mode: false,
+                approval_mode: Default::default(),
                 provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                 reasoning_effort: None,
                 model: None,
@@ -4074,6 +4180,7 @@ data: {\"type\":\"done\"}\n\n",
                 title: Some("Generic HTTP Approval".to_string()),
                 agent: AgentKind::Acp,
                 brief_reply_mode: false,
+                approval_mode: Default::default(),
                 provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                 reasoning_effort: None,
                 model: None,
@@ -4229,6 +4336,7 @@ data: {\"type\":\"done\"}\n\n",
                 title: Some("Generic HTTP Cancel".to_string()),
                 agent: AgentKind::Acp,
                 brief_reply_mode: false,
+                approval_mode: Default::default(),
                 provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                 reasoning_effort: None,
                 model: None,
@@ -4292,6 +4400,7 @@ data: {\"type\":\"done\"}\n\n",
                 title: Some("Kiro ACP Timeout".to_string()),
                 agent: AgentKind::Acp,
                 brief_reply_mode: false,
+                approval_mode: Default::default(),
                 provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                 reasoning_effort: None,
                 model: None,
@@ -4350,6 +4459,7 @@ data: {\"type\":\"done\"}\n\n",
                 title: Some("Kiro ACP Exit".to_string()),
                 agent: AgentKind::Acp,
                 brief_reply_mode: false,
+                approval_mode: Default::default(),
                 provider_id: Some(AUTO_PROVIDER_ID.to_string()),
                 reasoning_effort: None,
                 model: None,
@@ -4670,6 +4780,15 @@ import threading
 
 scenario = os.environ.get("OMNI_CODE_MOCK_CODEX_SCENARIO", "success")
 log_path = os.environ.get("OMNI_CODE_MOCK_CODEX_LOG")
+if scenario == "profile-resume":
+    import tomllib
+    config = {}
+    for index, argument in enumerate(sys.argv):
+        if argument == "-c":
+            key, value = sys.argv[index + 1].split("=", 1)
+            config[key] = tomllib.loads("value=" + value)["value"]
+    assert config.get("model_provider") == "wechat", "profile selector was not loaded"
+    assert "wechat" in config.get("model_providers", {}), "named provider was not loaded"
 turn_request_id = None
 probe_count = 0
 steer_count = 0
@@ -4815,6 +4934,7 @@ for line in sys.stdin:
                 title: Some(format!("Mock Codex {suffix}")),
                 agent: AgentKind::Codex,
                 brief_reply_mode: false,
+                approval_mode: Default::default(),
                 provider_id: None,
                 reasoning_effort: None,
                 model: None,
@@ -5210,6 +5330,66 @@ for line in sys.stdin:
             assert!(!methods.contains("thread/archive"));
             assert_eq!(methods.matches("turn/start\n").count(), 1);
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_resume_loads_the_profile_for_an_older_canonical_session() {
+        let _lock = codex_test_lock().await;
+        let mock = MockCodexEnvironment::new("profile-resume");
+        let home = PathBuf::from(std::env::var_os("CODEX_HOME").unwrap());
+        std::fs::write(
+            home.join("wechat.config.toml"),
+            r#"
+model_provider = "wechat"
+model = "fixture-model"
+[model_providers.wechat]
+name = "fixture"
+base_url = "https://example.test/v1"
+wire_api = "responses"
+"#,
+        )
+        .unwrap();
+        let state = Arc::new(test_state("profile-resume").await);
+        let session = create_mock_codex_session(&state, "profile-resume").await;
+        assert!(session.profile_id.is_none());
+        std::fs::create_dir_all(home.join("sessions")).unwrap();
+        std::fs::write(
+            home.join("sessions")
+                .join(format!("rollout-{}.jsonl", session.id)),
+            serde_json::to_string(&serde_json::json!({
+                "type":"session_meta", "payload":{"id":session.id,
+                    "cwd":std::env::temp_dir(), "model_provider":"wechat",
+                    "timestamp":"2026-11-15T00:00:00Z"}
+            }))
+            .unwrap()
+                + "\n",
+        )
+        .unwrap();
+        state
+            .set_provider_session_ref(&session.id, Some("mock-thread".into()))
+            .await;
+        assert_eq!(
+            state
+                .find_session(&session.id)
+                .await
+                .unwrap()
+                .profile_id
+                .as_deref(),
+            Some("wechat")
+        );
+        start_mock_codex_turn(&state, &session, 1).await;
+        wait_for_turn_completion(&state, &session.id).await.unwrap();
+        let detail = state.get_session(&session.id).await.unwrap();
+        assert!(matches!(detail.session.status, SessionStatus::Idle));
+        assert_eq!(
+            detail.session.runtime_session_ref.as_deref(),
+            Some("mock-thread")
+        );
+        let methods = std::fs::read_to_string(&mock.log_path).unwrap();
+        assert_eq!(methods.matches("thread/resume\n").count(), 1);
+        assert!(!methods.contains("thread/start"));
+        assert!(!methods.contains("thread/fork"));
     }
 
     #[cfg(unix)]
@@ -6714,6 +6894,7 @@ fn merge_codex_thread_list_page(archive: &mut SessionArchiveSummary, result: &Va
             title,
             agent: AgentKind::Codex,
             brief_reply_mode: false,
+            approval_mode: Default::default(),
             status,
             updated_at,
             unread_count: 0,
@@ -6742,6 +6923,7 @@ fn merge_codex_thread_list_page(archive: &mut SessionArchiveSummary, result: &Va
                 }
             })
             .or_insert_with(|| ProjectSummary {
+                icon_data_uri: None,
                 id: project_id,
                 name: Path::new(&cwd)
                     .file_name()
@@ -6890,6 +7072,26 @@ impl CodexProvider {
 
 #[async_trait]
 impl AgentProvider for CodexProvider {
+    async fn message_revision(&self, session_id: &str) -> Option<String> {
+        let path = self
+            .cache
+            .lock()
+            .ok()?
+            .as_ref()
+            .and_then(|archive| archive.session_files.get(session_id).cloned());
+        let path = match path {
+            Some(path) => path,
+            None => self
+                .ensure_archive()
+                .await
+                .session_files
+                .get(session_id)?
+                .clone(),
+        };
+        crate::session_store::file_fingerprint(&path)
+            .map(|revision| format!("{}:{revision}", path.display()))
+    }
+
     async fn catalog_revision(&self) -> Option<u64> {
         crate::session_store::session_catalog_revision()
     }
@@ -7711,25 +7913,39 @@ fn spawn_codex_app_server(cwd: &Path) -> Result<Child> {
 const CODEX_APP_SERVER_CLIENT_NAME: &str = "codex-tui";
 
 fn codex_profile_overrides(config: &toml::Table) -> Vec<String> {
-    fn visit(prefix: &str, value: &toml::Value, output: &mut Vec<String>) {
-        if let toml::Value::Table(table) = value {
-            for (key, child) in table {
-                let key = serde_json::to_string(key).expect("string serializes");
-                visit(&format!("{prefix}.{key}"), child, output);
-            }
-        } else {
-            output.push(format!("{prefix}={value}"));
+    fn inline_value(value: &toml::Value) -> String {
+        match value {
+            toml::Value::Table(table) => format!(
+                "{{{}}}",
+                table
+                    .iter()
+                    .map(|(key, value)| {
+                        format!(
+                            "{}={}",
+                            serde_json::to_string(key).expect("string serializes"),
+                            inline_value(value)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            toml::Value::Array(values) => format!(
+                "[{}]",
+                values
+                    .iter()
+                    .map(inline_value)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            value => value.to_string(),
         }
     }
-    let mut output = Vec::new();
-    for (key, value) in config {
-        visit(
-            &serde_json::to_string(key).expect("string serializes"),
-            value,
-            &mut output,
-        );
-    }
-    output
+    // Codex splits override paths on literal dots; it does not parse quoted
+    // TOML keys there. Keep nested keys inside the parsed TOML value instead.
+    config
+        .iter()
+        .map(|(key, value)| format!("{key}={}", inline_value(value)))
+        .collect()
 }
 
 fn codex_mcp_startup_grace_override(profile_config: Option<&toml::Table>) -> Option<String> {
@@ -8361,6 +8577,7 @@ impl OpenCodeHttpClient {
                     }
                 })
                 .or_insert_with(|| ProjectSummary {
+                    icon_data_uri: None,
                     id: project_id,
                     name: project_name_from_path(directory),
                     root_path: directory.to_string(),
@@ -8788,6 +9005,15 @@ async fn run_codex(
                 format!("failed to resume Codex thread {thread_id}; original session retained")
             })?;
         if let Some(error) = response.get("error") {
+            if error
+                .get("message")
+                .and_then(Value::as_str)
+                .is_some_and(|message| message.contains("already has an active writer"))
+            {
+                bail!(
+                    "原 Codex 会话正在其他窗口或进程中打开，请关闭对应会话后重试，或新建会话分析；原会话及历史已保留"
+                );
+            }
             bail!("failed to resume Codex thread {thread_id}; original session retained: {error}");
         }
         response
@@ -9952,7 +10178,18 @@ async fn run_claude_code(
                 if pending_approval.is_none() {
                     if let Some(request) = next_claude_permission_request(&state_dir, &run_id, &mut seen_permission_requests).await? {
                         let mut approval = request.as_approval_request();
-                        if let Some(choice) = auto_approve_codex_request_for_state(&state, &session.id, &mut approval, &project_root).await? {
+                        let smart = state.session_approval_mode(&session.id).await == crate::models::ApprovalMode::Smart;
+                        let remembered = if smart {
+                            let allowed = crate::claude_hook::load_always_allow_commands(&state_dir).await;
+                            approval.command.as_deref().is_some_and(|command|
+                                !ai_approval::is_hard_blocked(command, &project_root)
+                                && (crate::claude_hook::is_auto_allowed_bash_command(command, &allowed)
+                                    || approval_policy::should_auto_approve(command, &project_root).is_some()))
+                        } else { false };
+                        let choice = if remembered { Some(ApprovalChoice::Accept) } else {
+                            auto_approve_codex_request_for_state(&state, &session.id, &mut approval, &project_root).await?
+                        };
+                        if let Some(choice) = choice {
                             let mut response = response_from_choice(&choice);
                             response.request_id = approval.request_id.clone();
                             tokio::fs::write(
@@ -10140,7 +10377,7 @@ async fn run_opencode(
                     }
                     "permission.asked" => {
                         let mut request = opencode_permission_to_approval(properties);
-                        if let Some(choice) = auto_approve_opencode_request(&mut request, &project_root).await? {
+                        if let Some(choice) = auto_approve_codex_request_for_state(&state, &session.id, &mut request, &project_root).await? {
                             client.reply_permission(&request.request_id, &choice).await?;
                             state.resolve_approval(&session.id, &request.request_id, choice).await;
                         } else {
@@ -15082,6 +15319,7 @@ fn load_opencode_archive_from_db(path: &Path) -> Result<LoadedOpenCodeArchive> {
             title: title.clone(),
             agent: AgentKind::OpenCode,
             brief_reply_mode: false,
+            approval_mode: Default::default(),
             status: crate::models::SessionStatus::Idle,
             updated_at,
             unread_count: 0,
@@ -15105,6 +15343,7 @@ fn load_opencode_archive_from_db(path: &Path) -> Result<LoadedOpenCodeArchive> {
                 }
             })
             .or_insert_with(|| ProjectSummary {
+                icon_data_uri: None,
                 id: project_id,
                 name: project_name_from_path(&directory),
                 root_path: directory,
@@ -15195,6 +15434,7 @@ fn opencode_session_summary(value: &Value) -> Option<SessionSummary> {
         title: title.clone(),
         agent: AgentKind::OpenCode,
         brief_reply_mode: false,
+        approval_mode: Default::default(),
         status: crate::models::SessionStatus::Idle,
         updated_at: opencode_time(value.pointer("/time/updated")),
         unread_count: 0,
@@ -15348,17 +15588,6 @@ fn opencode_permission_to_approval(value: &Value) -> ApprovalRequest {
         allow_accept_for_session: true,
         allow_cancel: true,
         resolvable: true,
-    }
-}
-
-async fn auto_approve_opencode_request(
-    request: &mut ApprovalRequest,
-    project_root: &Path,
-) -> Result<Option<ApprovalChoice>> {
-    match auto_approve_codex_request(request, project_root, None).await? {
-        Some(ApprovalChoice::Accept) => Ok(Some(ApprovalChoice::Accept)),
-        Some(other) => Ok(Some(other)),
-        None => Ok(None),
     }
 }
 
@@ -15764,12 +15993,26 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
-async fn auto_approve_codex_request_for_state(
+pub(crate) async fn auto_approve_codex_request_for_state(
     state: &AppState,
     session_id: &str,
     request: &mut ApprovalRequest,
     project_root: &std::path::Path,
 ) -> Result<Option<ApprovalChoice>> {
+    if !request.resolvable {
+        return Ok(None);
+    }
+    // Read the live session for every request: another open session's choice
+    // and the last-used default never change an existing session's policy.
+    match state.session_approval_mode(session_id).await
+    {
+        crate::models::ApprovalMode::Manual => return Ok(None),
+        crate::models::ApprovalMode::Auto if request.resolvable => {
+            return Ok(Some(ApprovalChoice::Accept));
+        }
+        crate::models::ApprovalMode::Auto => return Ok(None),
+        crate::models::ApprovalMode::Smart => {}
+    }
     let context = state.acceptance.approval_context(session_id).await;
     if context
         .as_ref()
@@ -15784,6 +16027,17 @@ async fn auto_approve_codex_request_for_state(
                 "[approval:auto] 已确认验收范围内的常规构建或只读诊断，本地核实通过",
             )
             .await;
+        return Ok(Some(ApprovalChoice::Accept));
+    }
+    if context.is_none()
+        && matches!(
+            request.kind,
+            ApprovalKind::CommandExecution | ApprovalKind::ExecCommand
+        )
+        && request.command.as_deref().is_some_and(|command| {
+            approval_policy::should_auto_approve(command, project_root).is_some()
+        })
+    {
         return Ok(Some(ApprovalChoice::Accept));
     }
     // Approval settings belong to the active Bridge instance. Reading only the
@@ -15803,7 +16057,21 @@ async fn auto_approve_codex_request_for_state(
     }) {
         return Ok(Some(ApprovalChoice::Accept));
     }
-    auto_approve_codex_request(request, project_root, context).await
+    let decision = auto_approve_codex_request(request, project_root, context).await?;
+    // A remote review can finish after the user changes the current mode.
+    Ok(
+        match state
+            .find_session(session_id)
+            .await
+            .map(|s| s.approval_mode)
+            .unwrap_or_default()
+        {
+            crate::models::ApprovalMode::Manual => None,
+            crate::models::ApprovalMode::Auto if request.resolvable => Some(ApprovalChoice::Accept),
+            crate::models::ApprovalMode::Auto => None,
+            crate::models::ApprovalMode::Smart => decision,
+        },
+    )
 }
 
 async fn auto_approve_codex_request(
@@ -15836,14 +16104,12 @@ async fn auto_approve_codex_request(
             }
             let preferred_language = APPROVAL_LANGUAGE.try_with(Clone::clone).ok();
             let trusted_acceptance = context.is_some();
-            let decision = match ai_approval::review_request_with_context(
-                request,
-                project_root,
-                preferred_language.as_deref(),
-                context,
-            )
-            .await
-            {
+            let review = if trusted_acceptance {
+                ai_approval::review_request_with_context(request, project_root, preferred_language.as_deref(), context).await
+            } else {
+                ai_approval::review_request(request, project_root, preferred_language.as_deref()).await
+            };
+            let decision = match review {
                 Ok(decision) => decision,
                 Err(error) if trusted_acceptance => {
                     return Err(error)
@@ -16924,19 +17190,26 @@ mod profile_override_tests {
 model_provider = "work.api"
 [model_providers."work.api"]
 base_url = "https://example.test/v1"
+[projects."/tmp/project.with.dots"]
+trust_level = "trusted"
 "#
         .parse()
         .unwrap();
         let arguments = super::codex_profile_overrides(&config);
-        assert!(arguments.contains(&r#""model_provider"="work.api""#.to_string()));
-        assert!(arguments.contains(
-            &r#""model_providers"."work.api"."base_url"="https://example.test/v1""#.to_string()
-        ));
+        assert!(arguments.contains(&r#"model_provider="work.api""#.to_string()));
+        let mut restored = toml::Table::new();
         for argument in arguments {
-            argument
+            let parsed = argument
                 .parse::<toml::Table>()
                 .expect("valid TOML override");
+            let (key, _) = argument.split_once('=').unwrap();
+            assert!(
+                !key.contains(['.', '"']),
+                "Codex override key must be a plain top-level name"
+            );
+            restored.extend(parsed);
         }
+        assert_eq!(restored, config);
     }
 }
 

@@ -39,6 +39,9 @@ pub struct AiApprovalPromptInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BridgeSettings {
+    /// Last explicitly selected mode, copied only when creating a conversation.
+    #[serde(default)]
+    pub default_approval_mode: crate::models::ApprovalMode,
     pub ai_approval: AiApprovalSettings,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub project_ai_approval: BTreeMap<String, ProjectAiApprovalSettings>,
@@ -90,6 +93,7 @@ impl Default for BridgeSettings {
         Self {
             ai_approval: AiApprovalSettings::default(),
             project_ai_approval: BTreeMap::new(),
+            default_approval_mode: Default::default(),
             model_providers: Vec::new(),
             acp_servers: Vec::new(),
         }
@@ -447,6 +451,7 @@ mod tests {
             settings: tokio::sync::RwLock::new(BridgeSettings {
                 ai_approval: AiApprovalSettings::default(),
                 project_ai_approval: Default::default(),
+                default_approval_mode: Default::default(),
                 model_providers: Vec::new(),
                 acp_servers: Vec::new(),
             }),
@@ -762,6 +767,7 @@ mod tests {
         let settings = BridgeSettings {
             ai_approval: AiApprovalSettings::default(),
             project_ai_approval: Default::default(),
+            default_approval_mode: Default::default(),
             model_providers: Vec::new(),
             acp_servers: vec![
                 crate::models::AcpServerConfig {

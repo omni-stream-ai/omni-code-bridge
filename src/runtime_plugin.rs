@@ -130,13 +130,16 @@ impl RuntimePluginStore {
     /// Persist before spawning, so concurrent installs join the same operation.
     pub async fn install(self: &Arc<Self>) -> Result<PluginInstallation> {
         let _lifecycle = self.lifecycle.lock().await;
-        let mut state = self.installation.lock().await;
-        if state.is_none() {
-            *state = Some(self.read_installation()?);
+        let current = self.status().await?;
+        if current.phase.in_progress() {
+            return Ok(current);
         }
-        let current = state.as_ref().unwrap();
-        if current.phase.in_progress() || current.phase == InstallPhase::Ready {
-            return Ok(current.clone());
+        if current.phase == InstallPhase::Ready {
+            if let Some(image) = &current.image_id {
+                if self.image_available(image).await? {
+                    return Ok(current);
+                }
+            }
         }
         let value = PluginInstallation {
             phase: InstallPhase::Checking,
@@ -144,7 +147,7 @@ impl RuntimePluginStore {
             ..Default::default()
         };
         atomic_json(&self.root.join("installation.json"), &value)?;
-        *state = Some(value.clone());
+        *self.installation.lock().await = Some(value.clone());
         let store = Arc::clone(self);
         tokio::spawn(async move {
             let result = store.provision().await;
@@ -168,6 +171,47 @@ impl RuntimePluginStore {
             *state = Some(value);
         });
         Ok(value)
+    }
+
+    /// Check Docker only when preparing an approved run, never while planning.
+    /// Installation is asynchronous so API requests and run polling stay responsive.
+    pub async fn ensure_ready(self: &Arc<Self>) -> Result<String> {
+        let mut value = self.install().await?;
+        let wait = async {
+            while value.phase.in_progress() {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                value = self.status().await?;
+            }
+            if value.phase != InstallPhase::Ready {
+                bail!(
+                    "验收基础运行时恢复失败：{}",
+                    value.error.as_deref().unwrap_or("运行时尚未安装")
+                );
+            }
+            value.image_id.context("验收基础运行时缺少镜像 ID")
+        };
+        tokio::time::timeout(Duration::from_secs(4200), wait)
+            .await
+            .context("等待验收基础运行时恢复超时，请检查插件安装状态后重试")?
+    }
+
+    /// Only an explicit missing-image response is recoverable by rebuilding.
+    /// A stopped daemon, permission error or timeout must retain its actual cause.
+    async fn image_available(&self, image: &str) -> Result<bool> {
+        match self
+            .docker(&["image", "inspect", "--format", "{{.Id}}", image], 30)
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(error) => {
+                let message = format!("{error:#}").to_lowercase();
+                if message.contains("no such image:") || message.contains("no such object:") {
+                    Ok(false)
+                } else {
+                    Err(error).context("无法检查验收基础镜像，请检查 Docker 服务及访问权限")
+                }
+            }
+        }
     }
 
     pub async fn mark_uninstalled(&self) -> Result<PluginInstallation> {
@@ -206,35 +250,21 @@ impl RuntimePluginStore {
         let image = if let Some(image) = &self.config.image {
             validate_image_reference(image)?;
             if image.starts_with("sha256:") {
-                self.docker(&["image", "inspect", image], 30).await?;
+                if self.image_available(image).await? {
+                    image.clone()
+                } else if let Some(source) = &self.config.source_dir {
+                    self.build_from_source(source).await?
+                } else {
+                    bail!(
+                        "验收基础镜像 {image} 已从 Docker 删除；本地镜像 ID 无法从仓库拉取。请配置 OMNI_CODE_X11BOX_SOURCE 恢复来源，或将 OMNI_CODE_X11BOX_IMAGE 设置为 repository@sha256:digest 后重试"
+                    );
+                }
             } else {
                 self.docker(&["pull", image], 1800).await?;
+                image.clone()
             }
-            image.clone()
         } else if let Some(source) = &self.config.source_dir {
-            let source = source
-                .canonicalize()
-                .context("resolve x11box source directory")?;
-            if !source.join("src/main.rs").is_file() || !source.join("Cargo.lock").is_file() {
-                bail!("x11box source must contain src/main.rs and Cargo.lock");
-            }
-            let dockerfile = self.root.join("x11box.Dockerfile");
-            std::fs::create_dir_all(&self.root)?;
-            std::fs::write(&dockerfile, include_str!("../deploy/x11box.Dockerfile"))?;
-            let tag = format!("omni-x11box-install:{}", Uuid::new_v4().simple());
-            self.docker(
-                &[
-                    "build",
-                    "--file",
-                    path_str(&dockerfile)?,
-                    "--tag",
-                    &tag,
-                    path_str(&source)?,
-                ],
-                3600,
-            )
-            .await?;
-            tag
+            self.build_from_source(source).await?
         } else {
             bail!(
                 "Configure OMNI_CODE_X11BOX_IMAGE with an immutable image digest, or OMNI_CODE_X11BOX_SOURCE with the x11box source directory"
@@ -249,6 +279,42 @@ impl RuntimePluginStore {
         self.phase(InstallPhase::Verifying).await?;
         self.verify_image(&image_id).await?;
         Ok(image_id)
+    }
+
+    async fn build_from_source(&self, source: &Path) -> Result<String> {
+        let source = source
+            .canonicalize()
+            .context("resolve x11box source directory")?;
+        if !source.join("src/main.rs").is_file() || !source.join("Cargo.lock").is_file() {
+            bail!("x11box source must contain src/main.rs and Cargo.lock");
+        }
+        let dockerfile = self.root.join("x11box.Dockerfile");
+        std::fs::create_dir_all(&self.root)?;
+        std::fs::write(&dockerfile, include_str!("../deploy/x11box.Dockerfile"))?;
+        let tag = format!("omni-x11box-install:{}", Uuid::new_v4().simple());
+        let proxy = std::env::var("OMNI_CODE_X11BOX_BUILD_PROXY")
+            .ok()
+            .filter(|value| !value.is_empty());
+        let network = std::env::var("OMNI_CODE_X11BOX_BUILD_NETWORK")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .or_else(|| proxy.as_ref().map(|_| "host".to_owned()));
+        let args = crate::project_environment::build_arguments(
+            &[
+                "build",
+                "--progress=plain",
+                "--file",
+                path_str(&dockerfile)?,
+                "--tag",
+                &tag,
+                path_str(&source)?,
+            ],
+            network.as_deref(),
+            proxy.as_deref(),
+        )?;
+        self.docker(&args.iter().map(String::as_str).collect::<Vec<_>>(), 3600)
+            .await?;
+        Ok(tag)
     }
 
     pub(crate) async fn verify_image(&self, image: &str) -> Result<()> {
@@ -385,6 +451,13 @@ pub(crate) fn state_write_failure(
 ) -> String {
     let details = format!("{error:#}");
     let previous = previous.filter(|message| !message.is_empty());
+    if let Some(previous) = previous {
+        if previous.starts_with(&format!("{operation}失败。"))
+            && previous.ends_with(&format!("\n详细原因：{details}"))
+        {
+            return previous.to_owned();
+        }
+    }
     let diagnostic = format!("{}\n{details}", previous.unwrap_or_default()).to_lowercase();
     let hint = if error.chain().any(|cause| {
         cause
@@ -488,6 +561,19 @@ pub async fn run_bounded(program: &Path, args: &[&str], deadline: Duration) -> R
 mod tests {
     use super::*;
 
+    #[test]
+    fn repeated_state_save_failure_does_not_nest_the_same_diagnostic() {
+        let error = anyhow::Error::from(std::io::Error::from_raw_os_error(28));
+        let first = state_write_failure("保存验收状态", Some("环境构建失败"), &error);
+        let mut message = first.clone();
+        for _ in 0..30 {
+            message = state_write_failure("保存验收状态", Some(&message), &error);
+        }
+        assert_eq!(message, first);
+        assert!(message.contains("磁盘空间不足"));
+        assert!(message.contains("环境构建失败"));
+    }
+
     fn test_store() -> RuntimePluginStore {
         RuntimePluginStore::new(
             std::env::temp_dir().join(format!("runtime-plugin-{}", Uuid::new_v4())),
@@ -497,6 +583,122 @@ mod tests {
                 docker: PathBuf::from("docker"),
             },
         )
+    }
+
+    #[cfg(unix)]
+    fn docker_fixture() -> Arc<RuntimePluginStore> {
+        use std::os::unix::fs::PermissionsExt;
+        let mut store = test_store();
+        std::fs::create_dir_all(&store.root).unwrap();
+        store.config.docker = store.root.join("docker");
+        store.config.image = Some(format!("sha256:{}", "a".repeat(64)));
+        let script = r#"#!/bin/sh
+set -eu
+task_root=$(dirname "$0")
+printf '%s\n' "$*" >> "$task_root/calls"
+if [ -f "$task_root/daemon-down" ]; then
+  echo 'Cannot connect to the Docker daemon' >&2; exit 1
+fi
+case "$*" in
+  'info --format '*) echo linux;;
+  'image inspect '*)
+    case "$*" in
+      *MISSING_ID*)
+        if [ -f "$task_root/missing" ]; then
+          echo 'Error response from daemon: No such image: MISSING_ID' >&2; exit 1
+        fi
+        echo MISSING_ID;;
+      *) echo RECOVERED_ID;;
+    esac;;
+  build*) echo built;;
+  *http://127.0.0.1:14500/*) echo '<html>viewer</html>';;
+  *'x11box do screenshot'*) echo '{"ok":true}';;
+esac
+"#
+        .replace("MISSING_ID", store.config.image.as_ref().unwrap())
+        .replace("RECOVERED_ID", &format!("sha256:{}", "b".repeat(64)));
+        std::fs::write(&store.config.docker, script).unwrap();
+        std::fs::set_permissions(&store.config.docker, std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        atomic_json(
+            &store.root.join("installation.json"),
+            &PluginInstallation {
+                phase: InstallPhase::Ready,
+                image_id: store.config.image.clone(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        Arc::new(store)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ready_install_checks_docker_without_rebuilding_an_existing_image() {
+        let store = docker_fixture();
+        let result = store.install().await.unwrap();
+        assert_eq!(result.phase, InstallPhase::Ready);
+        let calls = std::fs::read_to_string(store.root.join("calls")).unwrap();
+        assert!(calls.starts_with("image inspect --format"));
+        assert_eq!(calls.lines().count(), 1);
+        std::fs::remove_dir_all(&store.root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn missing_ready_image_is_rebuilt_once_and_verified_for_concurrent_runs() {
+        let mut store = docker_fixture();
+        let source = store.root.join("source");
+        std::fs::create_dir_all(source.join("src")).unwrap();
+        std::fs::write(source.join("src/main.rs"), "fn main() {} ").unwrap();
+        std::fs::write(source.join("Cargo.lock"), "").unwrap();
+        Arc::get_mut(&mut store).unwrap().config.source_dir = Some(source);
+        std::fs::write(store.root.join("missing"), "").unwrap();
+        let (a, b) = tokio::join!(store.ensure_ready(), store.ensure_ready());
+        let recovered = format!("sha256:{}", "b".repeat(64));
+        assert_eq!(a.unwrap(), recovered);
+        assert_eq!(b.unwrap(), recovered);
+        let calls = std::fs::read_to_string(store.root.join("calls")).unwrap();
+        assert_eq!(
+            calls
+                .lines()
+                .filter(|line| line.starts_with("build "))
+                .count(),
+            1
+        );
+        assert!(calls.contains("x11box x11 start --desktop --web"));
+        assert!(calls.contains("x11box do screenshot"));
+        assert_eq!(store.status().await.unwrap().image_id, Some(recovered));
+        std::fs::remove_dir_all(&store.root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn missing_local_image_without_recovery_fails_with_an_actionable_reason() {
+        let store = docker_fixture();
+        std::fs::write(store.root.join("missing"), "").unwrap();
+        let error = store.ensure_ready().await.unwrap_err();
+        assert!(format!("{error:#}").contains("本地镜像 ID 无法从仓库拉取"));
+        let status = store.status().await.unwrap();
+        assert_eq!(status.phase, InstallPhase::Failed);
+        assert!(status.image_id.is_none());
+        let calls = std::fs::read_to_string(store.root.join("calls")).unwrap();
+        assert!(!calls.contains("build "));
+        assert!(!calls.contains("pull "));
+        std::fs::remove_dir_all(&store.root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn daemon_failure_is_not_treated_as_a_deleted_image() {
+        let store = docker_fixture();
+        std::fs::write(store.root.join("daemon-down"), "").unwrap();
+        let error = store.ensure_ready().await.unwrap_err();
+        assert!(format!("{error:#}").contains("Cannot connect to the Docker daemon"));
+        assert_eq!(store.status().await.unwrap().phase, InstallPhase::Ready);
+        let calls = std::fs::read_to_string(store.root.join("calls")).unwrap();
+        assert_eq!(calls.lines().count(), 1);
+        std::fs::remove_dir_all(&store.root).unwrap();
     }
 
     #[test]

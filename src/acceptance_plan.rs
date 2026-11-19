@@ -317,7 +317,12 @@ impl AcceptanceStore {
         }
         require_draft(&run, version)?;
         validate_cases(&run.test_plan.as_ref().unwrap().cases)?;
-        if self.runtime.status().await?.phase != InstallPhase::Ready {
+        let runtime_phase = self.runtime.status().await?.phase;
+        if runtime_phase != InstallPhase::Ready
+            && !runtime_phase.in_progress()
+            && self.runtime.config.image.is_none()
+            && self.runtime.config.source_dir.is_none()
+        {
             bail!("x11box plugin is not ready");
         }
         let plan = run.test_plan.as_mut().unwrap();

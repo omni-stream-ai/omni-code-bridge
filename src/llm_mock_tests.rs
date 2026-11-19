@@ -502,6 +502,7 @@ async fn bridge_switch_matrix(root: &Path, first: &Server, second: &Server) {
             title: Some("LLM integration".into()),
             agent: AgentKind::Pi,
             brief_reply_mode: false,
+            approval_mode: Default::default(),
             provider_id: Some("bridge-mock".into()),
             reasoning_effort: None,
             model: None,

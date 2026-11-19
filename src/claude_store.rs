@@ -274,6 +274,7 @@ fn parse_session_summary_file(path: &Path) -> Option<ParsedSessionSummaryRecord>
 
     Some(ParsedSessionSummaryRecord {
         project: ProjectSummary {
+            icon_data_uri: None,
             id: project_id.clone(),
             name: project_name_from_path(&cwd),
             root_path: cwd.clone(),
@@ -289,6 +290,7 @@ fn parse_session_summary_file(path: &Path) -> Option<ParsedSessionSummaryRecord>
             title: session_title,
             agent: AgentKind::ClaudeCode,
             brief_reply_mode: false,
+            approval_mode: Default::default(),
             status: SessionStatus::Idle,
             updated_at,
             unread_count: 0,

@@ -54,11 +54,6 @@ pub(super) fn render_script(decision: &StartupDecision, workspace: &Path, logs: 
         "#!/bin/sh\nset -eu\ncd {}\n",
         quote(&workspace.to_string_lossy())
     );
-    if !has_preparation(decision) {
-        script.push_str(&decision.command);
-        script.push('\n');
-        return script;
-    }
     script.push_str(&format!("mkdir -p {}\n", quote(&logs.to_string_lossy())));
     let marker = quote(&logs.join("omni-acceptance-runtime.ready").to_string_lossy());
     script.push_str(&format!(

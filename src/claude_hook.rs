@@ -6,7 +6,6 @@ use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::models::{ApprovalChoice, ApprovalKind, ApprovalRequest};
-use crate::{ai_approval, approval_policy};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaudePermissionRequest {
@@ -84,7 +83,7 @@ pub async fn append_always_allow_command(state_dir: &Path, command: &str) -> Res
     Ok(())
 }
 
-async fn load_always_allow_commands(state_dir: &Path) -> Vec<String> {
+pub async fn load_always_allow_commands(state_dir: &Path) -> Vec<String> {
     let path = state_dir.join("always_allow_commands.json");
     match tokio::fs::read(&path).await {
         Ok(body) => serde_json::from_slice::<Vec<String>>(&body).unwrap_or_default(),
@@ -96,7 +95,7 @@ pub async fn run_permission_hook(
     state_dir: PathBuf,
     session_id: String,
     run_id: String,
-    project_root: PathBuf,
+    _project_root: PathBuf,
 ) -> Result<()> {
     ensure_runtime_dirs(&state_dir).await?;
 
@@ -142,53 +141,9 @@ pub async fn run_permission_hook(
         .cloned()
         .or_else(|| payload.get("toolInput").cloned())
         .unwrap_or_else(|| payload.clone());
-    let command = extract_command_from_value(&tool_input).unwrap_or_default();
-    let auto_allow = load_always_allow_commands(&state_dir).await;
     if tool_name != Some("Bash") {
         write_hook_decision("allow", "Allowed by omni-code Claude hook").await?;
         return Ok(());
-    }
-
-    let hard_blocked = ai_approval::is_hard_blocked(&command, &project_root);
-    if !hard_blocked && is_auto_allowed_bash_command(&command, &auto_allow) {
-        write_hook_decision("allow", "Allowed by omni-code Claude hook").await?;
-        return Ok(());
-    }
-
-    if !hard_blocked && approval_policy::should_auto_approve(&command, &project_root).is_some() {
-        write_hook_decision("allow", "Allowed by approval policy").await?;
-        return Ok(());
-    }
-
-    // Layer 2: AI risk assessment before escalating to human
-    let ai_request = ApprovalRequest {
-        request_id: uuid::Uuid::new_v4().to_string(),
-        cwd: None,
-        kind: ApprovalKind::ExecCommand,
-        command: Some(command.clone()),
-        reason: Some(format!("Claude requests {}", tool_name.unwrap_or("Bash"))),
-        auto_approval_reason: None,
-        auto_approval_reason_kind: None,
-        allow_accept_for_session: false,
-        allow_cancel: true,
-        resolvable: true,
-    };
-    if let Ok(Some(decision)) = ai_approval::review_request(&ai_request, &project_root, None).await
-    {
-        use ai_approval::AiApprovalDecisionKind;
-        match decision.decision {
-            AiApprovalDecisionKind::Accept => {
-                write_hook_decision("allow", &format!("AI approved: {}", decision.reason)).await?;
-                return Ok(());
-            }
-            AiApprovalDecisionKind::Decline => {
-                write_hook_decision("deny", &format!("AI declined: {}", decision.reason)).await?;
-                return Ok(());
-            }
-            AiApprovalDecisionKind::AskUser => {
-                // Fall through to human approval
-            }
-        }
     }
 
     let request_id = uuid::Uuid::new_v4().to_string();
@@ -490,7 +445,7 @@ fn prefix_matches(command: &str, pattern: &str) -> bool {
     remaining.is_empty() || remaining.starts_with(' ')
 }
 
-fn is_auto_allowed_bash_command(command: &str, dynamic_allow: &[String]) -> bool {
+pub fn is_auto_allowed_bash_command(command: &str, dynamic_allow: &[String]) -> bool {
     const ALLOW_PREFIXES: &[&str] = &["date", "pwd"];
     ALLOW_PREFIXES.iter().any(|p| prefix_matches(command, p))
         || dynamic_allow.iter().any(|p| prefix_matches(command, p))

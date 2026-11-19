@@ -230,6 +230,7 @@ struct AggregatedListCache {
 }
 
 pub struct AppState {
+    pub(crate) workspace_agent: Arc<crate::workspace_agent::WorkspaceAgent>,
     projects: RwLock<HashMap<String, ProjectSummary>>,
     sessions: RwLock<HashMap<String, SessionSummary>>,
     session_title_overrides: RwLock<HashMap<String, String>>,
@@ -256,6 +257,7 @@ pub struct AppState {
     pub(crate) pi_plugins: crate::pi_plugin_store::PiPluginStore,
     pub(crate) runtime_plugins: Arc<crate::runtime_plugin::RuntimePluginStore>,
     pub(crate) acceptance: Arc<crate::acceptance::AcceptanceStore>,
+    pub(crate) project_runtimes: Arc<crate::project_runtime::ProjectRuntimeStore>,
     pub(crate) desktop_gateway: crate::desktop_gateway::DesktopGateway,
     runtime_store_path: PathBuf,
     session_metadata_store_path: PathBuf,
@@ -360,6 +362,12 @@ impl AppState {
             crate::runtime_plugin::RuntimeConfig::from_env(),
         ));
         let state = Self {
+            workspace_agent: Arc::new(
+                crate::workspace_agent::WorkspaceAgent::open(
+                    session_metadata_store_path.with_extension("workspace-agent.json"),
+                )
+                .expect("workspace agent store"),
+            ),
             projects: RwLock::new(persisted_metadata.projects.clone()),
             sessions: RwLock::new(
                 persisted_metadata
@@ -443,6 +451,9 @@ impl AppState {
             acceptance: Arc::new(crate::acceptance::AcceptanceStore::new(Arc::clone(
                 &runtime_plugins,
             ))),
+            project_runtimes: Arc::new(crate::project_runtime::ProjectRuntimeStore::new(
+                &runtime_plugins,
+            )),
             runtime_plugins,
             desktop_gateway: crate::desktop_gateway::DesktopGateway::default(),
             pi_plugins: crate::pi_plugin_store::PiPluginStore::new(pi_plugin_store_path(
@@ -479,6 +490,12 @@ impl AppState {
             crate::runtime_plugin::RuntimeConfig::from_env(),
         ));
         let state = Self {
+            workspace_agent: Arc::new(
+                crate::workspace_agent::WorkspaceAgent::open(
+                    session_metadata_store_path.with_extension("workspace-agent.json"),
+                )
+                .expect("workspace agent store"),
+            ),
             projects: RwLock::new(persisted_metadata.projects.clone()),
             sessions: RwLock::new(
                 persisted_metadata
@@ -562,6 +579,9 @@ impl AppState {
             acceptance: Arc::new(crate::acceptance::AcceptanceStore::new(Arc::clone(
                 &runtime_plugins,
             ))),
+            project_runtimes: Arc::new(crate::project_runtime::ProjectRuntimeStore::new(
+                &runtime_plugins,
+            )),
             runtime_plugins,
             desktop_gateway: crate::desktop_gateway::DesktopGateway::default(),
             pi_plugins: crate::pi_plugin_store::PiPluginStore::new(pi_plugin_store_path(
@@ -596,6 +616,12 @@ impl AppState {
             crate::runtime_plugin::RuntimeConfig::from_env(),
         ));
         let state = Self {
+            workspace_agent: Arc::new(
+                crate::workspace_agent::WorkspaceAgent::open(
+                    session_metadata_store_path.with_extension("workspace-agent.json"),
+                )
+                .map_err(anyhow::Error::msg)?,
+            ),
             projects: RwLock::new(persisted_metadata.projects.clone()),
             sessions: RwLock::new(
                 persisted_metadata
@@ -679,6 +705,9 @@ impl AppState {
             acceptance: Arc::new(crate::acceptance::AcceptanceStore::new(Arc::clone(
                 &runtime_plugins,
             ))),
+            project_runtimes: Arc::new(crate::project_runtime::ProjectRuntimeStore::new(
+                &runtime_plugins,
+            )),
             runtime_plugins,
             desktop_gateway: crate::desktop_gateway::DesktopGateway::default(),
             pi_plugins: crate::pi_plugin_store::PiPluginStore::new(pi_plugin_store_path(
@@ -992,6 +1021,33 @@ impl AppState {
         &self.secret_store
     }
 
+    pub(crate) async fn workspace_agent_participated_sessions(
+        &self,
+    ) -> std::collections::HashSet<String> {
+        let mut ids: std::collections::HashSet<String> =
+            self.sessions.read().await.keys().cloned().collect();
+        ids.extend(self.runtime.lock().await.keys().cloned());
+        ids
+    }
+
+    pub(crate) async fn workspace_agent_message_revision(
+        &self,
+        session: &SessionSummary,
+    ) -> Option<String> {
+        if session.agent == AgentKind::Pi {
+            return crate::session_store::file_fingerprint(&self.pi_session_path(&session.id))
+                .map(|value| format!("pi:{value}"));
+        }
+        let provider = self.provider_for_agent(session.agent)?;
+        let mut ids = vec![session.id.clone()];
+        ids.extend(self.provider_session_ref_chain(&session.id).await);
+        let mut revisions = Vec::new();
+        for id in ids {
+            revisions.push((id.clone(), provider.message_revision(&id).await?));
+        }
+        serde_json::to_string(&revisions).ok()
+    }
+
     pub async fn list_projects(&self) -> Vec<ProjectSummary> {
         self.ensure_list_cache().await.projects
     }
@@ -1151,6 +1207,27 @@ impl AppState {
     async fn overlay_persisted_session_title(&self, mut session: SessionSummary) -> SessionSummary {
         if let Some(title) = self.persisted_session_title(&session.id).await {
             session.title = title;
+        } else {
+            let is_project_default = self
+                .projects
+                .read()
+                .await
+                .get(&session.project_id)
+                .is_some_and(|project| session.title == format!("{} 会话", project.name));
+            let title = self
+                .workspace_agent
+                .fallback_title(
+                    &session.id,
+                    if is_project_default {
+                        ""
+                    } else {
+                        &session.title
+                    },
+                )
+                .await;
+            if !title.is_empty() {
+                session.title = title;
+            }
         }
         session
     }
@@ -1386,14 +1463,7 @@ impl AppState {
 
     pub async fn get_session(&self, session_id: &str) -> Option<SessionDetail> {
         let session = self.find_session(session_id).await?;
-        let mut session = self.with_runtime_approval(session).await;
-        if session.agent == AgentKind::Codex
-            && session.profile_id.is_none()
-            && let Some((id, name)) = crate::session_store::codex_profile_for_session(&session.id)
-        {
-            session.profile_id = Some(id);
-            session.profile_name = Some(name);
-        }
+        let session = self.with_runtime_approval(session).await;
         let git_status = self
             .find_project(&session.project_id)
             .await
@@ -1414,6 +1484,12 @@ impl AppState {
         })
     }
 
+    /// Runtime approvals read only canonical state. Provider-only archives have
+    /// the legacy smart policy until an explicit session setting is saved.
+    pub(crate) async fn session_approval_mode(&self, session_id: &str) -> crate::models::ApprovalMode {
+        self.sessions.read().await.get(session_id).map(|s| s.approval_mode).unwrap_or_default()
+    }
+
     pub(crate) async fn pending_session_approval(
         &self,
         session_id: &str,
@@ -1427,7 +1503,8 @@ impl AppState {
     }
 
     pub async fn create_project(&self, input: CreateProjectInput) -> ProjectSummary {
-        let project = ProjectSummary {
+        let mut project = ProjectSummary {
+            icon_data_uri: None,
             id: project_id_for_path(&input.root_path),
             name: input.name,
             root_path: input.root_path,
@@ -1444,6 +1521,11 @@ impl AppState {
             .insert(project.id.clone(), project.clone());
         self.invalidate_list_cache().await;
 
+        let root = project.root_path.clone();
+        project.icon_data_uri =
+            tokio::task::spawn_blocking(move || crate::project_icon::discover(&root))
+                .await
+                .unwrap_or_default();
         project
     }
 
@@ -1477,6 +1559,7 @@ impl AppState {
                 .unwrap_or_else(|| format!("{} 会话", project.name)),
             agent: input.agent,
             brief_reply_mode: input.brief_reply_mode,
+            approval_mode: input.approval_mode.unwrap_or(self.settings.get().await.default_approval_mode),
             status: SessionStatus::Idle,
             updated_at: Utc::now(),
             unread_count: 0,
@@ -1555,6 +1638,7 @@ impl AppState {
             let entry = projects
                 .entry(project_id.clone())
                 .or_insert_with(|| ProjectSummary {
+                    icon_data_uri: None,
                     id: project_id.clone(),
                     name: input
                         .project_name
@@ -1596,6 +1680,7 @@ impl AppState {
             title,
             agent: AgentKind::Custom,
             brief_reply_mode: false,
+            approval_mode: Default::default(),
             status: SessionStatus::Idle,
             updated_at: now,
             unread_count: 1,
@@ -1780,6 +1865,7 @@ impl AppState {
                     title: domain.title,
                     agent: domain.agent,
                     brief_reply_mode: domain.config.brief_reply_mode,
+                    approval_mode: domain.config.approval_mode,
                     status: match domain.status {
                         DomainSessionStatus::Idle => SessionStatus::Idle,
                         DomainSessionStatus::Running => SessionStatus::Running,
@@ -2516,10 +2602,26 @@ impl AppState {
             content: decorate_user_content(&input),
             created_at: Utc::now(),
         };
-        let system_prompt = input
+        let mut system_prompt = input
             .system_prompt
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
+        match self
+            .project_runtimes
+            .agent_instructions(self, session_id, &session_snapshot.project_id)
+            .await
+        {
+            Ok(Some(instructions)) => {
+                system_prompt = Some(match system_prompt {
+                    Some(prompt) => format!("{prompt}\n\n{instructions}"),
+                    None => instructions,
+                });
+            }
+            Ok(None) => {}
+            Err(error) => {
+                debug_log!("[project-runtime] Agent context unavailable: {error:#}");
+            }
+        }
         debug_log!(
             "[messages] send session={session_id} input_mode={:?} system_prompt_present={} system_prompt_len={} message_provider_id={:?} session_provider_id={:?} reasoning_effort={:?}",
             input.input_mode,
@@ -4277,6 +4379,77 @@ impl AppState {
         Ok(summary)
     }
 
+    pub async fn remember_approval_mode(
+        &self,
+        mode: crate::models::ApprovalMode,
+    ) -> Result<(), String> {
+        self.settings
+            .update(|settings| settings.default_approval_mode = mode)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub async fn update_session_approval_mode(
+        &self,
+        session_id: &str,
+        mode: crate::models::ApprovalMode,
+    ) -> Result<SessionSummary, String> {
+        let mut session = self
+            .find_session(session_id)
+            .await
+            .ok_or_else(|| format!("unknown session: {session_id}"))?;
+        let previous_mode = session.approval_mode;
+        {
+            let mut sessions = self.sessions.write().await;
+            let current = sessions.entry(session.id.clone()).or_insert(session);
+            current.approval_mode = mode;
+            current.updated_at = Utc::now();
+            session = current.clone();
+        }
+        let saved = async {
+            self.persist_canonical_session(&session).await?;
+            self.session_domain.sync_session_metadata(&session)?;
+            self.remember_approval_mode(mode).await
+        }
+        .await;
+        if let Err(error) = saved {
+            let restored = {
+                let mut sessions = self.sessions.write().await;
+                sessions.get_mut(session_id).map(|current| {
+                    current.approval_mode = previous_mode;
+                    current.clone()
+                })
+            };
+            if let Some(restored) = restored {
+                let _ = self.persist_canonical_session(&restored).await;
+                let _ = self.session_domain.sync_session_metadata(&restored);
+                self.publish_event(SessionEvent::SessionSnapshot(restored));
+            }
+            self.invalidate_list_cache().await;
+            return Err(error);
+        }
+        self.invalidate_list_cache().await;
+        self.publish_event(SessionEvent::SessionSnapshot(session.clone()));
+        if mode == crate::models::ApprovalMode::Auto {
+            if let Some(request) = self
+                .pending_session_approval(session_id)
+                .await
+                .filter(|r| r.resolvable)
+            {
+                // The provider acknowledges resolution through the normal event path.
+                let _ = self
+                    .submit_approval(
+                        session_id,
+                        &request.request_id,
+                        crate::models::ApprovalChoice::Accept,
+                    )
+                    .await;
+            }
+        }
+        Ok(session)
+    }
+
     pub async fn update_session_title(
         &self,
         session_id: &str,
@@ -4504,9 +4677,9 @@ impl AppState {
             .cloned()
     }
 
-    async fn find_session(&self, session_id: &str) -> Option<SessionSummary> {
+    pub(crate) async fn find_session(&self, session_id: &str) -> Option<SessionSummary> {
         let local = self.sessions.read().await.get(session_id).cloned();
-        let session = if let Some(session) = local
+        let mut session = if let Some(session) = local
             && !Self::has_rollout_filename_title(&session)
         {
             session
@@ -4517,6 +4690,15 @@ impl AppState {
                 .get(session_id)
                 .cloned()?
         };
+        // Both display and execution must resolve the imported thread's profile,
+        // including canonical sessions saved before profile metadata was added.
+        if session.agent == AgentKind::Codex
+            && session.profile_id.is_none()
+            && let Some((id, name)) = crate::session_store::codex_profile_for_session(&session.id)
+        {
+            session.profile_id = Some(id);
+            session.profile_name = Some(name);
+        }
         Some(self.with_runtime_approval(session).await)
     }
 
@@ -4609,13 +4791,17 @@ impl AppState {
         let project_git_states = tokio::task::spawn_blocking(move || {
             project_roots
                 .into_iter()
-                .map(|(id, root)| (id, git_project_state(&root)))
+                .map(|(id, root)| {
+                    let icon = crate::project_icon::discover(&root);
+                    (id, (git_project_state(&root), icon))
+                })
                 .collect::<HashMap<_, _>>()
         })
         .await
         .expect("project Git status task should complete");
         for (project_id, project) in &mut merged_projects {
-            if let Some(state) = project_git_states.get(project_id) {
+            if let Some((state, icon)) = project_git_states.get(project_id) {
+                project.icon_data_uri = icon.clone();
                 project.git_branch = state.branch.clone();
                 project.git_status = state.status.clone();
             }
@@ -4699,7 +4885,7 @@ impl AppState {
             provider_revisions,
             git_fingerprint: project_git_states
                 .values()
-                .map(|state| state.fingerprint)
+                .map(|(state, _)| state.fingerprint)
                 .fold(0, |acc, fingerprint| acc ^ fingerprint),
             projects_by_id: projects
                 .iter()
@@ -4941,6 +5127,27 @@ fn git_status_for_project(root_path: &str) -> Option<GitStatusState> {
     }
 
     parse_git_status_output(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Bounded, read-only status lookup for the assistant's current project.
+pub(crate) async fn workspace_project_git_status(root_path: &str) -> Option<GitStatusDetail> {
+    if root_path.contains("://") {
+        return None;
+    }
+    let mut command = tokio::process::Command::new("git");
+    command
+        .args(["status", "--porcelain=v1", "--branch"])
+        .current_dir(root_path)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(std::time::Duration::from_secs(2), command.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_git_status_output(&String::from_utf8_lossy(&output.stdout)).map(|status| status.detail)
 }
 
 fn parse_git_status_output(output: &str) -> Option<GitStatusState> {
@@ -5362,6 +5569,7 @@ mod tests {
                 title: Some("Persistent metadata".to_string()),
                 agent: AgentKind::Custom,
                 brief_reply_mode: false,
+                approval_mode: Default::default(),
                 provider_id: None,
                 reasoning_effort: None,
                 model: None,
@@ -5633,6 +5841,7 @@ mod tests {
             title: Some("Session".to_string()),
             agent: AgentKind::Codex,
             brief_reply_mode: false,
+            approval_mode: Default::default(),
             provider_id: None,
             reasoning_effort: None,
             model: Some("gpt-session-a".to_string()),
@@ -5672,6 +5881,7 @@ mod tests {
                 title: Some("Persistent session".to_string()),
                 agent: AgentKind::Codex,
                 brief_reply_mode: false,
+                approval_mode: Default::default(),
                 provider_id: None,
                 reasoning_effort: None,
                 model: None,
@@ -5714,6 +5924,7 @@ mod tests {
                 title: Some("Session".to_string()),
                 agent: AgentKind::Custom,
                 brief_reply_mode: false,
+                approval_mode: Default::default(),
                 provider_id: None,
                 reasoning_effort: None,
                 model: None,
@@ -5778,6 +5989,7 @@ mod tests {
                 title: Some("Session".to_string()),
                 agent: AgentKind::Custom,
                 brief_reply_mode: false,
+                approval_mode: Default::default(),
                 provider_id: None,
                 reasoning_effort: None,
                 model: None,
@@ -5814,6 +6026,7 @@ mod tests {
                 title: Some("Session".to_string()),
                 agent: AgentKind::Codex,
                 brief_reply_mode: false,
+                approval_mode: Default::default(),
                 provider_id: None,
                 reasoning_effort: None,
                 model: None,
@@ -5890,6 +6103,7 @@ mod tests {
                 title: Some("Session".to_string()),
                 agent: AgentKind::Codex,
                 brief_reply_mode: false,
+                approval_mode: Default::default(),
                 provider_id: None,
                 reasoning_effort: None,
                 model: None,
@@ -5974,6 +6188,7 @@ mod tests {
             title: "Provider history".to_string(),
             agent: AgentKind::Codex,
             brief_reply_mode: false,
+            approval_mode: Default::default(),
             status: SessionStatus::Idle,
             updated_at: Utc::now() - chrono::TimeDelta::days(7),
             unread_count: 0,
@@ -6130,6 +6345,7 @@ mod tests {
                 title: Some("Cancel race".to_string()),
                 agent: AgentKind::Codex,
                 brief_reply_mode: false,
+                approval_mode: Default::default(),
                 provider_id: None,
                 reasoning_effort: None,
                 model: None,
@@ -6223,6 +6439,7 @@ mod tests {
             title: "Provider history".to_string(),
             agent: AgentKind::Codex,
             brief_reply_mode: false,
+            approval_mode: Default::default(),
             status: SessionStatus::Idle,
             updated_at: Utc::now(),
             unread_count: 0,
@@ -6279,6 +6496,7 @@ mod tests {
                 title: Some("Original conversation".to_string()),
                 agent: AgentKind::Codex,
                 brief_reply_mode: false,
+                approval_mode: Default::default(),
                 provider_id: None,
                 reasoning_effort: None,
                 model: None,
@@ -6338,6 +6556,7 @@ mod tests {
                 title: Some("Original conversation".to_string()),
                 agent: AgentKind::Codex,
                 brief_reply_mode: false,
+                approval_mode: Default::default(),
                 provider_id: None,
                 reasoning_effort: None,
                 model: None,
@@ -6386,6 +6605,7 @@ mod tests {
             title: id.to_string(),
             agent: AgentKind::Codex,
             brief_reply_mode: false,
+            approval_mode: Default::default(),
             status,
             updated_at,
             unread_count: 0,
@@ -6470,6 +6690,7 @@ mod tests {
                 title: Some("Session".to_string()),
                 agent: AgentKind::Codex,
                 brief_reply_mode: false,
+                approval_mode: Default::default(),
                 provider_id: None,
                 reasoning_effort: None,
                 model: None,
@@ -6560,6 +6781,7 @@ mod tests {
                 title: Some("Session".to_string()),
                 agent: AgentKind::Codex,
                 brief_reply_mode: false,
+                approval_mode: Default::default(),
                 provider_id: None,
                 reasoning_effort: None,
                 model: None,
@@ -6627,6 +6849,7 @@ mod tests {
                 title: Some("Session".to_string()),
                 agent: AgentKind::Codex,
                 brief_reply_mode: false,
+                approval_mode: Default::default(),
                 provider_id: None,
                 reasoning_effort: None,
                 model: None,
@@ -6703,6 +6926,7 @@ mod tests {
                 title: Some("Session".to_string()),
                 agent: AgentKind::Custom,
                 brief_reply_mode: false,
+                approval_mode: Default::default(),
                 provider_id: None,
                 reasoning_effort: None,
                 model: None,
@@ -6869,6 +7093,7 @@ mod tests {
                 title: Some("Session".to_string()),
                 agent: AgentKind::Codex,
                 brief_reply_mode: false,
+                approval_mode: Default::default(),
                 provider_id: None,
                 reasoning_effort: None,
                 model: None,
@@ -6990,6 +7215,7 @@ mod tests {
                     title: "local".to_string(),
                     agent: AgentKind::Codex,
                     brief_reply_mode: false,
+                    approval_mode: Default::default(),
                     status: SessionStatus::Idle,
                     updated_at: now,
                     unread_count: 0,
@@ -7011,6 +7237,7 @@ mod tests {
                     title: "archived".to_string(),
                     agent: AgentKind::Codex,
                     brief_reply_mode: false,
+                    approval_mode: Default::default(),
                     status: SessionStatus::Idle,
                     updated_at: now,
                     unread_count: 0,
@@ -7032,6 +7259,7 @@ mod tests {
                     title: "provider".to_string(),
                     agent: AgentKind::Codex,
                     brief_reply_mode: false,
+                    approval_mode: Default::default(),
                     status: SessionStatus::Running,
                     updated_at: now,
                     unread_count: 1,
@@ -7098,6 +7326,7 @@ mod tests {
             title: "Session".to_string(),
             agent: AgentKind::Codex,
             brief_reply_mode: false,
+            approval_mode: Default::default(),
             status: SessionStatus::Idle,
             updated_at: Utc::now(),
             unread_count: 0,
@@ -7131,6 +7360,7 @@ mod tests {
                 title: Some("Session".to_string()),
                 agent: AgentKind::Codex,
                 brief_reply_mode: false,
+                approval_mode: Default::default(),
                 provider_id: None,
                 reasoning_effort: None,
                 model: None,
@@ -7177,6 +7407,7 @@ mod tests {
                 title: Some("Session".to_string()),
                 agent: AgentKind::Codex,
                 brief_reply_mode: false,
+                approval_mode: Default::default(),
                 provider_id: None,
                 reasoning_effort: None,
                 model: None,
@@ -7249,6 +7480,7 @@ mod tests {
                 title: Some("Session".to_string()),
                 agent: AgentKind::Codex,
                 brief_reply_mode: false,
+                approval_mode: Default::default(),
                 provider_id: None,
                 reasoning_effort: None,
                 model: None,
@@ -7356,6 +7588,7 @@ mod tests {
                 title: Some("Session".to_string()),
                 agent: AgentKind::Codex,
                 brief_reply_mode: false,
+                approval_mode: Default::default(),
                 provider_id: None,
                 reasoning_effort: None,
                 model: None,
@@ -7417,6 +7650,7 @@ mod tests {
                 title: Some("Session".to_string()),
                 agent: AgentKind::Codex,
                 brief_reply_mode: false,
+                approval_mode: Default::default(),
                 provider_id: None,
                 reasoning_effort: None,
                 model: None,
@@ -7500,6 +7734,7 @@ mod tests {
                 title: Some("Session".to_string()),
                 agent: AgentKind::Codex,
                 brief_reply_mode: false,
+                approval_mode: Default::default(),
                 provider_id: None,
                 reasoning_effort: None,
                 model: None,
@@ -7585,6 +7820,7 @@ mod tests {
                 title: Some("Session".to_string()),
                 agent: AgentKind::Codex,
                 brief_reply_mode: false,
+                approval_mode: Default::default(),
                 provider_id: None,
                 reasoning_effort: None,
                 model: None,
@@ -7669,6 +7905,7 @@ mod tests {
                 title: Some("Session".to_string()),
                 agent: AgentKind::OpenCode,
                 brief_reply_mode: false,
+                approval_mode: Default::default(),
                 provider_id: None,
                 reasoning_effort: None,
                 model: None,
@@ -7716,6 +7953,7 @@ mod tests {
                 title: Some("Session".to_string()),
                 agent: AgentKind::Codex,
                 brief_reply_mode: false,
+                approval_mode: Default::default(),
                 provider_id: None,
                 reasoning_effort: Some(crate::models::ReasoningEffort::Medium),
                 model: None,
@@ -7766,6 +8004,7 @@ mod tests {
                     title: Some(filename_title.to_string()),
                     agent: AgentKind::Codex,
                     brief_reply_mode: false,
+                    approval_mode: Default::default(),
                     provider_id: None,
                     reasoning_effort: None,
                     model: None,
@@ -7853,6 +8092,7 @@ mod tests {
                 title: Some("Old".to_string()),
                 agent: AgentKind::Codex,
                 brief_reply_mode: false,
+                approval_mode: Default::default(),
                 provider_id: None,
                 reasoning_effort: None,
                 model: None,
@@ -7903,6 +8143,7 @@ mod tests {
                 title: Some("Original".to_string()),
                 agent: AgentKind::Codex,
                 brief_reply_mode: false,
+                approval_mode: Default::default(),
                 provider_id: None,
                 reasoning_effort: None,
                 model: None,
@@ -7922,6 +8163,7 @@ mod tests {
                 title: "Derived Again".to_string(),
                 agent: session.agent,
                 brief_reply_mode: session.brief_reply_mode,
+                approval_mode: Default::default(),
                 status: SessionStatus::Idle,
                 updated_at: Utc::now(),
                 unread_count: 0,
@@ -7963,6 +8205,7 @@ mod tests {
                 title: Some("Session".to_string()),
                 agent: AgentKind::Codex,
                 brief_reply_mode: false,
+                approval_mode: Default::default(),
                 provider_id: None,
                 reasoning_effort: None,
                 model: None,
@@ -8004,6 +8247,7 @@ mod tests {
                 title: Some("Session".to_string()),
                 agent: AgentKind::Codex,
                 brief_reply_mode: false,
+                approval_mode: Default::default(),
                 provider_id: None,
                 reasoning_effort: None,
                 model: None,
@@ -8051,6 +8295,7 @@ mod tests {
                 title: Some("Session".to_string()),
                 agent: AgentKind::Codex,
                 brief_reply_mode: false,
+                approval_mode: Default::default(),
                 provider_id: None,
                 reasoning_effort: None,
                 model: None,
@@ -8102,6 +8347,7 @@ mod tests {
                 title: Some("Session".to_string()),
                 agent: AgentKind::Codex,
                 brief_reply_mode: false,
+                approval_mode: Default::default(),
                 provider_id: None,
                 reasoning_effort: None,
                 model: None,
@@ -8126,6 +8372,7 @@ mod tests {
                 title: "Provider thread".to_string(),
                 agent: AgentKind::Codex,
                 brief_reply_mode: false,
+                approval_mode: Default::default(),
                 status: SessionStatus::Running,
                 updated_at: Utc::now(),
                 unread_count: 0,
@@ -8184,6 +8431,7 @@ mod tests {
                 title: Some("Session".to_string()),
                 agent: AgentKind::Codex,
                 brief_reply_mode: false,
+                approval_mode: Default::default(),
                 provider_id: None,
                 reasoning_effort: None,
                 model: None,
@@ -8250,6 +8498,7 @@ mod tests {
             title: "Session".to_string(),
             agent: AgentKind::Codex,
             brief_reply_mode: false,
+            approval_mode: Default::default(),
             status: SessionStatus::Idle,
             updated_at: Utc::now(),
             unread_count: 0,
@@ -8308,6 +8557,7 @@ mod tests {
             title: "Session".to_string(),
             agent: AgentKind::Codex,
             brief_reply_mode: false,
+            approval_mode: Default::default(),
             status: SessionStatus::Idle,
             updated_at: Utc::now(),
             unread_count: 0,
@@ -8387,6 +8637,7 @@ mod tests {
                 title: Some("Session".to_string()),
                 agent: AgentKind::Codex,
                 brief_reply_mode: false,
+                approval_mode: Default::default(),
                 provider_id: None,
                 reasoning_effort: None,
                 model: None,
@@ -8481,6 +8732,7 @@ mod tests {
                 title: Some("Session".to_string()),
                 agent: AgentKind::Codex,
                 brief_reply_mode: false,
+                approval_mode: Default::default(),
                 provider_id: None,
                 reasoning_effort: None,
                 model: None,

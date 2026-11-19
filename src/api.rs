@@ -45,7 +45,9 @@ use crate::{
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .merge(crate::mcp_api::router())
+        .merge(crate::workspace_agent::router())
         .merge(crate::acceptance_api::router())
+        .merge(crate::project_runtime::api::router())
         .merge(crate::desktop_gateway::router())
         .route("/health", get(health))
         .route("/files", get(get_file_by_path))
@@ -381,6 +383,7 @@ async fn health() -> impl IntoResponse {
     Json(serde_json::json!({
         "ok": true,
         "service": "omni-code-bridge",
+        "version": env!("CARGO_PKG_VERSION"),
     }))
 }
 
@@ -967,13 +970,17 @@ async fn update_session(
                 message,
             })?;
     }
-    let session = state
+    let mut session = state
         .update_session_settings(&id, input.provider_id, input.reasoning_effort, input.model)
         .await
         .map_err(|err| ApiError {
             status: StatusCode::NOT_FOUND,
             message: err,
         })?;
+    if let Some(mode) = input.approval_mode {
+        session = state.update_session_approval_mode(&id, mode).await
+            .map_err(|message| ApiError { status: StatusCode::BAD_REQUEST, message })?;
+    }
     Ok(Json(ApiResponse { data: session }))
 }
 
@@ -1095,8 +1102,19 @@ async fn list_agent_commands(
         return error.into_response();
     }
     let mut codex = agent_commands_summary(AgentKind::Codex);
-    if let Some(session_id) = query.session_id.as_deref()
-        && let Ok(project_root) = state.project_root_path_for_session(session_id).await
+    let project_root = if let Some(session_id) = query.session_id.as_deref() {
+        state.project_root_path_for_session(session_id).await.ok()
+    } else if let Some(project_id) = query.project_id.as_deref() {
+        state
+            .list_projects()
+            .await
+            .into_iter()
+            .find(|project| project.id == project_id)
+            .map(|project| project.root_path)
+    } else {
+        None
+    };
+    if let Some(project_root) = project_root
         && let Ok(skills) = adapter::list_codex_skills(StdPath::new(&project_root)).await
     {
         codex
@@ -1900,14 +1918,29 @@ async fn create_domain_turn(
     Json(command): Json<CreateTurnCommand>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize_request(&headers, &state).await?;
-    let approval_language = preferred_language(&headers);
+    let result = submit_domain_turn(state, id, command, &headers).await?;
+    let status = if result.created {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::OK
+    };
+    Ok((status, Json(ApiResponse { data: result })))
+}
+
+pub(crate) async fn submit_domain_turn(
+    state: Arc<AppState>,
+    id: String,
+    command: CreateTurnCommand,
+    headers: &HeaderMap,
+) -> Result<crate::session_domain::CreateTurnResult, ApiError> {
+    let approval_language = preferred_language(headers);
     let result = state
         .create_domain_turn(&id, &command)
         .await
         .map_err(domain_store_api_error)?;
 
     if !result.created {
-        return Ok((StatusCode::OK, Json(ApiResponse { data: result })));
+        return Ok(result);
     }
 
     let execution_state = Arc::clone(&state);
@@ -1956,7 +1989,7 @@ async fn create_domain_turn(
         }
     });
 
-    Ok((StatusCode::ACCEPTED, Json(ApiResponse { data: result })))
+    Ok(result)
 }
 
 fn preferred_language(headers: &HeaderMap) -> Option<String> {
@@ -2904,6 +2937,14 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn health_exposes_version_without_requiring_authorization() {
+        let response = response_json(super::health().await.into_response()).await;
+        assert_eq!(response["service"], "omni-code-bridge");
+        assert_eq!(response["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(response["ok"], true);
+    }
+
+    #[tokio::test]
     async fn file_metadata_and_binary_download_require_auth_and_keep_bytes() {
         let state = test_state("file-info").await;
         let session_id = create_api_test_session(&state, "file-info").await;
@@ -2979,6 +3020,7 @@ mod tests {
                 title: Some(format!("API session {suffix}")),
                 agent: AgentKind::Custom,
                 brief_reply_mode: false,
+                approval_mode: Default::default(),
                 provider_id: None,
                 reasoning_effort: None,
                 model: None,
@@ -2986,6 +3028,106 @@ mod tests {
             .await
             .expect("session should be created");
         session_id
+    }
+
+    #[tokio::test]
+    async fn approval_modes_are_isolated_persisted_and_used_as_new_session_defaults() {
+        use crate::models::ApprovalMode;
+        let root =
+            std::env::temp_dir().join(format!("omni-approval-modes-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let state = Arc::new(
+            AppState::new_with_paths(
+                root.join("settings.json"),
+                root.join("runtime.json"),
+                root.join("metadata.json"),
+            )
+            .await,
+        );
+        let a = create_api_test_session(&state, "mode-a").await;
+        let b = create_api_test_session(&state, "mode-b").await;
+        let headers = authorized_headers(&state).await;
+        let patch: crate::models::UpdateSessionInput =
+            serde_json::from_value(serde_json::json!({"approval_mode":"auto"})).unwrap();
+        let response = super::update_session(
+            axum::extract::Path(a.clone()),
+            headers,
+            State(state.clone()),
+            Json(patch),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(
+            response_json(response).await["data"]["approval_mode"],
+            "auto"
+        );
+        assert_eq!(
+            state.find_session(&b).await.unwrap().approval_mode,
+            ApprovalMode::Smart
+        );
+        let c = create_api_test_session(&state, "mode-c").await;
+        assert_eq!(
+            state.find_session(&c).await.unwrap().approval_mode,
+            ApprovalMode::Auto
+        );
+        state
+            .update_session_approval_mode(&b, ApprovalMode::Manual)
+            .await
+            .unwrap();
+        assert_eq!(
+            state.find_session(&a).await.unwrap().approval_mode,
+            ApprovalMode::Auto
+        );
+        assert_eq!(
+            state.find_session(&c).await.unwrap().approval_mode,
+            ApprovalMode::Auto
+        );
+        assert_eq!(
+            state
+                .domain_session_state(&b)
+                .await
+                .unwrap()
+                .unwrap()
+                .session
+                .config
+                .approval_mode,
+            ApprovalMode::Manual
+        );
+        drop(state);
+        let restored = Arc::new(
+            AppState::new_with_paths(
+                root.join("settings.json"),
+                root.join("runtime.json"),
+                root.join("metadata.json"),
+            )
+            .await,
+        );
+        assert_eq!(
+            restored.find_session(&a).await.unwrap().approval_mode,
+            ApprovalMode::Auto
+        );
+        assert_eq!(
+            restored.find_session(&b).await.unwrap().approval_mode,
+            ApprovalMode::Manual
+        );
+        assert_eq!(
+            restored.find_session(&c).await.unwrap().approval_mode,
+            ApprovalMode::Auto
+        );
+        let d = create_api_test_session(&restored, "mode-d").await;
+        assert_eq!(
+            restored.find_session(&d).await.unwrap().approval_mode,
+            ApprovalMode::Manual
+        );
+        assert!(
+            serde_json::from_value::<crate::models::UpdateSessionInput>(
+                serde_json::json!({"approval_mode":"invalid"})
+            )
+            .is_err()
+        );
+        drop(restored);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -3234,6 +3376,7 @@ mod tests {
                     title: Some("Session".to_string()),
                     agent: AgentKind::Custom,
                     brief_reply_mode: false,
+                    approval_mode: Default::default(),
                     provider_id: None,
                     reasoning_effort: None,
                     model: None,
@@ -3722,6 +3865,7 @@ mod tests {
                 title: Some("Persistent API session".to_string()),
                 agent: AgentKind::Custom,
                 brief_reply_mode: false,
+                approval_mode: Default::default(),
                 provider_id: None,
                 reasoning_effort: None,
                 model: None,
@@ -4228,6 +4372,7 @@ for line in sys.stdin:
             title: "Existing session".to_string(),
             agent: AgentKind::Codex,
             brief_reply_mode: false,
+            approval_mode: Default::default(),
             status: crate::models::SessionStatus::Interrupted,
             updated_at: chrono::Utc::now(),
             unread_count: 0,

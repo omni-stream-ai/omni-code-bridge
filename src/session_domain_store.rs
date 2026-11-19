@@ -1560,6 +1560,7 @@ fn domain_session_from_summary(legacy: &SessionSummary) -> DomainSession {
             reasoning_effort: legacy.reasoning_effort,
             model: legacy.model.clone(),
             brief_reply_mode: legacy.brief_reply_mode,
+            approval_mode: legacy.approval_mode,
         },
         active_turn_id: None,
         pending_approval_id: None,
@@ -1576,13 +1577,15 @@ fn update_session_metadata(session: &mut DomainSession, legacy: &SessionSummary)
         || session.config.provider_id != legacy.provider_id
         || session.config.reasoning_effort != legacy.reasoning_effort
         || session.config.model != legacy.model
-        || session.config.brief_reply_mode != legacy.brief_reply_mode;
+        || session.config.brief_reply_mode != legacy.brief_reply_mode
+        || session.config.approval_mode != legacy.approval_mode;
     if changed {
         session.title = legacy.title.clone();
         session.config.provider_id = legacy.provider_id.clone();
         session.config.reasoning_effort = legacy.reasoning_effort;
         session.config.model = legacy.model.clone();
         session.config.brief_reply_mode = legacy.brief_reply_mode;
+        session.config.approval_mode = legacy.approval_mode;
         session.version += 1;
         session.updated_at = Utc::now();
     }
@@ -2373,6 +2376,7 @@ mod tests {
             title: "Session".to_string(),
             agent: AgentKind::Codex,
             brief_reply_mode: false,
+            approval_mode: Default::default(),
             status: SessionStatus::Idle,
             updated_at: Utc::now(),
             unread_count: 0,

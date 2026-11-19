@@ -217,6 +217,8 @@ pub struct SessionConfig {
     pub model: Option<String>,
     #[serde(default)]
     pub brief_reply_mode: bool,
+    #[serde(default)]
+    pub approval_mode: crate::models::ApprovalMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

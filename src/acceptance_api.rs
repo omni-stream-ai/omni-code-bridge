@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{OriginalUri, Path, State},
     http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
@@ -17,6 +17,9 @@ use crate::{
     runtime_plugin::{MANIFEST, PluginInstallation},
 };
 
+#[path = "acceptance_analysis.rs"]
+mod analysis;
+
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route(
@@ -27,6 +30,14 @@ pub fn router() -> Router<Arc<AppState>> {
         )
         .route("/v2/acceptance", get(list_runs).post(create_run))
         .route(
+            "/v2/projects/{project_id}/environment",
+            get(project_environment).post(save_project_environment),
+        )
+        .route(
+            "/v2/projects/{project_id}/environment/detect",
+            post(detect_project_environment),
+        )
+        .route(
             "/v2/projects/{project_id}/acceptance-environment",
             get(project_environment).post(save_project_environment),
         )
@@ -35,6 +46,7 @@ pub fn router() -> Router<Arc<AppState>> {
             post(detect_project_environment),
         )
         .route("/v2/acceptance/{id}", get(get_run))
+        .route("/v2/acceptance/{id}/analyze", post(analysis::analyze))
         .route("/v2/acceptance/{id}/retry", post(retry_automation))
         .route("/v2/acceptance/{id}/rejudge", post(rejudge))
         .route("/v2/acceptance/{id}/test-plan", post(edit_test_plan))
@@ -72,6 +84,7 @@ async fn project_environment(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(project_id): Path<String>,
+    OriginalUri(uri): OriginalUri,
 ) -> Result<Json<ApiResponse<EnvironmentSettings>>, ApiError> {
     crate::api::authorize_request(&headers, &state).await?;
     require_project(&state, &project_id).await?;
@@ -87,6 +100,23 @@ async fn project_environment(
     settings.detection = Some(crate::project_detection::detect(std::path::Path::new(
         &project.root_path,
     )));
+    state
+        .project_runtimes
+        .prepare_detection(&state, &project, settings.detection.as_mut().unwrap())
+        .map_err(internal)?;
+    if uri.path().ends_with("/environment") {
+        settings.config.build_targets = state
+            .project_runtimes
+            .targets(&state, &project)
+            .map_err(internal)?;
+        if settings
+            .current
+            .as_ref()
+            .is_some_and(|current| current.config != settings.config)
+        {
+            settings.current = None;
+        }
+    }
     Ok(Json(ApiResponse { data: settings }))
 }
 
@@ -117,7 +147,13 @@ async fn save_project_environment(
 ) -> Result<Json<ApiResponse<EnvironmentSettings>>, ApiError> {
     crate::api::authorize_request(&headers, &state).await?;
     require_project(&state, &project_id).await?;
-    let config = EnvironmentConfig {
+    let _profiles = state.project_runtimes.profiles_lock.lock().await;
+    let excluded = state
+        .project_runtimes
+        .preferences(&project_id)
+        .map_err(internal)?
+        .excluded;
+    let mut config = EnvironmentConfig {
         build: input.build,
         build_targets: input.build_targets,
         build_reasoning: input.build_reasoning,
@@ -126,13 +162,40 @@ async fn save_project_environment(
         image: input.image,
         ..Default::default()
     };
-    Ok(Json(ApiResponse {
-        data: state
-            .acceptance
-            .environments
-            .save_config(&project_id, config, input.rebuild)
-            .map_err(operation_error)?,
-    }))
+    let previous_count = config.build_targets.len();
+    config
+        .build_targets
+        .retain(|target| !excluded.contains(&target.directory));
+    if previous_count != config.build_targets.len() {
+        config.build = config
+            .build_targets
+            .first()
+            .map(|target| target.configuration.clone());
+    }
+    config.validate().map_err(operation_error)?;
+    // Retain per-directory profiles when a later acceptance run selects only a
+    // subset. Manual runtime settings must not disappear with that test scope.
+    let previous = state
+        .acceptance
+        .environments
+        .config(&project_id)
+        .map_err(internal)?;
+    state
+        .project_runtimes
+        .remember_targets(&project_id, &previous.build_targets)
+        .await
+        .map_err(internal)?;
+    let settings = state
+        .acceptance
+        .environments
+        .save_config(&project_id, config, input.rebuild)
+        .map_err(operation_error)?;
+    state
+        .project_runtimes
+        .remember_targets(&project_id, &settings.config.build_targets)
+        .await
+        .map_err(internal)?;
+    Ok(Json(ApiResponse { data: settings }))
 }
 
 #[derive(Deserialize)]
@@ -140,6 +203,8 @@ async fn save_project_environment(
 struct DetectEnvironment {
     #[serde(default)]
     agent: bool,
+    #[serde(default)]
+    all_targets: bool,
     #[serde(default)]
     current: crate::project_detection::BuildConfiguration,
     #[serde(default)]
@@ -163,8 +228,15 @@ async fn detect_project_environment(
         .await
         .ok_or_else(|| bad_request("project not found"))?;
     input.current.validate().map_err(operation_error)?;
+    if input.all_targets && input.target_directory.is_some() {
+        return Err(bad_request("全项目配置不能限定单个子项目"));
+    }
     let root = std::path::Path::new(&project.root_path);
     let mut detection = crate::project_detection::detect(root);
+    state
+        .project_runtimes
+        .prepare_detection(&state, &project, &mut detection)
+        .map_err(internal)?;
     if let Some(directory) = &input.target_directory {
         let candidate = detection
             .candidates
@@ -173,21 +245,45 @@ async fn detect_project_environment(
             .ok_or_else(|| bad_request("验收目标未在识别结果中找到，请刷新后重试"))?;
         detection.configuration = candidate.configuration.clone();
     }
-    if input.agent {
-        let identified = crate::project_detection::identify_with_agent(
-            &state,
-            &project_id,
-            root,
-            &input.current,
-            &detection,
-            input.target_directory.as_deref(),
-            &crate::project_detection::IdentificationContext {
-                requirements: input.requirements,
-                session_id: input.session_id,
-                current_targets: input.current_targets,
-            },
-        )
-        .await
+    if input.all_targets || input.agent {
+        let identified = if input.all_targets {
+            let excluded = state
+                .project_runtimes
+                .preferences(&project_id)
+                .map_err(internal)?
+                .excluded;
+            let current_targets: Vec<_> = input
+                .current_targets
+                .iter()
+                .filter(|target| !excluded.contains(&target.directory))
+                .cloned()
+                .collect();
+            crate::project_detection::configure_all_targets(
+                &state,
+                &project_id,
+                root,
+                &detection,
+                &current_targets,
+                input.agent,
+            )
+            .await
+        } else {
+            crate::project_detection::identify_with_agent(
+                &state,
+                &project_id,
+                root,
+                &input.current,
+                &detection,
+                input.target_directory.as_deref(),
+                &crate::project_detection::IdentificationContext {
+                    all_targets: input.all_targets,
+                    requirements: input.requirements,
+                    session_id: input.session_id,
+                    current_targets: input.current_targets,
+                },
+            )
+            .await
+        }
         .map_err(operation_error)?;
         detection.configuration = identified
             .targets
@@ -324,6 +420,8 @@ async fn rejudge(
 struct RetryAutomation {
     #[serde(default)]
     startup: Option<crate::acceptance::StartupDecision>,
+    #[serde(default)]
+    use_current_environment: bool,
 }
 
 async fn retry_automation(
@@ -335,7 +433,12 @@ async fn retry_automation(
     crate::api::authorize_request(&headers, &state).await?;
     let run = state
         .acceptance
-        .retry_automation(Arc::clone(&state), &id, input.startup)
+        .retry_with_environment(
+            Arc::clone(&state),
+            &id,
+            input.startup,
+            input.use_current_environment,
+        )
         .await
         .map_err(operation_error)?;
     Ok((StatusCode::ACCEPTED, Json(ApiResponse { data: run })))
@@ -1083,6 +1186,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn build_detection_all_targets_uses_program_results_without_a_model() {
+        let fixture = crate::acceptance_test_support::Fixture::new().await;
+        let root = fixture.root.join("program-detection");
+        for (directory, manifest, content) in [
+            (
+                "api",
+                "Cargo.toml",
+                "[package]\nname='api'\nversion='0.1.0'",
+            ),
+            (
+                "web",
+                "package.json",
+                r#"{"packageManager":"npm@10","scripts":{"start":"vite"}}"#,
+            ),
+        ] {
+            std::fs::create_dir_all(root.join(directory)).unwrap();
+            std::fs::write(root.join(directory).join(manifest), content).unwrap();
+        }
+        let project = fixture
+            .state
+            .create_project(crate::models::CreateProjectInput {
+                name: "Program detection".into(),
+                root_path: root.to_string_lossy().into_owned(),
+            })
+            .await;
+        let sessions_before = fixture
+            .state
+            .list_project_sessions(&project.id)
+            .await
+            .unwrap()
+            .len();
+        let (origin, server) = fixture.server().await;
+        let client = reqwest::Client::new();
+        let url = format!("{origin}/v2/projects/{}/environment/detect", project.id);
+        let response = client
+            .post(&url)
+            .headers(fixture.headers.clone())
+            .json(&json!({
+                "all_targets": true,
+                "agent": true,
+                "current_targets": [{"directory": "api", "configuration": {
+                    "start_command": "./custom-api", "build_command": "./custom-build"
+                }}]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = response.json().await.unwrap();
+        let targets = body["data"]["targets"].as_array().unwrap();
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0]["configuration"]["start_command"], "./custom-api");
+        assert_eq!(
+            targets[0]["configuration"]["build_command"],
+            "./custom-build"
+        );
+        assert_eq!(
+            targets[0]["configuration"]["install_command"],
+            "cd 'api' && cargo fetch"
+        );
+        assert_eq!(
+            targets[1]["configuration"]["start_command"],
+            "cd 'web' && npm run start"
+        );
+        assert_eq!(targets[1]["configuration"]["build_command"], "");
+        assert_eq!(targets[1]["configuration"]["artifact_directory"], "");
+        assert_eq!(
+            body["data"]["reasoning"],
+            "已优先使用程序识别结果并保留已有配置。"
+        );
+        assert_eq!(
+            fixture
+                .state
+                .list_project_sessions(&project.id)
+                .await
+                .unwrap()
+                .len(),
+            sessions_before
+        );
+
+        // Explicit program-only requests also return incomplete profiles without
+        // starting an Agent or requiring model configuration.
+        let response = client
+            .post(&url)
+            .headers(fixture.headers.clone())
+            .json(&json!({
+                "all_targets": true, "agent": false
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(
+            body["data"]["targets"][0]["configuration"]["start_command"],
+            ""
+        );
+        assert_eq!(
+            body["data"]["targets"][1]["configuration"]["start_command"],
+            "cd 'web' && npm run start"
+        );
+        assert_eq!(
+            fixture
+                .state
+                .list_project_sessions(&project.id)
+                .await
+                .unwrap()
+                .len(),
+            sessions_before
+        );
+        assert!(
+            fixture
+                .state
+                .acceptance
+                .environments
+                .config(&project.id)
+                .unwrap()
+                .build_targets
+                .is_empty()
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn build_detection_exposes_targets_and_validates_explicit_selection() {
         let fixture = crate::acceptance_test_support::Fixture::new().await;
         let root = fixture.root.join("multi-project");
@@ -1189,6 +1416,19 @@ mod tests {
                 .post(format!("{url}/detect"))
                 .headers(fixture.headers.clone())
                 .json(&json!({"agent": true, "target_directory": invalid}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        for invalid in [
+            json!({"all_targets": true, "target_directory": "client"}),
+            json!({"agent": true, "all_targets": true, "target_directory": "client"}),
+        ] {
+            let response = client
+                .post(format!("{url}/detect"))
+                .headers(fixture.headers.clone())
+                .json(&invalid)
                 .send()
                 .await
                 .unwrap();

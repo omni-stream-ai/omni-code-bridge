@@ -88,6 +88,7 @@ async fn session(state: &Arc<AppState>, root: &Path, agent: AgentKind) -> String
             title: Some("mock fault test".into()),
             agent,
             brief_reply_mode: false,
+            approval_mode: Default::default(),
             provider_id: Some("bridge-mock".into()),
             reasoning_effort: None,
             model: None,

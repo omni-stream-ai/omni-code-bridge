@@ -351,8 +351,8 @@ pub(crate) fn session_archive_fingerprint() -> Option<u64> {
     Some(fingerprint)
 }
 
-/// Appending transcript events does not change the lightweight catalog, whose
-/// revision tracks title metadata rather than database activity or token usage.
+/// Track transcript metadata as well as titles so appended final messages
+/// invalidate activity times without parsing the transcript body.
 pub(crate) fn session_catalog_revision() -> Option<u64> {
     session_catalog_revision_for_root(&sessions_root())
 }
@@ -363,10 +363,7 @@ fn session_catalog_revision_for_root(root: &Path) -> Option<u64> {
     root.hash(&mut hasher);
     for path in paths {
         path.hash(&mut hasher);
-        fs::metadata(&path)
-            .ok()
-            .map(|metadata| metadata.len() > 0)
-            .hash(&mut hasher);
+        file_fingerprint(&path).hash(&mut hasher);
     }
     if let Some(index) = root
         .parent()
@@ -414,18 +411,19 @@ fn load_session_catalog_summary_for_root(root: &Path) -> SessionArchiveSummary {
         let id = header.id.as_str();
         let cwd = header.cwd.as_str();
         let index_entry = index.get(id);
-        let updated_at = index_entry
+        let indexed_at = index_entry
             .and_then(|entry| entry.1.as_deref())
             .and_then(parse_timestamp)
-            .or(header.created_at)
-            .unwrap_or_else(|| {
-                fs::metadata(&path)
-                    .and_then(|metadata| metadata.modified())
-                    .ok()
-                    .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
-                    .and_then(|value| DateTime::<Utc>::from_timestamp(value.as_secs() as i64, 0))
-                    .unwrap_or_else(Utc::now)
-            });
+            .or(header.created_at);
+        let modified_at = fs::metadata(&path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .map(DateTime::<Utc>::from);
+        let updated_at = indexed_at
+            .into_iter()
+            .chain(modified_at)
+            .max()
+            .unwrap_or_else(Utc::now);
         let title = index_entry
             .and_then(|entry| entry.0.clone())
             .filter(|value| !value.trim().is_empty())
@@ -443,6 +441,7 @@ fn load_session_catalog_summary_for_root(root: &Path) -> SessionArchiveSummary {
             title: truncate_preview(&title, 32),
             agent: AgentKind::Codex,
             brief_reply_mode: false,
+            approval_mode: Default::default(),
             status: SessionStatus::Idle,
             updated_at,
             unread_count: 0,
@@ -467,6 +466,7 @@ fn load_session_catalog_summary_for_root(root: &Path) -> SessionArchiveSummary {
                 }
             })
             .or_insert_with(|| ProjectSummary {
+                icon_data_uri: None,
                 id: project_id,
                 name: project_name_from_path(cwd),
                 root_path: cwd.to_string(),
@@ -1296,6 +1296,7 @@ fn parse_session_summary_file(path: &Path) -> Option<ParsedSessionSummaryRecord>
 
     Some(ParsedSessionSummaryRecord {
         project: ProjectSummary {
+            icon_data_uri: None,
             id: project_id.clone(),
             name: project_name_from_path(&cwd),
             root_path: cwd.clone(),
@@ -1311,6 +1312,7 @@ fn parse_session_summary_file(path: &Path) -> Option<ParsedSessionSummaryRecord>
             title: session_title,
             agent: AgentKind::Codex,
             brief_reply_mode: false,
+            approval_mode: Default::default(),
             status,
             updated_at,
             unread_count: 0,
@@ -1735,7 +1737,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_revision_ignores_appends_and_detects_new_sessions_and_titles() {
+    fn catalog_revision_detects_appends_new_sessions_and_titles() {
         let root =
             std::env::temp_dir().join(format!("omni-catalog-revision-{}", uuid::Uuid::new_v4()));
         let sessions = root.join("sessions");
@@ -1744,7 +1746,8 @@ mod tests {
         fs::write(&first, "header").unwrap();
         let initial = session_catalog_revision_for_root(&sessions).unwrap();
         fs::write(&first, "header with appended transcript events").unwrap();
-        assert_eq!(session_catalog_revision_for_root(&sessions), Some(initial));
+        assert_ne!(session_catalog_revision_for_root(&sessions), Some(initial));
+        let initial = session_catalog_revision_for_root(&sessions).unwrap();
         let second = sessions.join("second.jsonl");
         fs::write(&second, "another session header").unwrap();
         assert_ne!(session_catalog_revision_for_root(&sessions), Some(initial));
@@ -1752,6 +1755,33 @@ mod tests {
         assert_eq!(session_catalog_revision_for_root(&sessions), Some(initial));
         fs::write(root.join("session_index.jsonl"), "updated title").unwrap();
         assert_ne!(session_catalog_revision_for_root(&sessions), Some(initial));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn catalog_activity_tracks_transcript_even_with_an_unchanged_title_index() {
+        let (root, sessions) = catalog_fixture();
+        let path = write_catalog_session(&sessions, "finished", &[]);
+        fs::write(
+            root.join("session_index.jsonl"),
+            r#"{"id":"finished","thread_name":"Submit fix","updated_at":"2026-10-23T10:50:13Z"}"#,
+        )
+        .unwrap();
+        let file = fs::File::options().write(true).open(&path).unwrap();
+        let first = parse_timestamp("2026-10-23T10:51:00.123Z").unwrap();
+        file.set_modified(first.into()).unwrap();
+        let before = load_session_catalog_summary_for_root(&sessions);
+        assert_eq!(before.sessions["finished"].updated_at, first);
+        let initial_revision = session_catalog_revision_for_root(&sessions);
+        let finished = parse_timestamp("2026-10-23T10:53:00.456Z").unwrap();
+        file.set_modified(finished.into()).unwrap();
+        let after = load_session_catalog_summary_for_root(&sessions);
+        assert_eq!(after.sessions["finished"].updated_at, finished);
+        assert_eq!(after.sessions["finished"].title, "Submit fix");
+        assert_ne!(
+            session_catalog_revision_for_root(&sessions),
+            initial_revision
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
